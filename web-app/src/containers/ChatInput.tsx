@@ -23,6 +23,7 @@ import {
 } from '@/components/ui/dropdown-menu'
 import { ArrowRight, PlusIcon } from 'lucide-react'
 import {
+  IconLivePhoto,
   IconPhoto,
   IconTool,
   IconCodeCircle2,
@@ -1706,6 +1707,10 @@ const ChatInput = memo(function ChatInput({
     setShowVisionModelPrompt(true)
   }
 
+  const handleImageCreationClick = async () => {
+    alert("test image");
+  }
+
   // --- Audio attachments (omni/audio-capable models) -----------------------
   // Audio mirrors the image attachment pipeline (validate → read as base64 →
   // commit to the per-thread chip store) but is never downscaled/transcoded,
@@ -2520,6 +2525,21 @@ const ChatInput = memo(function ChatInput({
                       </Button>
                     </DropdownMenuTrigger>
                     <DropdownMenuContent align="start">
+                      {/* Vision image attachment - always enabled, prompts to download vision model if needed */}
+                      <DropdownMenuItem onClick={handleImageCreationClick}>
+                        <IconLivePhoto
+                          size={18}
+                          className="text-muted-foreground"
+                        />
+                        <span>Create Image</span>
+                        {/* <input
+                          type="file"
+                          ref={fileInputRef}
+                          className="hidden"
+                          multiple
+                          onChange={handleFileChange}
+                        /> */}
+                      </DropdownMenuItem>
                       {/* Vision image attachment - always enabled, prompts to download vision model if needed */}
                       <DropdownMenuItem onClick={handleImagePickerClick}>
                         <IconPhoto
