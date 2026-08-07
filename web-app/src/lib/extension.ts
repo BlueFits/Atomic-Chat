@@ -1,4 +1,4 @@
-import { AIEngine, BaseExtension, ExtensionTypeEnum } from '@janhq/core'
+import { AIEngine, BaseExtension, ExtensionTypeEnum, ImageEngine } from '@janhq/core'
 
 import { getServiceHub } from '@/hooks/useServiceHub'
 
@@ -67,6 +67,8 @@ export class ExtensionManager {
   // Registered inference engines
   private engines = new Map<string, AIEngine>()
 
+  private imageEngines = new Map<string, ImageEngine>()
+
   /**
    * Registers an extension.
    * @param extension - The extension to register.
@@ -76,7 +78,10 @@ export class ExtensionManager {
     this.extensions.set(name, extension)
 
     // Register AI Engines
-    if ('provider' in extension && typeof extension.provider === 'string') {
+    if (extension.type() === ExtensionTypeEnum.ImageEngine) {
+      const imageEngine = extension as ImageEngine
+      this.imageEngines.set(imageEngine.provider, imageEngine)
+    } else if ('provider' in extension && typeof extension.provider === 'string') {
       this.engines.set(
         extension.provider as unknown as string,
         extension as unknown as AIEngine
@@ -118,6 +123,14 @@ export class ExtensionManager {
    */
   getEngine<T extends AIEngine>(engine: string): T | undefined {
     return this.engines.get(engine) as T | undefined
+  }
+
+  getImageEngine<T extends ImageEngine>(provider: string): T | undefined {
+    return this.imageEngines.get(provider) as T | undefined
+  }
+
+  listImageEngines(): ImageEngine[] {
+    return [...this.imageEngines.values()]
   }
 
   /**

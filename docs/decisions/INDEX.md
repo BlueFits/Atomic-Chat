@@ -15,6 +15,8 @@ decision is reversed, add a new one that says which record it supersedes.
 
 ## Load-bearing — read before touching platform / provider / agent code
 
+- **2026-08-05** — [Add a separate local image-generation engine boundary](2026-08-05-add-local-image-generation-engine-boundary.md)
+
 - **2026-07-28** — [Ship dual llama providers on Windows and Linux](2026-07-28-ship-dual-llama-providers-on-windows-and-linux.md)
 - **2026-05-19** — [Product identity is "Atomic Chat"; new code stops carrying Jan branding](2026-05-19-product-identity-is-atomic-chat-new-code-stops-carrying-jan.md)
 - **2026-05-22** — [Windows ships only `llamacpp-upstream`, sourced from `ggml-org/llama.cpp`](2026-05-22-windows-ships-only-llamacpp-upstream-sourced-from-ggml-org.md)
@@ -214,4 +216,3 @@ decision is reversed, add a new one that says which record it supersedes.
 - **2026-07-28** — [Isolate the unstable Tauri IPC test API](2026-07-28-isolate-tauri-ipc-test-api.md)
 - **2026-07-23** — [Isolate the Windows Common Controls test manifest by feature](2026-07-23-isolate-the-windows-common-controls-test-manifest-by-feature.md)
 - **2026-07-20** — [Open Agent-referenced files from assistant summaries](2026-07-20-open-agent-referenced-files-from-assistant-summaries.md)
-

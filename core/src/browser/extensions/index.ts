@@ -23,6 +23,7 @@ export { MCPExtension } from './mcp'
  * Base AI Engines.
  */
 export * from './engines'
+export * from './image'
 
 export { RAGExtension, RAG_INTERNAL_SERVER } from './rag'
 export type { AttachmentInput, IngestAttachmentsResult } from './rag'

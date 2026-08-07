@@ -10,6 +10,7 @@ export enum ExtensionTypeEnum {
   MCP = 'mcp',
   HuggingFace = 'huggingFace',
   Engine = 'engine',
+  ImageEngine = 'imageEngine',
   Hardware = 'hardware',
   RAG = 'rag',
   VectorDB = 'vectorDB',

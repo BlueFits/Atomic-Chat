@@ -70,8 +70,10 @@ import {
   ThreadMessage,
   fs,
   VectorDBExtension,
+  ChatCompletionRole,
 } from '@janhq/core'
 import { ExtensionManager } from '@/lib/extension'
+import { getImageGenerationEngine } from '@/lib/image-generation'
 import { useAttachments } from '@/hooks/useAttachments'
 import { toast } from 'sonner'
 import { isPlatformTauri } from '@/lib/platform/utils'
@@ -1708,7 +1710,96 @@ const ChatInput = memo(function ChatInput({
   }
 
   const handleImageCreationClick = async () => {
-    alert("test image");
+    const imagePrompt = prompt.trim()
+    if (!imagePrompt) {
+      toast.info('Describe the image you want to create first')
+      textareaRef.current?.focus()
+      return
+    }
+    if (!currentThreadId) {
+      toast.info('Open a chat before generating an image')
+      return
+    }
+
+    const engine = getImageGenerationEngine()
+    let models
+    try {
+      models = await engine.list()
+    } catch (error) {
+      toast.error('Image generation is unavailable', {
+        description: error instanceof Error ? error.message : String(error),
+      })
+      return
+    }
+    const model = models[0]
+    if (!model) {
+      toast.error('No image model is installed', {
+        description: 'Install an SDXL checkpoint before generating an image.',
+      })
+      return
+    }
+
+    const now = Date.now()
+    const userMessage: ThreadMessage = {
+      id: crypto.randomUUID(),
+      object: 'thread.message',
+      thread_id: currentThreadId,
+      role: ChatCompletionRole.User,
+      content: [{
+        type: ContentType.Text,
+        text: { value: imagePrompt, annotations: [] },
+      }],
+      status: MessageStatus.Ready,
+      created_at: now,
+      completed_at: now,
+      metadata: { generationMode: 'image' },
+    }
+    const pendingMessage: ThreadMessage = {
+      id: crypto.randomUUID(),
+      object: 'thread.message',
+      thread_id: currentThreadId,
+      role: ChatCompletionRole.Assistant,
+      content: [{
+        type: ContentType.Text,
+        text: { value: 'Generating image…', annotations: [] },
+      }],
+      status: MessageStatus.Pending,
+      created_at: now,
+      completed_at: 0,
+      metadata: { generationMode: 'image', model: model.id, provider: engine.provider },
+    }
+    const messageStore = useMessages.getState()
+    messageStore.addMessage(userMessage)
+    messageStore.addMessage(pendingMessage)
+    setPrompt('')
+
+    try {
+      const result = await engine.generate({ model: model.id, prompt: imagePrompt })
+      const image = result.images[0]
+      messageStore.updateMessage({
+        ...pendingMessage,
+        content: [{ type: ContentType.Image, image_url: { url: image.url } }],
+        status: MessageStatus.Ready,
+        completed_at: Date.now(),
+        metadata: {
+          generationMode: 'image', model: result.model,
+          provider: result.provider, seed: image.seed, width: image.width,
+          height: image.height, path: image.path, durationMs: result.durationMs,
+        },
+      })
+    } catch (error) {
+      const description = error instanceof Error ? error.message : String(error)
+      messageStore.updateMessage({
+        ...pendingMessage,
+        content: [{
+          type: ContentType.Text,
+          text: { value: description, annotations: [] },
+        }],
+        status: MessageStatus.Error,
+        completed_at: Date.now(),
+      })
+      toast.error('Image generation failed', { description })
+    }
   }
 
   // --- Audio attachments (omni/audio-capable models) -----------------------

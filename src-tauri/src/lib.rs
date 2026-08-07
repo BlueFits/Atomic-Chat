@@ -168,6 +168,9 @@ pub fn run() {
         core::server::commands::start_server,
         core::server::commands::stop_server,
         core::server::commands::get_server_status,
+        core::image_generation::commands::generate_image,
+        core::image_generation::commands::cancel_image_generation,
+        core::image_generation::commands::list_image_models,
         // Remote provider commands
         core::server::remote_provider_commands::register_provider_config,
         core::server::remote_provider_commands::unregister_provider_config,
