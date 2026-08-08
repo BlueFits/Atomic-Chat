@@ -46,8 +46,10 @@ fn validate_request(request: &GenerateImageRequest) -> Result<(u32, u32, u32, f3
     if request.prompt.trim().is_empty() || request.prompt.chars().count() > 8_000 {
         return Err("Prompt must contain between 1 and 8000 characters".into());
     }
-    let width = request.width.unwrap_or(1024);
-    let height = request.height.unwrap_or(1024);
+    // 512 matches SD 1.5 native size and keeps VAE decode under typical 8–12GB
+    // VRAM when a chat model is also loaded. Callers can still request up to 2048.
+    let width = request.width.unwrap_or(512);
+    let height = request.height.unwrap_or(512);
     if !(256..=2048).contains(&width)
         || !(256..=2048).contains(&height)
         || width % 64 != 0
@@ -166,9 +168,14 @@ pub async fn generate_image<R: Runtime>(
         .insert(request.job_id.clone(), token.clone());
 
     let started = Instant::now();
-    let mut command = Command::new(runtime);
+    let backend_dir = runtime
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| root.clone());
+    let mut command = Command::new(&runtime);
     command
         .kill_on_drop(true)
+        .current_dir(&backend_dir)
         .arg("--mode")
         .arg("img_gen")
         .arg("--model")
@@ -187,6 +194,9 @@ pub async fn generate_image<R: Runtime>(
         .arg(guidance.to_string())
         .arg("--seed")
         .arg(seed.to_string())
+        // Tile VAE decode so large latent → RGB work does not allocate one huge
+        // Vulkan buffer (the failure mode we hit at 1024² with a chat model loaded).
+        .arg("--vae-tiling")
         .arg("--output")
         .arg(&temporary_output);
     let mut child = command
@@ -247,10 +257,10 @@ mod tests {
         }
     }
     #[test]
-    fn validates_sdxl_defaults() {
+    fn validates_default_dimensions() {
         assert_eq!(
             validate_request(&request()).unwrap(),
-            (1024, 1024, 20, 7.0, -1)
+            (512, 512, 20, 7.0, -1)
         );
     }
     #[test]

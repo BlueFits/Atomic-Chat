@@ -16,6 +16,7 @@ decision is reversed, add a new one that says which record it supersedes.
 ## Load-bearing — read before touching platform / provider / agent code
 
 - **2026-08-05** — [Add a separate local image-generation engine boundary](2026-08-05-add-local-image-generation-engine-boundary.md)
+- **2026-08-07** — [Default local image generation to 512² with VAE tiling](2026-08-07-default-local-image-gen-to-512-with-vae-tiling.md)
 
 - **2026-07-28** — [Ship dual llama providers on Windows and Linux](2026-07-28-ship-dual-llama-providers-on-windows-and-linux.md)
 - **2026-05-19** — [Product identity is "Atomic Chat"; new code stops carrying Jan branding](2026-05-19-product-identity-is-atomic-chat-new-code-stops-carrying-jan.md)

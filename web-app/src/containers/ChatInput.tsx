@@ -60,6 +60,8 @@ import { useTools } from '@/hooks/useTools'
 import { TokenCounter } from '@/components/TokenCounter'
 import { ContextSizeControl } from '@/containers/ContextSizeControl'
 import { useMessages } from '@/hooks/useMessages'
+import { useChatSessions } from '@/stores/chat-session-store'
+import { convertThreadMessageToUIMessage } from '@/lib/messages'
 import { useShallow } from 'zustand/react/shallow'
 import { McpExtensionToolLoader } from './McpExtensionToolLoader'
 import {
@@ -1768,15 +1770,24 @@ const ChatInput = memo(function ChatInput({
       completed_at: 0,
       metadata: { generationMode: 'image', model: model.id, provider: engine.provider },
     }
+    // Persist via useMessages, and mirror into the live AI SDK chat session so
+    // ThreadDetail re-renders immediately (useMessages alone only shows up on reload).
     const messageStore = useMessages.getState()
+    const syncChatUi = (message: ThreadMessage) => {
+      useChatSessions
+        .getState()
+        .upsertMessage(message.thread_id, convertThreadMessageToUIMessage(message))
+    }
     messageStore.addMessage(userMessage)
+    syncChatUi(userMessage)
     messageStore.addMessage(pendingMessage)
+    syncChatUi(pendingMessage)
     setPrompt('')
 
     try {
       const result = await engine.generate({ model: model.id, prompt: imagePrompt })
       const image = result.images[0]
-      messageStore.updateMessage({
+      const readyMessage: ThreadMessage = {
         ...pendingMessage,
         content: [{ type: ContentType.Image, image_url: { url: image.url } }],
         status: MessageStatus.Ready,
@@ -1786,10 +1797,12 @@ const ChatInput = memo(function ChatInput({
           provider: result.provider, seed: image.seed, width: image.width,
           height: image.height, path: image.path, durationMs: result.durationMs,
         },
-      })
+      }
+      messageStore.updateMessage(readyMessage)
+      syncChatUi(readyMessage)
     } catch (error) {
       const description = error instanceof Error ? error.message : String(error)
-      messageStore.updateMessage({
+      const errorMessage: ThreadMessage = {
         ...pendingMessage,
         content: [{
           type: ContentType.Text,
@@ -1797,7 +1810,9 @@ const ChatInput = memo(function ChatInput({
         }],
         status: MessageStatus.Error,
         completed_at: Date.now(),
-      })
+      }
+      messageStore.updateMessage(errorMessage)
+      syncChatUi(errorMessage)
       toast.error('Image generation failed', { description })
     }
   }

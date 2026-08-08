@@ -137,10 +137,15 @@ export const useChatSessions = create<ChatSessionState>((set, get) => ({
     const existing = get().sessions[sessionId];
     if (!existing) return;
 
-    existing.chat.messages = [
-      ...existing.chat.messages.filter((item) => item.id !== message.id),
-      message,
-    ];
+    // Assigning chat.messages notifies AI SDK subscribers (live thread UI).
+    // Replace in place when the id already exists so pending → final updates
+    // do not reshuffle history; append only for new ids.
+    const messages = existing.chat.messages;
+    const index = messages.findIndex((item) => item.id === message.id);
+    existing.chat.messages =
+      index >= 0
+        ? [...messages.slice(0, index), message, ...messages.slice(index + 1)]
+        : [...messages, message];
   },
   updateStatus: (sessionId, status) => {
     set((state) => {

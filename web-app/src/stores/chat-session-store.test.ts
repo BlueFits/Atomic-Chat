@@ -48,4 +48,43 @@ describe('chat session message routing', () => {
     expect(chatA.messages).toEqual([threadAMessage, agentMessage])
     expect(chatB.messages).toEqual([threadBMessage])
   })
+
+  it('replaces an existing message in place without reshuffling', () => {
+    const userMessage: UIMessage = {
+      id: 'user-1',
+      role: 'user',
+      parts: [{ type: 'text', text: 'draw a cat' }],
+    }
+    const pending: UIMessage = {
+      id: 'assistant-1',
+      role: 'assistant',
+      parts: [{ type: 'text', text: 'Generating image…' }],
+    }
+    const ready: UIMessage = {
+      id: 'assistant-1',
+      role: 'assistant',
+      parts: [
+        {
+          type: 'file',
+          mediaType: 'image/png',
+          url: 'asset://localhost/generated.png',
+        },
+      ],
+    }
+    const trailing: UIMessage = {
+      id: 'user-2',
+      role: 'user',
+      parts: [{ type: 'text', text: 'thanks' }],
+    }
+    const transport = {} as CustomChatTransport
+    const chat = createChat([userMessage, pending, trailing])
+
+    useChatSessions
+      .getState()
+      .ensureSession('thread-img', transport, () => chat)
+
+    useChatSessions.getState().upsertMessage('thread-img', ready)
+
+    expect(chat.messages).toEqual([userMessage, ready, trailing])
+  })
 })
