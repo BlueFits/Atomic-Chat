@@ -60,8 +60,6 @@ import { useTools } from '@/hooks/useTools'
 import { TokenCounter } from '@/components/TokenCounter'
 import { ContextSizeControl } from '@/containers/ContextSizeControl'
 import { useMessages } from '@/hooks/useMessages'
-import { useChatSessions } from '@/stores/chat-session-store'
-import { convertThreadMessageToUIMessage } from '@/lib/messages'
 import { useShallow } from 'zustand/react/shallow'
 import { McpExtensionToolLoader } from './McpExtensionToolLoader'
 import {
@@ -72,10 +70,9 @@ import {
   ThreadMessage,
   fs,
   VectorDBExtension,
-  ChatCompletionRole,
 } from '@janhq/core'
 import { ExtensionManager } from '@/lib/extension'
-import { getImageGenerationEngine } from '@/lib/image-generation'
+import { useImageGeneration } from '@/hooks/useImageGeneration'
 import { useAttachments } from '@/hooks/useAttachments'
 import { toast } from 'sonner'
 import { isPlatformTauri } from '@/lib/platform/utils'
@@ -158,6 +155,7 @@ const ChatInput = memo(function ChatInput({
   const textareaRef = useRef<HTMLTextAreaElement>(null)
   const [isFocused, setIsFocused] = useState(false)
   const [rows, setRows] = useState(1)
+  const [creationMode, setCreationMode] = useState<'image' | null>(null)
   const serviceHub = useServiceHub()
   const abortControllers = useAppState((state) => state.abortControllers)
   const loadingModel = useAppState((state) => state.loadingModel)
@@ -167,6 +165,7 @@ const ChatInput = memo(function ChatInput({
   const prompt = usePrompt((state) => state.prompt)
   const setPrompt = usePrompt((state) => state.setPrompt)
   const currentThreadId = useThreads((state) => state.currentThreadId)
+  const { generateImage } = useImageGeneration(currentThreadId)
   const updateCurrentThreadModel = useThreads(
     (state) => state.updateCurrentThreadModel
   )
@@ -1712,6 +1711,11 @@ const ChatInput = memo(function ChatInput({
   }
 
   const handleImageCreationClick = async () => {
+    setCreationMode('image')
+    requestAnimationFrame(() => textareaRef.current?.focus())
+  }
+
+  const handleImageGenerationSubmit = async () => {
     const imagePrompt = prompt.trim()
     if (!imagePrompt) {
       toast.info('Describe the image you want to create first')
@@ -1723,98 +1727,9 @@ const ChatInput = memo(function ChatInput({
       return
     }
 
-    const engine = getImageGenerationEngine()
-    let models
-    try {
-      models = await engine.list()
-    } catch (error) {
-      toast.error('Image generation is unavailable', {
-        description: error instanceof Error ? error.message : String(error),
-      })
-      return
-    }
-    const model = models[0]
-    if (!model) {
-      toast.error('No image model is installed', {
-        description: 'Install an SDXL checkpoint before generating an image.',
-      })
-      return
-    }
-
-    const now = Date.now()
-    const userMessage: ThreadMessage = {
-      id: crypto.randomUUID(),
-      object: 'thread.message',
-      thread_id: currentThreadId,
-      role: ChatCompletionRole.User,
-      content: [{
-        type: ContentType.Text,
-        text: { value: imagePrompt, annotations: [] },
-      }],
-      status: MessageStatus.Ready,
-      created_at: now,
-      completed_at: now,
-      metadata: { generationMode: 'image' },
-    }
-    const pendingMessage: ThreadMessage = {
-      id: crypto.randomUUID(),
-      object: 'thread.message',
-      thread_id: currentThreadId,
-      role: ChatCompletionRole.Assistant,
-      content: [{
-        type: ContentType.Text,
-        text: { value: 'Generating image…', annotations: [] },
-      }],
-      status: MessageStatus.Pending,
-      created_at: now,
-      completed_at: 0,
-      metadata: { generationMode: 'image', model: model.id, provider: engine.provider },
-    }
-    // Persist via useMessages, and mirror into the live AI SDK chat session so
-    // ThreadDetail re-renders immediately (useMessages alone only shows up on reload).
-    const messageStore = useMessages.getState()
-    const syncChatUi = (message: ThreadMessage) => {
-      useChatSessions
-        .getState()
-        .upsertMessage(message.thread_id, convertThreadMessageToUIMessage(message))
-    }
-    messageStore.addMessage(userMessage)
-    syncChatUi(userMessage)
-    messageStore.addMessage(pendingMessage)
-    syncChatUi(pendingMessage)
     setPrompt('')
-
-    try {
-      const result = await engine.generate({ model: model.id, prompt: imagePrompt })
-      const image = result.images[0]
-      const readyMessage: ThreadMessage = {
-        ...pendingMessage,
-        content: [{ type: ContentType.Image, image_url: { url: image.url } }],
-        status: MessageStatus.Ready,
-        completed_at: Date.now(),
-        metadata: {
-          generationMode: 'image', model: result.model,
-          provider: result.provider, seed: image.seed, width: image.width,
-          height: image.height, path: image.path, durationMs: result.durationMs,
-        },
-      }
-      messageStore.updateMessage(readyMessage)
-      syncChatUi(readyMessage)
-    } catch (error) {
-      const description = error instanceof Error ? error.message : String(error)
-      const errorMessage: ThreadMessage = {
-        ...pendingMessage,
-        content: [{
-          type: ContentType.Text,
-          text: { value: description, annotations: [] },
-        }],
-        status: MessageStatus.Error,
-        completed_at: Date.now(),
-      }
-      messageStore.updateMessage(errorMessage)
-      syncChatUi(errorMessage)
-      toast.error('Image generation failed', { description })
-    }
+    setCreationMode(null)
+    await generateImage(imagePrompt)
   }
 
   // --- Audio attachments (omni/audio-capable models) -----------------------
@@ -2360,6 +2275,28 @@ const ChatInput = memo(function ChatInput({
               onDragOver={attachmentsEnabled ? handleDragOver : undefined}
               onDrop={attachmentsEnabled ? handleDrop : undefined}
             >
+              {creationMode === 'image' && (
+                <div className="flex px-3 pt-3">
+                  <div
+                    className="inline-flex items-center gap-2 rounded-xl border border-border bg-muted/60 px-3 py-2 text-sm"
+                    data-testid="image-generation-mode"
+                  >
+                    <IconLivePhoto
+                      size={18}
+                      className="text-muted-foreground"
+                    />
+                    <span className="font-medium">Generate image</span>
+                    <button
+                      type="button"
+                      className="ml-1 rounded-full text-muted-foreground hover:text-foreground"
+                      aria-label="Exit image generation mode"
+                      onClick={() => setCreationMode(null)}
+                    >
+                      <IconX size={16} />
+                    </button>
+                  </div>
+                </div>
+              )}
               {attachments.length > 0 && (
                 <div className="flex flex-col gap-2 p-2 pb-0">
                   <div className="flex flex-wrap gap-2 items-center">
@@ -2574,7 +2511,11 @@ const ChatInput = memo(function ChatInput({
                         !isAttachmentPipelineBusy &&
                         !blockSendUntilModelReady
                       ) {
-                        handleSendMessage(prompt)
+                        if (creationMode === 'image') {
+                          void handleImageGenerationSubmit()
+                        } else {
+                          handleSendMessage(prompt)
+                        }
                       }
                       // When Shift+Enter is pressed, a new line is added (default behavior)
                     }
@@ -2587,7 +2528,9 @@ const ChatInput = memo(function ChatInput({
                   }
                   onPaste={handlePaste}
                   placeholder={
-                    selectedAgentSkill
+                    creationMode === 'image'
+                      ? 'Describe the image you want to create'
+                      : selectedAgentSkill
                       ? ''
                       : effectiveAgentMode
                         ? t('chat:agentMode.placeholder')
@@ -2920,7 +2863,13 @@ const ChatInput = memo(function ChatInput({
                       blockSendUntilModelReady
                     }
                     data-test-id="send-message-button"
-                    onClick={() => handleSendMessage(prompt)}
+                    onClick={() => {
+                      if (creationMode === 'image') {
+                        void handleImageGenerationSubmit()
+                      } else {
+                        handleSendMessage(prompt)
+                      }
+                    }}
                     className="rounded-full mr-1 mb-1"
                   >
                     <ArrowRight className="text-primary-fg" />

@@ -1,11 +1,16 @@
 import {
   ExtensionTypeEnum,
   ImageEngine,
+  ImageEngineManager,
   type ImageGenerationRequest,
+  type ImageGenerationProgress,
   type ImageGenerationResult,
   type ImageModelInfo,
 } from '@janhq/core'
 import { convertFileSrc, invoke } from '@tauri-apps/api/core'
+import { listen } from '@tauri-apps/api/event'
+
+const IMAGE_GENERATION_PROGRESS_EVENT = 'image-generation-progress'
 
 type NativeImageModel = {
   id: string
@@ -63,23 +68,39 @@ export class StableDiffusionCppImageEngine extends ImageEngine {
     return [...this.loaded]
   }
 
-  async generate(request: ImageGenerationRequest): Promise<ImageGenerationResult> {
+  async generate(
+    request: ImageGenerationRequest,
+    onProgress?: (progress: ImageGenerationProgress) => void
+  ): Promise<ImageGenerationResult> {
     await this.load(request.model)
     const jobId = crypto.randomUUID()
     const createdAt = Date.now()
-    const result = await invoke<NativeImageResult>('generate_image', {
-      request: {
-        jobId,
-        model: request.model,
-        prompt: request.prompt,
-        negativePrompt: request.negativePrompt,
-        width: request.width,
-        height: request.height,
-        steps: request.steps,
-        guidanceScale: request.guidanceScale,
-        seed: request.seed,
-      },
-    })
+    const unlisten = onProgress
+      ? await listen<ImageGenerationProgress>(
+          IMAGE_GENERATION_PROGRESS_EVENT,
+          ({ payload }) => {
+            if (payload.jobId === jobId) onProgress(payload)
+          }
+        )
+      : undefined
+    let result: NativeImageResult
+    try {
+      result = await invoke<NativeImageResult>('generate_image', {
+        request: {
+          jobId,
+          model: request.model,
+          prompt: request.prompt,
+          negativePrompt: request.negativePrompt,
+          width: request.width,
+          height: request.height,
+          steps: request.steps,
+          guidanceScale: request.guidanceScale,
+          seed: request.seed,
+        },
+      })
+    } finally {
+      unlisten?.()
+    }
     return {
       jobId,
       model: request.model,
@@ -102,12 +123,19 @@ export class StableDiffusionCppImageEngine extends ImageEngine {
   }
 }
 
-let engine: StableDiffusionCppImageEngine | undefined
+let builtInEngine: StableDiffusionCppImageEngine | undefined
 
-export function getImageGenerationEngine(): StableDiffusionCppImageEngine {
-  if (!engine) {
-    engine = new StableDiffusionCppImageEngine()
-    engine.onLoad()
+function ensureBuiltInImageEngine(): void {
+  if (!builtInEngine) {
+    builtInEngine = new StableDiffusionCppImageEngine()
+    builtInEngine.onLoad()
   }
+}
+
+/** Resolve an image provider without exposing its implementation to chat UI. */
+export function getImageGenerationEngine(provider = 'atomic-image'): ImageEngine {
+  ensureBuiltInImageEngine()
+  const engine = ImageEngineManager.instance().get(provider)
+  if (!engine) throw new Error(`Image provider '${provider}' is unavailable`)
   return engine
 }

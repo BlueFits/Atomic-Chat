@@ -163,6 +163,49 @@ function stripAudioFileParts(messages: UIMessage[]): UIMessage[] {
   })
 }
 
+type ImageInferenceMetadata = {
+  generationMode?: string
+  artifactKind?: string
+  includeInInference?: boolean
+}
+
+/**
+ * Project display history into model-facing history.
+ *
+ * Images remain in persisted/UI messages, but a text-only model must never
+ * receive image file parts. Generated assistant artifacts are also excluded
+ * from vision-model context unless the user explicitly opts them in.
+ */
+export function projectImagesForInference(
+  messages: UIMessage[],
+  supportsVision: boolean
+): UIMessage[] {
+  return messages.flatMap((message) => {
+    const metadata = (message.metadata ?? {}) as ImageInferenceMetadata
+    const generatedAssistantImage =
+      message.role === 'assistant' &&
+      (metadata.generationMode === 'image' ||
+        metadata.artifactKind === 'generated_image')
+    const includeGeneratedImage =
+      generatedAssistantImage && metadata.includeInInference === true
+
+    const parts = message.parts.filter((part) => {
+      if (
+        part.type !== 'file' ||
+        typeof part.mediaType !== 'string' ||
+        !part.mediaType.startsWith('image/')
+      ) {
+        return true
+      }
+      if (!supportsVision) return false
+      if (generatedAssistantImage) return includeGeneratedImage
+      return true
+    })
+
+    return parts.length > 0 ? [{ ...message, parts }] : []
+  })
+}
+
 /// Fold the assistant system prompt into the first user message.
 ///
 /// Local backends (gemma-4 et al.) reliably emit a spurious chain-of-thought
@@ -677,8 +720,13 @@ export class CustomChatTransport implements ChatTransport<UIMessage> {
     // first: they are delivered out-of-band as `input_audio` (see
     // extractAudioInputParts), and the OpenAI-compatible converter throws on
     // any non-image file part.
-    let preparedMessages = stripAudioFileParts(
-      this.mapUserInlineAttachments(messagesToConvert)
+    const supportsVision =
+      useModelProvider
+        .getState()
+        .selectedModel?.capabilities?.includes('vision') ?? false
+    let preparedMessages = projectImagesForInference(
+      stripAudioFileParts(this.mapUserInlineAttachments(messagesToConvert)),
+      supportsVision
     )
     // Local backends serialize tool results to a `role: "tool"` text message
     // (JSON.stringify), so an image in a tool result (e.g. an MCP screenshot
@@ -688,10 +736,6 @@ export class CustomChatTransport implements ChatTransport<UIMessage> {
     // image as a proper multimodal user message. Cloud providers are left
     // untouched (they have large contexts and handle this differently).
     if (LOCAL_INFERENCE_PROVIDERS.has(effectiveProviderName)) {
-      const supportsVision =
-        useModelProvider
-          .getState()
-          .selectedModel?.capabilities?.includes('vision') ?? false
       preparedMessages = prepareToolResultImagesForModel(preparedMessages, {
         supportsVision,
       })

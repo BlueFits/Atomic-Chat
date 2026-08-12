@@ -79,7 +79,7 @@ export class ExtensionManager {
 
     // Register AI Engines
     if (extension.type() === ExtensionTypeEnum.ImageEngine) {
-      const imageEngine = extension as ImageEngine
+      const imageEngine = extension as unknown as ImageEngine
       this.imageEngines.set(imageEngine.provider, imageEngine)
     } else if ('provider' in extension && typeof extension.provider === 'string') {
       this.engines.set(

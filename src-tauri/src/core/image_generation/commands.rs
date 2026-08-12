@@ -3,11 +3,14 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
+    process::Stdio,
+    sync::atomic::{AtomicU32, Ordering},
+    sync::Arc,
     sync::OnceLock,
     time::Instant,
 };
-use tauri::{AppHandle, Runtime};
-use tokio::{process::Command, sync::Mutex};
+use tauri::{AppHandle, Emitter, Runtime};
+use tokio::{io::AsyncReadExt, process::Command, sync::Mutex};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -40,6 +43,56 @@ pub struct GenerateImageResult {
     pub height: u32,
     pub seed: i64,
     pub duration_ms: u128,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ImageGenerationProgress {
+    job_id: String,
+    completed_steps: u32,
+    total_steps: u32,
+}
+
+fn progress_from_output(output: &str, total_steps: u32) -> Option<u32> {
+    static STEP_PROGRESS: OnceLock<regex::Regex> = OnceLock::new();
+    let pattern = STEP_PROGRESS.get_or_init(|| regex::Regex::new(r"(\d+)\s*/\s*(\d+)").unwrap());
+    pattern
+        .captures_iter(output)
+        .filter_map(|capture| {
+            let completed = capture.get(1)?.as_str().parse::<u32>().ok()?;
+            let total = capture.get(2)?.as_str().parse::<u32>().ok()?;
+            (total == total_steps && completed <= total).then_some(completed)
+        })
+        .last()
+}
+
+async fn forward_progress<R: Runtime>(
+    mut reader: impl tokio::io::AsyncRead + Unpin,
+    app: AppHandle<R>,
+    job_id: String,
+    total_steps: u32,
+    last_step: Arc<AtomicU32>,
+) {
+    let mut buffer = vec![0_u8; 4096];
+    while let Ok(read) = reader.read(&mut buffer).await {
+        if read == 0 {
+            break;
+        }
+        let output = String::from_utf8_lossy(&buffer[..read]);
+        if let Some(completed_steps) = progress_from_output(&output, total_steps) {
+            let previous = last_step.swap(completed_steps, Ordering::Relaxed);
+            if previous != completed_steps {
+                let _ = app.emit(
+                    "image-generation-progress",
+                    ImageGenerationProgress {
+                        job_id: job_id.clone(),
+                        completed_steps,
+                        total_steps,
+                    },
+                );
+            }
+        }
+    }
 }
 
 fn validate_request(request: &GenerateImageRequest) -> Result<(u32, u32, u32, f32, i64), String> {
@@ -198,10 +251,31 @@ pub async fn generate_image<R: Runtime>(
         // Vulkan buffer (the failure mode we hit at 1024² with a chat model loaded).
         .arg("--vae-tiling")
         .arg("--output")
-        .arg(&temporary_output);
+        .arg(&temporary_output)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
     let mut child = command
         .spawn()
         .map_err(|e| format!("Failed to start image runtime: {e}"))?;
+    let last_step = Arc::new(AtomicU32::new(0));
+    let stdout_task = child.stdout.take().map(|stdout| {
+        tokio::spawn(forward_progress(
+            stdout,
+            app.clone(),
+            request.job_id.clone(),
+            steps,
+            last_step.clone(),
+        ))
+    });
+    let stderr_task = child.stderr.take().map(|stderr| {
+        tokio::spawn(forward_progress(
+            stderr,
+            app.clone(),
+            request.job_id.clone(),
+            steps,
+            last_step,
+        ))
+    });
     let status = tokio::select! {
         status = child.wait() => status.map_err(|e| format!("Image runtime failed: {e}"))?,
         _ = token.cancelled() => {
@@ -211,6 +285,12 @@ pub async fn generate_image<R: Runtime>(
             return Err("Image generation cancelled".into());
         }
     };
+    if let Some(task) = stdout_task {
+        let _ = task.await;
+    }
+    if let Some(task) = stderr_task {
+        let _ = task.await;
+    }
     jobs().lock().await.remove(&request.job_id);
     if !status.success() {
         let _ = std::fs::remove_file(&temporary_output);
@@ -274,5 +354,13 @@ mod tests {
         let mut r = request();
         r.prompt = " ".into();
         assert!(validate_request(&r).is_err());
+    }
+    #[test]
+    fn parses_only_sampling_progress_for_the_requested_total() {
+        assert_eq!(
+            progress_from_output("loading 1/2\r[====] 7/20", 20),
+            Some(7)
+        );
+        assert_eq!(progress_from_output("loading 1/2", 20), None);
     }
 }
