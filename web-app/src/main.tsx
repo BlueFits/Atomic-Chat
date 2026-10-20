@@ -1,3 +1,6 @@
+// Dev-only fresh-install mode (`make dev-fresh`). MUST be the first import:
+// it wipes/restores localStorage before any zustand store module rehydrates.
+import './lib/freshInstallBoot'
 import { StrictMode } from 'react'
 import ReactDOM from 'react-dom/client'
 import { RouterProvider, createRouter } from '@tanstack/react-router'
@@ -9,11 +12,15 @@ import { routeTree } from './routeTree.gen'
 import './index.css'
 import './i18n'
 import { installCodeBlockDownloadHandler } from './lib/codeBlockDownload'
+import { installInternalNavigationHandler } from './lib/internal-navigation'
 import { runWindowsLlamacppProviderMigration } from './lib/windowsProviderMigration'
 import { runMacosLlamacppDefaultMigration } from './lib/macosLlamacppDefaultMigration'
+import { runTurboquantDefaultMigration } from './lib/turboquantDefaultMigration'
 import { initSentryFrontend } from './lib/sentry'
+import { resetForcedOnboardingRun } from './lib/onboarding'
 import { useGeneralSetting } from './hooks/useGeneralSetting'
 import { useModelProvider } from './hooks/useModelProvider'
+import { isLocalProvider } from '@/utils/registerRemoteProvider'
 import GlobalError from './containers/GlobalError'
 
 // ATO-113: arm Sentry before anything else so the React ErrorBoundary and the
@@ -69,7 +76,7 @@ const preventDefaultFileDrop = () => {
   })
 }
 
-//* Запрет зума страницы: клавиатурные сочетания, Ctrl/Cmd+колесо, жесты трекпада/пальцев
+//* Disable page zoom: keyboard shortcuts, Ctrl/Cmd+wheel, trackpad/touch gestures
 const disablePageZoom = () => {
   const isZoomKey = (key: string) =>
     key === '+' ||
@@ -152,16 +159,40 @@ runWindowsLlamacppProviderMigration()
 // Windows / Linux and on second launch.
 runMacosLlamacppDefaultMigration()
 
-// When "Preload model on startup" is disabled, don't let a model selection
-// persisted from a previous session flash into the topbar or trigger
-// `ChatInput`'s local-model auto-start effect before we've confirmed
+// One-time classification of this profile as fresh-install vs existing, which
+// decides whether the TurboQuant `llamacpp` provider registers active (existing
+// users) or disabled-but-toggleable (fresh installs). Must run BEFORE React
+// mounts AND before the `preloadModelOnStartup` reset below — that
+// `useModelProvider.setState` call creates the persisted `model-provider`
+// blob, which would misclassify a fresh install as an existing profile.
+runTurboquantDefaultMigration()
+
+// Dev-only (`make dev-onboarding`): drop the persisted onboarding completion
+// flag so the forced run replays the whole flow — picker, 15s auto-exit, chat
+// handoff, model reminder — on every launch, without a factory reset. Must run
+// before React mounts so the very first render of `routes/index.tsx` sees it.
+// No-op in every shipped build.
+resetForcedOnboardingRun()
+
+// When "Preload model on startup" is disabled, don't let a *local* model
+// selection persisted from a previous session flash into the topbar or
+// trigger `ChatInput`'s local-model auto-start effect before we've confirmed
 // whether that model is actually still running. Both `useModelProvider`
 // and `useGeneralSetting` are synchronous localStorage-backed stores, so
 // they are already rehydrated at this point (well before React mounts).
 // `DropdownModelProvider`'s startup effect re-populates the selection from
 // the live engine state if a model turns out to still be active.
+//
+// A cloud selection is kept: it holds no memory and nothing has to start, so
+// the setting's reason ("open fast") does not apply, and clearing it made
+// every launch begin with "what do I reply with?" for a user whose answer was
+// already known (ATO-461). `DropdownModelProvider` still drops it if the
+// provider has since been disconnected.
 if (!useGeneralSetting.getState().preloadModelOnStartup) {
-  useModelProvider.setState({ selectedProvider: '', selectedModel: null })
+  const { selectedProvider } = useModelProvider.getState()
+  if (!selectedProvider || isLocalProvider(selectedProvider)) {
+    useModelProvider.setState({ selectedProvider: '', selectedModel: null })
+  }
 }
 
 // Tauri webviews ignore the HTML5 `download` attribute, so streamdown's
@@ -172,6 +203,12 @@ if (IS_TAURI) {
 
 // Create a new router instance
 const router = createRouter({ routeTree })
+
+if (IS_TAURI && !IS_IOS && !IS_ANDROID) {
+  installInternalNavigationHandler((href) => {
+    void router.navigate({ href })
+  })
+}
 
 // Register the router instance for type safety
 declare module '@tanstack/react-router' {

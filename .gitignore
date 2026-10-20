@@ -37,6 +37,9 @@ yarn-debug.log*
 yarn-error.log*
 pnpm-debug.log*
 lerna-debug.log*
+# Source, not output: the Rust module that reads the logs, and its log-format fixtures
+!src-tauri/src/core/logs/
+!src-tauri/src/core/logs/testdata/*.log
 
 # Rust / Cargo
 target/
@@ -48,6 +51,12 @@ src-tauri/resources/
 src-tauri/resources/*
 !src-tauri/resources/agent-skills/
 !src-tauri/resources/agent-skills/**
+!src-tauri/resources/llamacpp-backend/
+src-tauri/resources/llamacpp-backend/*
+!src-tauri/resources/llamacpp-backend/.gitkeep
+!src-tauri/resources/llamacpp-backend-upstream/
+src-tauri/resources/llamacpp-backend-upstream/*
+!src-tauri/resources/llamacpp-backend-upstream/.gitkeep
 src-tauri/resources/lib
 src-tauri/resources/bin
 src-tauri/icons/*
@@ -118,3 +127,6 @@ autoqa/__pycache__
 
 # Benchmarks
 benchmarks/
+
+# Local copy of the recommendations manifest for `make dev-onboarding-low-spec`.
+web-app/public/dev-recommended.json

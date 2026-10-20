@@ -32,6 +32,7 @@ Object.defineProperty(globalThis, 'window', {
 })
 
 vi.stubGlobal('IS_WINDOWS', false)
+vi.stubGlobal('IS_LINUX', false)
 
 vi.mock('../hardware', () => ({
   getSystemInfo: vi.fn(),
@@ -42,6 +43,14 @@ vi.mock('../hardware', () => ({
 vi.mock('@tauri-apps/api/core', () => ({
   invoke: vi.fn(),
   Channel: vi.fn(),
+}))
+
+vi.mock('@tauri-apps/api/event', () => ({ listen: vi.fn().mockResolvedValue(vi.fn()) }))
+
+// The app version travels with every catalog / recommendation / updates call to the core. The
+// implementation is passed to `vi.fn` so `restoreAllMocks` in a suite's `afterEach` keeps it.
+vi.mock('@tauri-apps/api/app', () => ({
+  getVersion: vi.fn(async () => '1.0.0'),
 }))
 
 vi.mock('@tauri-apps/plugin-log', () => ({

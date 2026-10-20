@@ -5,11 +5,10 @@ import { useProjectDialog } from '@/hooks/useProjectDialog'
 import { useRouter } from '@tanstack/react-router'
 import { route } from '@/constants/routes'
 import { PlatformShortcuts, ShortcutAction } from '@/lib/shortcuts'
-import { useAgentMode } from '@/hooks/useAgentMode'
-import { TEMPORARY_CHAT_ID } from '@/constants/chat'
 
 export function KeyboardShortcutsProvider() {
-  const { open, setLeftPanel } = useLeftPanel()
+  const open = useLeftPanel((state) => state.open)
+  const setLeftPanel = useLeftPanel((state) => state.setLeftPanel)
   const { setOpen: setSearchOpen } = useSearchDialog()
   const { setOpen: setProjectDialogOpen } = useProjectDialog()
   const router = useRouter()
@@ -33,20 +32,9 @@ export function KeyboardShortcutsProvider() {
   useKeyboardShortcut({
     ...newChatShortcut,
     callback: () => {
-      const { sidebarMode, setAgentMode } = useAgentMode.getState()
-      setAgentMode(TEMPORARY_CHAT_ID, sidebarMode === 'agent')
       router.navigate({ to: route.home })
     },
   })
-
-  // New Agent Chat — disabled, kept as dead code for future use
-  // useKeyboardShortcut({
-  //   ...newAgentChatShortcut,
-  //   callback: () => {
-  //     useAgentMode.getState().setAgentMode(TEMPORARY_CHAT_ID, true)
-  //     router.navigate({ to: route.home })
-  //   },
-  // })
 
   // New Project
   useKeyboardShortcut({

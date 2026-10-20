@@ -1,7 +1,11 @@
 {
+  "api": "API",
+  "cloud": "Cloud",
   "assistants": "Assistants",
   "hardware": "Matériel",
   "mcp-servers": "Serveurs MCP",
+  "connectors": "Connecteurs",
+  "plugins": "Plugins",
   "local_api_server": "Serveur Local API",
   "https_proxy": "Mandataire Proxy HTTPS",
   "extensions": "Extensions",
@@ -22,12 +26,17 @@
   "recents": "Récents",
   "hub": "Concentrateur Hub",
   "models": "Modèles",
+  "images": "Images",
+  "video": "Video",
+  "media": "Media",
   "helpSupport": "Aide & Support",
   "helpUsImproveJan": "Aidez-nous à améliorer Atomic Bot",
   "unstarAll": "Enlever toutes les étoiles",
   "unstar": "Désélectionner",
   "deleteAll": "Tout supprimer",
   "star": "Étoile",
+  "openInNewWindow": "Ouvrir dans une nouvelle fenêtre",
+  "openInNewWindowFailed": "Impossible d'ouvrir cette discussion dans une nouvelle fenêtre",
   "rename": "Renommer",
   "delete": "Supprimer",
   "copied": "Copié!",
@@ -239,16 +248,13 @@
     "deleteThread": {
       "description": "Êtes-vous sûr de vouloir supprimer cette discussion ? Cette action ne peut pas être annulée."
     },
-    "editMessage": {
-      "title": "Modifier le message"
-    },
     "messageMetadata": {
       "title": "Métadonnées du message"
     }
   },
   "projects": {
     "title": "Projets",
-    "new": "Nouveaux Projets",
+    "new": "Nouveau projet",
     "addProject": "Ajouter un projet",
     "addToProject": "Ajouter au projet",
     "removeFromProject": "Retirer du projet",
@@ -385,5 +391,18 @@
   "attachmentInjectedIndicator": "Injecté dans la discussion",
   "attachmentEmbeddedIndicator": "Intégré pour RAG",
   "viewInjectedContent": "Voir le contenu injecté",
-  "injectedContentTitle": "Contenu du fichier injecté"
+  "injectedContentTitle": "Contenu du fichier injecté",
+  "skills": "Compétences",
+  "pluginsMenu": {
+    "title": "Plugins",
+    "emptySkills": "Aucune compétence pour l’instant",
+    "manageSkills": "Gérer les compétences"
+  },
+  "desktopNotification": {
+    "modelReadyTitle": "Modèle téléchargé",
+    "modelReadyBody": "{{name}} est prêt à l'emploi.",
+    "engineReadyTitle": "Moteur installé",
+    "chatEngineReadyBody": "llama.cpp est prêt à exécuter des modèles.",
+    "mediaEngineReadyBody": "Le moteur d'images et de vidéo est prêt."
+  }
 }

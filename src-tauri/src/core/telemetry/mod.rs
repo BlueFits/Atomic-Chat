@@ -8,6 +8,7 @@
 //! `set_telemetry_consent` command.
 
 pub mod commands;
+pub mod core_state;
 pub mod scrub;
 
 use std::collections::HashMap;
@@ -42,6 +43,18 @@ pub fn consent_enabled() -> bool {
     TELEMETRY_ENABLED.load(Ordering::Relaxed)
 }
 
+/// Whether this build reports at all: `init` found a DSN and a non-development
+/// environment. A `tauri dev` session and a test run are not.
+static REPORTING_BUILD: AtomicBool = AtomicBool::new(false);
+
+/// What the app tells the core about its error reports: the user's consent, and
+/// only in a build that reports itself. The core reports by default otherwise
+/// (core ADR `2026-09-22-the-core-owns-its-error-reporting`), and a developer's
+/// session must not reach the production project through it.
+pub fn core_consent() -> bool {
+    consent_enabled() && REPORTING_BUILD.load(Ordering::Relaxed)
+}
+
 pub fn set_log_path(path: PathBuf) {
     let _ = LOG_PATH.set(path);
 }
@@ -64,6 +77,12 @@ pub fn init() -> Option<ClientInitGuard> {
         .filter(|s| !s.is_empty())
         .unwrap_or("production")
         .to_string();
+    // A developer's local `.env` pairs a real DSN with
+    // SENTRY_ENVIRONMENT=development, which sent every `tauri dev` session into
+    // the production project. Stay off entirely on such builds.
+    if environment == "development" {
+        return None;
+    }
 
     let options = ClientOptions {
         release: Some(release.into()),
@@ -81,6 +100,9 @@ pub fn init() -> Option<ClientInitGuard> {
             if is_duplicate_event(&event) {
                 return None;
             }
+            if is_transient_network_failure(&event) {
+                return None;
+            }
             Some(scrub_event(event))
         })),
         before_breadcrumb: Some(Arc::new(|crumb| {
@@ -92,7 +114,9 @@ pub fn init() -> Option<ClientInitGuard> {
         ..Default::default()
     };
 
-    Some(sentry::init((dsn, options)))
+    let guard = sentry::init((dsn, options));
+    REPORTING_BUILD.store(true, Ordering::Relaxed);
+    Some(guard)
 }
 
 /// Wrap the `tauri-plugin-log` logger so `log::error!` reaches Sentry (as
@@ -149,9 +173,108 @@ fn is_duplicate_event(event: &Event<'static>) -> bool {
     false
 }
 
+/// Loggers whose failures are dominated by connectivity, not by app defects.
+/// The background update check runs on every launch, so an offline machine or
+/// a briefly unreachable release host turns into a steady stream of crash
+/// events. A genuinely broken update channel still surfaces: only the
+/// connectivity-shaped failures below are dropped.
+const TRANSIENT_NETWORK_LOGGERS: &[&str] = &[
+    "tauri_plugin_updater",
+    "app_lib::core::updater::custom_updater",
+];
+
+/// Substrings `reqwest` uses for a request that never reached the server.
+const TRANSIENT_NETWORK_MARKERS: &[&str] = &[
+    "error sending request",
+    "operation timed out",
+    "dns error",
+    "connection refused",
+    "connection reset",
+    "network is unreachable",
+];
+
+/// Whether an event is an update check that failed for want of a working
+/// network connection.
+fn is_transient_network_failure(event: &Event<'static>) -> bool {
+    let logger = event.logger.as_deref().unwrap_or_default();
+    if !TRANSIENT_NETWORK_LOGGERS
+        .iter()
+        .any(|prefix| logger.starts_with(prefix))
+    {
+        return false;
+    }
+
+    let mut message = String::new();
+    if let Some(msg) = &event.message {
+        message.push_str(msg);
+    }
+    if let Some(logentry) = &event.logentry {
+        message.push_str(&logentry.message);
+    }
+    let message = message.to_ascii_lowercase();
+
+    TRANSIENT_NETWORK_MARKERS
+        .iter()
+        .any(|marker| message.contains(marker))
+}
+
+/// Model-load failures all arrive under the same headline ("Error in load
+/// command:") with a whole llama.cpp log pasted after it. Sentry groups on that
+/// text, so unrelated defects — a shard set opened at the wrong file, a model
+/// too big for the machine, a context longer than the model was trained on —
+/// landed in one issue, while incidental differences in the log split the same
+/// defect across several.
+///
+/// The engine already classifies the cause and stamps it into the message as a
+/// bracketed code. When one is present, group by it.
+const LOAD_ERROR_HEADLINE: &str = "Error in load command";
+
+/// Extract the `[SCREAMING_SNAKE_CASE]` code the engine appends to a load
+/// failure, if any.
+fn load_error_code(message: &str) -> Option<String> {
+    let open = message.rfind('[')?;
+    let close = message[open..].find(']')? + open;
+    let code = &message[open + 1..close];
+    if code.is_empty()
+        || !code
+            .chars()
+            .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+    {
+        return None;
+    }
+    Some(code.to_string())
+}
+
+/// Group a model-load failure by its cause rather than by the log text that
+/// happens to follow it. Returns `None` for everything else, leaving Sentry's
+/// default grouping alone.
+fn load_failure_fingerprint(event: &Event<'static>) -> Option<Vec<String>> {
+    let mut message = String::new();
+    if let Some(msg) = &event.message {
+        message.push_str(msg);
+    }
+    if let Some(logentry) = &event.logentry {
+        message.push_str(&logentry.message);
+    }
+    if !message.contains(LOAD_ERROR_HEADLINE) {
+        return None;
+    }
+
+    let code = load_error_code(&message).unwrap_or_else(|| "UNCLASSIFIED".to_string());
+    Some(vec!["model-load-failure".to_string(), code])
+}
+
 /// Strip machine name + IP, scrub every free-text field, and attach a scrubbed
 /// `app.log` tail.
 fn scrub_event(mut event: Event<'static>) -> Event<'static> {
+    if let Some(fingerprint) = load_failure_fingerprint(&event) {
+        event.fingerprint = fingerprint
+            .into_iter()
+            .map(std::borrow::Cow::Owned)
+            .collect::<Vec<_>>()
+            .into();
+    }
+
     // Machine/host name and any IP are forbidden by the zero-PII doctrine.
     event.server_name = None;
     if let Some(user) = event.user.as_mut() {
@@ -224,4 +347,122 @@ fn read_log_tail() -> Option<String> {
     let data = std::fs::read(path).ok()?;
     let start = data.len().saturating_sub(LOG_TAIL_BYTES);
     Some(scrub(&String::from_utf8_lossy(&data[start..])))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn event(logger: &str, message: &str) -> Event<'static> {
+        Event {
+            logger: Some(logger.to_string()),
+            message: Some(message.to_string()),
+            ..Default::default()
+        }
+    }
+
+    /// Real messages seen in the desktop project, trimmed.
+    const SPLIT_SHARD_FAILURE: &str = "Error in load command:\n\
+        The model process encountered an unexpected error.\n\
+        error loading model: illegal split file idx: 1 (file: /home/x/model.gguf), \
+        model must be loaded with the first split [LLAMA_CPP_PROCESS_ERROR]";
+    const OOM_FAILURE: &str = "Error in load command:\n\
+        Out of memory. The model requires more RAM or VRAM than available.\n\
+        failed to allocate CPU_REPACK buffer of size 2167603200 [OUT_OF_MEMORY]";
+
+    #[test]
+    fn load_failures_group_by_cause_not_by_log_text() {
+        let split = load_failure_fingerprint(&event("webview:error", SPLIT_SHARD_FAILURE));
+        let oom = load_failure_fingerprint(&event("webview:error", OOM_FAILURE));
+
+        assert_eq!(
+            split,
+            Some(vec![
+                "model-load-failure".to_string(),
+                "LLAMA_CPP_PROCESS_ERROR".to_string()
+            ])
+        );
+        assert_ne!(split, oom, "distinct causes must not share an issue");
+    }
+
+    #[test]
+    fn the_same_cause_groups_across_differing_logs() {
+        // Same defect, different user, different model, different timings.
+        let a = load_failure_fingerprint(&event("webview:error", SPLIT_SHARD_FAILURE));
+        let b = load_failure_fingerprint(&event(
+            "webview:error",
+            "Error in load command:\n\
+             The model process encountered an unexpected error.\n\
+             0.00.253.774 I cmn common_param: verbosity = 3\n\
+             error loading model: illegal split file idx: 3 (file: /Users/y/other.gguf), \
+             model must be loaded with the first split [LLAMA_CPP_PROCESS_ERROR]",
+        ));
+
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn an_unclassified_load_failure_still_gets_its_own_bucket() {
+        let fingerprint = load_failure_fingerprint(&event(
+            "webview:error",
+            "Error in load command:\nsomething we do not classify yet",
+        ));
+
+        assert_eq!(
+            fingerprint,
+            Some(vec![
+                "model-load-failure".to_string(),
+                "UNCLASSIFIED".to_string()
+            ])
+        );
+    }
+
+    #[test]
+    fn other_events_keep_default_grouping() {
+        assert_eq!(
+            load_failure_fingerprint(&event("app_lib::core::mcp", "Failed to start MCP server")),
+            None
+        );
+    }
+
+    #[test]
+    fn a_bracketed_non_code_is_not_mistaken_for_one() {
+        // Log lines are full of brackets; only a SCREAMING_SNAKE_CASE token counts.
+        assert_eq!(
+            load_error_code("Error in load command: [HummingbirdCore] failed"),
+            None
+        );
+        assert_eq!(
+            load_error_code("Error in load command: boom [OUT_OF_MEMORY]"),
+            Some("OUT_OF_MEMORY".to_string())
+        );
+    }
+
+    #[test]
+    fn drops_offline_update_checks() {
+        assert!(is_transient_network_failure(&event(
+            "tauri_plugin_updater::updater",
+            "failed to check for updates: error sending request for url (https://example.invalid/latest.json)",
+        )));
+        assert!(is_transient_network_failure(&event(
+            "app_lib::core::updater::custom_updater",
+            "All 1 endpoints failed, no usable network connection: HTTP request failed: operation timed out",
+        )));
+    }
+
+    #[test]
+    fn keeps_update_failures_that_are_not_connectivity() {
+        assert!(!is_transient_network_failure(&event(
+            "app_lib::core::updater::custom_updater",
+            "All 1 endpoints failed: Invalid response from server: missing signature",
+        )));
+    }
+
+    #[test]
+    fn keeps_network_shaped_failures_from_other_subsystems() {
+        assert!(!is_transient_network_failure(&event(
+            "app_lib::core::mcp::helpers",
+            "Failed to connect to server: error sending request",
+        )));
+    }
 }

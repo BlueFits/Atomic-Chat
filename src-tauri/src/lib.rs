@@ -3,7 +3,6 @@ pub mod core;
 #[cfg(test)]
 pub(crate) mod test_support;
 
-#[cfg(not(feature = "cli"))]
 use core::{
     app::commands::get_jan_data_folder_path,
     downloads::models::DownloadManagerState,
@@ -11,25 +10,22 @@ use core::{
     setup::{self, setup_mcp},
     state::AppState,
 };
-#[cfg(not(feature = "cli"))]
 use jan_utils::generate_app_token;
-#[cfg(not(feature = "cli"))]
 use std::{collections::HashMap, sync::Arc};
-#[cfg(not(feature = "cli"))]
 use tauri::{path::BaseDirectory, Emitter, Manager, RunEvent};
-#[cfg(all(not(feature = "cli"), target_os = "windows"))]
-use tauri_plugin_llamacpp_upstream::install_bundled_backend;
-#[cfg(not(feature = "cli"))]
 use tauri_plugin_store::StoreExt;
-#[cfg(not(feature = "cli"))]
 use tokio::sync::Mutex;
 
-#[cfg(not(feature = "cli"))]
 #[cfg_attr(
     all(mobile, any(target_os = "android", target_os = "ios")),
     tauri::mobile_entry_point
 )]
 pub fn run() {
+    // Before anything resolves a path: an end-to-end build without a root of
+    // its own would land in the developer's real profile.
+    #[cfg(feature = "e2e")]
+    core::e2e::require_root();
+
     let mut builder = tauri::Builder::default();
     #[cfg(desktop)]
     {
@@ -70,7 +66,10 @@ pub fn run() {
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_llamacpp::init())
         .plugin(tauri_plugin_llamacpp_upstream::init())
-        .plugin(tauri_plugin_vector_db::init())
+        // Document indexes belong to the data folder: they move with it and are reset with it.
+        .plugin(tauri_plugin_vector_db::init_in(|app| {
+            core::app::commands::get_jan_data_folder_path(app.clone()).join("db")
+        }))
         .plugin(tauri_plugin_rag::init());
 
     #[cfg(feature = "deep-link")]
@@ -78,19 +77,25 @@ pub fn run() {
         app_builder = app_builder.plugin(tauri_plugin_deep_link::init());
     }
 
-    #[cfg(feature = "mlx")]
-    {
-        app_builder = app_builder.plugin(tauri_plugin_mlx::init());
-    }
-
-    #[cfg(feature = "foundation-models")]
-    {
-        app_builder = app_builder.plugin(tauri_plugin_foundation_models::init());
-    }
-
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     {
         app_builder = app_builder.plugin(tauri_plugin_hardware::init());
+    }
+
+    // Voice input. Desktop only: it captures from a real microphone and drives
+    // a local llama.cpp server, neither of which exists on the mobile targets.
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    {
+        app_builder = app_builder.plugin(tauri_plugin_atomic_audio::init());
+    }
+
+    // Desktop UI end-to-end builds only: a WebDriver server inside the app, on
+    // 127.0.0.1:$TAURI_WEBDRIVER_PORT. It can drive the whole UI, so it exists
+    // only behind the `e2e` feature, which no release build enables.
+    #[cfg(feature = "e2e")]
+    {
+        app_builder = app_builder.plugin(tauri_plugin_wdio_webdriver::init());
+        app_builder = app_builder.plugin(core::e2e::seed_plugin());
     }
 
     // Desktop: include updater commands
@@ -102,7 +107,9 @@ pub fn run() {
         core::filesystem::commands::exists_sync,
         core::filesystem::commands::readdir_sync,
         core::filesystem::commands::read_file_sync,
+        core::filesystem::commands::read_file_chunk,
         core::filesystem::commands::get_os_home_dir,
+        core::filesystem::commands::get_env_vars,
         core::filesystem::commands::create_symlink,
         core::filesystem::commands::rm,
         core::filesystem::commands::mv,
@@ -129,10 +136,13 @@ pub fn run() {
         core::extensions::commands::get_active_extensions,
         // System commands
         core::system::commands::relaunch,
+        core::system::page_cache::get_page_cache_resident_fraction,
         core::system::commands::open_app_directory,
         core::system::commands::open_file_explorer,
         core::system::commands::factory_reset,
         core::system::commands::read_logs,
+        core::logs::commands::read_unified_logs,
+        core::logs::commands::export_logs,
         core::system::commands::show_desktop_notification,
         core::system::commands::get_installer_type,
         core::system::commands::is_library_available,
@@ -144,6 +154,7 @@ pub fn run() {
         core::system::commands::clear_claude_code_env,
         core::system::commands::configure_hermes_agent,
         core::system::commands::clear_hermes_agent_config,
+        core::system::commands::configure_atomic_agent,
         core::system::commands::detect_agent_installed,
         core::system::commands::install_agent,
         core::system::commands::configure_codex,
@@ -153,15 +164,20 @@ pub fn run() {
         core::system::commands::configure_mimo,
         core::system::commands::configure_zed,
         core::system::commands::launch_zed,
+        core::system::commands::configure_zcode,
+        core::system::commands::launch_zcode,
         core::system::commands::configure_openclaw,
+        core::system::commands::launch_openclaw_app,
         core::system::commands::configure_claude_code,
         core::system::commands::configure_copilot,
         core::system::commands::configure_droid,
         core::system::commands::configure_pi,
+        core::system::commands::configure_dsh,
         core::system::commands::configure_goose,
         core::system::commands::configure_openhands,
         core::system::commands::configure_kilo,
         core::system::commands::configure_poolside,
+        core::system::commands::configure_muse,
         core::system::commands::open_agent_terminal,
         core::system::commands::launch_editor,
         // Server commands
@@ -171,17 +187,30 @@ pub fn run() {
         core::image_generation::commands::generate_image,
         core::image_generation::commands::cancel_image_generation,
         core::image_generation::commands::list_image_models,
+        core::server::commands::get_api_request_log,
+        core::server::commands::set_api_inspector_enabled,
+        core::server::commands::clear_api_request_log,
         // Remote provider commands
         core::server::remote_provider_commands::register_provider_config,
         core::server::remote_provider_commands::unregister_provider_config,
-        core::server::remote_provider_commands::get_provider_config,
-        core::server::remote_provider_commands::list_provider_configs,
+        // ChatGPT subscription sign-in
+        core::auth::commands::chatgpt_status,
+        core::auth::commands::chatgpt_login,
+        core::auth::commands::chatgpt_cancel_login,
+        core::auth::commands::chatgpt_logout,
+        core::auth::commands::chatgpt_models,
         // MCP commands
         core::mcp::commands::get_tools,
+        core::mcp::commands::get_mcp_server_statuses,
         core::mcp::commands::call_tool,
         core::mcp::commands::cancel_tool_call,
+        core::chat_exec::commands::chat_exec_status,
+        core::chat_exec::commands::chat_exec_run,
+        core::chat_exec::commands::chat_exec_cancel,
         core::agent::commands::agent_run_turn,
         core::agent::commands::agent_cancel_turn,
+        core::agent::commands::agent_kill_session_procs,
+        core::agent::commands::agent_session_reseed,
         core::agent::commands::agent_resolve_approval,
         core::agent::commands::agent_resolve_folder_access,
         core::agent::commands::agent_workspace_list,
@@ -205,6 +234,9 @@ pub fn run() {
         core::mcp::commands::activate_mcp_server,
         core::mcp::commands::deactivate_mcp_server,
         core::mcp::commands::check_jan_browser_extension_connected,
+        core::mcp::oauth::mcp_oauth_login,
+        core::mcp::oauth::mcp_oauth_cancel,
+        core::mcp::oauth::mcp_oauth_logout,
         // Threads
         core::threads::commands::list_threads,
         core::threads::commands::create_thread,
@@ -220,6 +252,8 @@ pub fn run() {
         // Download
         core::downloads::commands::download_files,
         core::downloads::commands::cancel_download_task,
+        core::downloads::commands::test_proxy_connection,
+        core::downloads::commands::get_download_free_space,
         // Custom updater commands (desktop only)
         core::updater::commands::check_for_app_updates,
         core::updater::commands::is_update_available,
@@ -227,6 +261,7 @@ pub fn run() {
         core::http::post_local_http,
         core::http::get_local_http,
         core::http::stream_local_http,
+        core::http::cancel_local_stream,
         // HTML artifact preview (served via the artifact:// protocol)
         core::artifact::set_artifact_html,
         core::artifact::clear_artifact_html,
@@ -235,6 +270,21 @@ pub fn run() {
         // Telemetry (ATO-113): consent sync + zero-PII context tags for Sentry
         core::telemetry::commands::set_telemetry_consent,
         core::telemetry::commands::set_telemetry_context,
+        core::telemetry::commands::set_telemetry_user,
+        // Where a model is served. One answer for the webview, whoever owns the session.
+        core::sessions::resolve_local_session,
+        core::sessions::list_local_sessions,
+        // atomic-chat-core: one call for the whole control API, its status and
+        // its snapshot. Desktop only — the core is a native
+        // process the mobile targets do not ship.
+        core::atomic_core::commands::atomic_core_call,
+        core::atomic_core::commands::atomic_core_status,
+        core::atomic_core::commands::atomic_core_snapshot,
+        // The privileged step of a TensorRT-LLM setup (pkexec on Linux, UAC on Windows; elsewhere
+        // it answers unavailable).
+        core::atomic_core::commands::atomic_core_run_host_step,
+        // The progress bar's "restart now" (Windows) / "sign out now" (Linux) for a managed setup.
+        core::atomic_core::commands::atomic_core_finish_session_step,
     ]);
 
     // Mobile: no updater commands
@@ -246,7 +296,9 @@ pub fn run() {
         core::filesystem::commands::exists_sync,
         core::filesystem::commands::readdir_sync,
         core::filesystem::commands::read_file_sync,
+        core::filesystem::commands::read_file_chunk,
         core::filesystem::commands::get_os_home_dir,
+        core::filesystem::commands::get_env_vars,
         core::filesystem::commands::create_symlink,
         core::filesystem::commands::rm,
         core::filesystem::commands::mv,
@@ -273,10 +325,12 @@ pub fn run() {
         core::extensions::commands::get_active_extensions,
         // System commands
         core::system::commands::relaunch,
+        core::system::page_cache::get_page_cache_resident_fraction,
         core::system::commands::open_app_directory,
         core::system::commands::open_file_explorer,
         core::system::commands::factory_reset,
         core::system::commands::read_logs,
+        core::logs::commands::read_unified_logs,
         core::system::commands::show_desktop_notification,
         core::system::commands::get_installer_type,
         core::system::commands::is_library_available,
@@ -288,6 +342,7 @@ pub fn run() {
         core::system::commands::clear_claude_code_env,
         core::system::commands::configure_hermes_agent,
         core::system::commands::clear_hermes_agent_config,
+        core::system::commands::configure_atomic_agent,
         core::system::commands::detect_agent_installed,
         core::system::commands::install_agent,
         core::system::commands::configure_codex,
@@ -297,33 +352,44 @@ pub fn run() {
         core::system::commands::configure_mimo,
         core::system::commands::configure_zed,
         core::system::commands::launch_zed,
+        core::system::commands::configure_zcode,
+        core::system::commands::launch_zcode,
         core::system::commands::configure_openclaw,
+        core::system::commands::launch_openclaw_app,
         core::system::commands::configure_claude_code,
         core::system::commands::configure_copilot,
         core::system::commands::configure_droid,
         core::system::commands::configure_pi,
+        core::system::commands::configure_dsh,
         core::system::commands::configure_goose,
         core::system::commands::configure_openhands,
         core::system::commands::configure_kilo,
         core::system::commands::configure_poolside,
+        core::system::commands::configure_muse,
         core::system::commands::open_agent_terminal,
         core::system::commands::launch_editor,
         // Server commands
         core::server::commands::start_server,
         core::server::commands::stop_server,
         core::server::commands::get_server_status,
+        core::server::commands::get_api_request_log,
+        core::server::commands::set_api_inspector_enabled,
+        core::server::commands::clear_api_request_log,
         // Remote provider commands
         core::server::remote_provider_commands::register_provider_config,
         core::server::remote_provider_commands::unregister_provider_config,
-        core::server::remote_provider_commands::get_provider_config,
-        core::server::remote_provider_commands::list_provider_configs,
-        core::server::remote_provider_commands::abort_remote_stream,
         // MCP commands
         core::mcp::commands::get_tools,
+        core::mcp::commands::get_mcp_server_statuses,
         core::mcp::commands::call_tool,
         core::mcp::commands::cancel_tool_call,
+        core::chat_exec::commands::chat_exec_status,
+        core::chat_exec::commands::chat_exec_run,
+        core::chat_exec::commands::chat_exec_cancel,
         core::agent::commands::agent_run_turn,
         core::agent::commands::agent_cancel_turn,
+        core::agent::commands::agent_kill_session_procs,
+        core::agent::commands::agent_session_reseed,
         core::agent::commands::agent_resolve_approval,
         core::agent::commands::agent_resolve_folder_access,
         core::agent::commands::agent_workspace_list,
@@ -347,6 +413,9 @@ pub fn run() {
         core::mcp::commands::activate_mcp_server,
         core::mcp::commands::deactivate_mcp_server,
         core::mcp::commands::check_jan_browser_extension_connected,
+        core::mcp::oauth::mcp_oauth_login,
+        core::mcp::oauth::mcp_oauth_cancel,
+        core::mcp::oauth::mcp_oauth_logout,
         // Threads
         core::threads::commands::list_threads,
         core::threads::commands::create_thread,
@@ -362,6 +431,17 @@ pub fn run() {
         // Download
         core::downloads::commands::download_files,
         core::downloads::commands::cancel_download_task,
+        core::downloads::commands::test_proxy_connection,
+        core::downloads::commands::get_download_free_space,
+        // HTTP (bypasses tauri_plugin_http fetch interception).
+        // Registered on mobile too: `providers/tauri.ts` routes EVERY provider's
+        // model listing through `get_local_http`, with no platform branch, so
+        // leaving these desktop-only made custom cloud providers list nothing at
+        // all on iOS/Android (#293).
+        core::http::post_local_http,
+        core::http::get_local_http,
+        core::http::stream_local_http,
+        core::http::cancel_local_stream,
         // HTML artifact preview (served via the artifact:// protocol)
         core::artifact::set_artifact_html,
         core::artifact::clear_artifact_html,
@@ -369,32 +449,100 @@ pub fn run() {
         core::tray_status::update_tray_status,
     ]);
 
+    #[cfg(not(feature = "e2e"))]
+    let context = tauri::generate_context!();
+    #[cfg(feature = "e2e")]
+    let context = {
+        let mut context = tauri::generate_context!();
+        core::e2e::take_over_windows(&mut context);
+        core::e2e::namespace_identifier(&mut context);
+        context
+    };
+
     let app = app_builder
+        // The last TensorRT-LLM models root the core named (outside the data folder on Windows).
+        .manage(core::filesystem::model_roots::CoreModelRoot::default())
+        .manage(core::chat_exec::ChatExecState::default())
         .manage(AppState {
             app_token: Some(generate_app_token()),
             mcp_servers: Arc::new(Mutex::new(HashMap::new())),
+            mcp_start_generations: Arc::new(Mutex::new(HashMap::new())),
+            mcp_server_generations: Arc::new(Mutex::new(HashMap::new())),
+            mcp_server_errors: Arc::new(Mutex::new(HashMap::new())),
             download_manager: Arc::new(Mutex::new(DownloadManagerState::default())),
             mcp_active_servers: Arc::new(Mutex::new(HashMap::new())),
             server_handle: Arc::new(Mutex::new(None)),
+            local_server_endpoint: Arc::new(Mutex::new(None)),
             tool_call_cancellations: Arc::new(Mutex::new(HashMap::new())),
             agent_pending_approvals: Arc::new(Mutex::new(HashMap::new())),
             agent_pending_folder_access: Arc::new(Mutex::new(HashMap::new())),
             agent_approval_allowlist: Arc::new(Mutex::new(Default::default())),
             agent_session_locks: Arc::new(Mutex::new(HashMap::new())),
+            agent_pty_sessions: Default::default(),
             mcp_settings: Arc::new(Mutex::new(McpSettings::default())),
             mcp_shutdown_in_progress: Arc::new(Mutex::new(false)),
-            mcp_monitoring_tasks: Arc::new(Mutex::new(HashMap::new())),
             background_cleanup_handle: Arc::new(Mutex::new(None)),
             mcp_server_pids: Arc::new(Mutex::new(HashMap::new())),
             provider_configs: Arc::new(Mutex::new(HashMap::new())),
+            chatgpt_auth: Arc::new(Default::default()),
+            mcp_oauth: Arc::new(Default::default()),
             auto_increase_ctx: Arc::new(core::state::AutoIncreaseState::default()),
+            api_request_inspector: Arc::new(Default::default()),
+            session_resolver: Arc::new(std::sync::OnceLock::new()),
             #[cfg(desktop)]
             tray_handles: Arc::new(std::sync::Mutex::new(None)),
         })
         .setup(|app| {
+            // The same windows from the same config, built here so that each
+            // can be given this run's own WebKit data store.
+            #[cfg(feature = "e2e")]
+            {
+                core::e2e::require_inside_root(&get_jan_data_folder_path(app.handle().clone()));
+                core::e2e::create_windows(app)?;
+            }
+
             let log_dir = get_jan_data_folder_path(app.handle().clone()).join("logs");
-            let log_builder = tauri_plugin_log::Builder::default()
+            // The plugin's defaults are 40 KB per file with
+            // `RotationStrategy::KeepOne`, and `KeepOne` does not archive
+            // anything — it `remove_file`s `app.log` and starts over. At
+            // `Debug` (where `reqwest` / `hyper` alone produce a line per
+            // connection) that budget is spent in minutes, so a bug report
+            // filed even shortly after an incident carried none of it, and the
+            // file appeared to erase itself while the app was still running.
+            // 10 MB across 5 generations covers a long session, and the noisy
+            // HTTP crates are dropped to `warn` so app-level events aren't
+            // pushed out by transport chatter.
+            const LOG_MAX_FILE_SIZE: u128 = 10 * 1024 * 1024;
+            const LOG_GENERATIONS: usize = 5;
+            let log_builder = tauri_plugin_log::Builder::default();
+            // UTC set explicitly, not inherited from the plugin's default: the time format is
+            // shared with the core's `core.log`, and the Logs window merges the two files by it.
+            // The line format is set after `timezone_strategy`, which installs a format of its
+            // own with the level and target columns swapped. Mobile keeps the plugin's own.
+            #[cfg(desktop)]
+            let log_builder = log_builder
+                .timezone_strategy(tauri_plugin_log::TimezoneStrategy::UseUtc)
+                .format(|out, message, record| {
+                    out.finish(format_args!(
+                        "{}{message}",
+                        core::logs::line_header(
+                            chrono::Utc::now(),
+                            record.target(),
+                            record.level()
+                        )
+                    ))
+                });
+            let log_builder = log_builder
                 .level(log::LevelFilter::Debug)
+                .level_for("reqwest", log::LevelFilter::Warn)
+                .level_for("hyper", log::LevelFilter::Warn)
+                .level_for("hyper_util", log::LevelFilter::Warn)
+                .level_for("rustls", log::LevelFilter::Warn)
+                .level_for("h2", log::LevelFilter::Warn)
+                .max_file_size(LOG_MAX_FILE_SIZE)
+                .rotation_strategy(tauri_plugin_log::RotationStrategy::KeepSome(
+                    LOG_GENERATIONS,
+                ))
                 .targets([
                     tauri_plugin_log::Target::new(tauri_plugin_log::TargetKind::Stdout),
                     tauri_plugin_log::Target::new(tauri_plugin_log::TargetKind::Webview),
@@ -428,6 +576,23 @@ pub fn run() {
             #[cfg(not(any(target_os = "ios", target_os = "android")))]
             crate::core::process_reaper::reap_orphan_backends(app.handle());
 
+            // Start or attach to `atomic-chat-core`, which owns every local
+            // runtime and the public API on desktop. Placed after the reaper so
+            // the reaper has already decided which processes a live core owns.
+            #[cfg(not(any(target_os = "ios", target_os = "android")))]
+            crate::core::atomic_core::commands::init(app.handle());
+
+            // Same rationale for the agent's own children, which the backend
+            // reaper cannot recognise: they are arbitrary user commands, so
+            // they are identified by a journal of pids instead of by name.
+            {
+                let data_folder = get_jan_data_folder_path(app.handle().clone());
+                crate::core::agent::pty::reap_orphans(&data_folder);
+                app.state::<AppState>()
+                    .agent_pty_sessions
+                    .set_journal_path(&data_folder);
+            }
+
             #[cfg(target_os = "windows")]
             {
                 if let Err(e) = crate::core::notifications::ensure_aumid_registered(
@@ -435,40 +600,6 @@ pub fn run() {
                     "Atomic Chat",
                 ) {
                     log::warn!("Failed to register AUMID for toast notifications: {e}");
-                }
-            }
-
-            #[cfg(target_os = "windows")]
-            {
-                // Windows installs the bundled upstream backend on startup
-                // (turboquant fork is not shipped on Windows — see ADR
-                // 2026-05-22 "Windows ships only `llamacpp-upstream`"). The
-                // upstream extension reads from `llamacpp-upstream/backends/`.
-                let backends_dir = get_jan_data_folder_path(app.handle().clone())
-                    .join("llamacpp-upstream")
-                    .join("backends");
-                // block_on is safe here: the setup closure runs on the main
-                // thread, which is never a tokio runtime worker.
-                match tauri::async_runtime::block_on(install_bundled_backend(
-                    app.handle().clone(),
-                    backends_dir.to_string_lossy().to_string(),
-                )) {
-                    Ok(result) => {
-                        if let Some(backend_string) = result.backend_string {
-                            log::info!(
-                                "Bundled llama.cpp backend ready during startup: {}",
-                                backend_string
-                            );
-                        } else {
-                            log::info!("No bundled llama.cpp backend installed during startup");
-                        }
-                    }
-                    Err(err) => {
-                        log::warn!(
-                            "Failed to install bundled llama.cpp backend during startup: {}",
-                            err
-                        );
-                    }
                 }
             }
 
@@ -558,12 +689,29 @@ pub fn run() {
             }
 
             setup_mcp(app);
-            #[cfg(desktop)]
+            // Not in an end-to-end build: a clean profile always counts as a
+            // version change, so every run would overwrite the CLI on the
+            // operator's real PATH — outside the isolated test root.
+            #[cfg(all(desktop, not(feature = "e2e")))]
             setup::setup_jan_cli(app.handle().clone(), stored_version != app_version);
             setup::setup_theme_listener(app)?;
+
+            // Keep the Windows window hidden until synchronous setup is
+            // complete, then let WebView2 begin navigation. A fully hidden
+            // WebView2 does not load, so the frontend cannot reveal itself from
+            // JavaScript. The window is decorated/non-transparent on Windows to
+            // avoid the softbuffer resize panic that kills the process when the
+            // client area becomes zero (minimise, bad saved state, etc.).
+            #[cfg(target_os = "windows")]
+            {
+                if let Some(window) = app.get_webview_window("main") {
+                    window.show()?;
+                }
+            }
+
             Ok(())
         })
-        .build(tauri::generate_context!())
+        .build(context)
         .expect("error while running tauri application");
     // Handle app lifecycle events
     app.run(|app, event| {
@@ -578,95 +726,104 @@ pub fn run() {
             }
         }
 
-        if let RunEvent::Exit = event {
-            let app_handle = app.clone();
-
-            #[cfg(not(any(target_os = "ios", target_os = "android")))]
-            {
-                if let Some(window) = app_handle.get_webview_window("main") {
-                    let _ = window.emit("app-shutting-down", ());
-                    let _ = window.hide();
+        match event {
+            RunEvent::ExitRequested { .. } => {
+                log::info!("Application exit requested");
+            }
+            RunEvent::WindowEvent {
+                label,
+                event: window_event,
+                ..
+            } => match window_event {
+                tauri::WindowEvent::CloseRequested { .. } => {
+                    log::info!("Window close requested: {label}");
                 }
-            }
+                tauri::WindowEvent::Destroyed => {
+                    log::info!("Window destroyed: {label}");
+                }
+                _ => {}
+            },
+            RunEvent::Exit => {
+                let app_handle = app.clone();
 
-            let state = app_handle.state::<AppState>();
-
-            // Check if cleanup already ran.
-            // block_on is safe here: RunEvent callbacks run on the main
-            // thread, which is never a tokio runtime worker (block_in_place
-            // is a pass-through outside a runtime).
-            let cleanup_already_running = tokio::task::block_in_place(|| {
-                tauri::async_runtime::block_on(async {
-                    let handle = state.background_cleanup_handle.lock().await;
-                    handle.is_some()
-                })
-            });
-
-            if cleanup_already_running {
-                return;
-            }
-
-            // Run cleanup synchronously and WAIT for it to complete
-            tokio::task::block_in_place(|| {
-                tauri::async_runtime::block_on(async {
-                    use crate::core::mcp::helpers::background_cleanup_mcp_servers;
-
-                    let state = app_handle.state::<AppState>();
-
-                    if let Err(e) =
-                        crate::core::server::proxy::stop_server(state.server_handle.clone()).await
-                    {
-                        log::warn!("Local API Server shutdown failed: {e}");
+                #[cfg(not(any(target_os = "ios", target_os = "android")))]
+                {
+                    if let Some(window) = app_handle.get_webview_window("main") {
+                        let _ = window.emit("app-shutting-down", ());
+                        let _ = window.hide();
                     }
+                }
 
-                    // Increase timeout to 10 seconds and log if it times out
-                    let cleanup_future = background_cleanup_mcp_servers(&app_handle, &state);
-                    match tokio::time::timeout(tokio::time::Duration::from_secs(10), cleanup_future)
-                        .await
-                    {
-                        Ok(_) => log::info!("MCP cleanup completed successfully"),
-                        Err(_) => log::warn!("MCP cleanup timed out after 10 seconds"),
-                    }
+                // Full exit stops only this app's isolated core and its models;
+                // hiding the window in the tray does not reach RunEvent::Exit.
+                #[cfg(not(any(target_os = "ios", target_os = "android")))]
+                {
+                    let handle = app_handle.clone();
+                    tokio::task::block_in_place(|| {
+                        tauri::async_runtime::block_on(async move {
+                            crate::core::atomic_core::commands::shutdown(&handle).await;
+                        })
+                    });
+                }
 
-                    // Both llama.cpp providers keep their own process map, so clean
-                    // up each one to avoid orphaned llama-server processes on quit.
-                    if let Err(e) =
-                        tauri_plugin_llamacpp::cleanup_llama_processes(app_handle.clone()).await
-                    {
-                        log::warn!("Failed to cleanup llamacpp processes: {}", e);
-                    } else {
-                        log::info!("llamacpp processes cleaned up successfully");
-                    }
+                let state = app_handle.state::<AppState>();
 
-                    if let Err(e) =
-                        tauri_plugin_llamacpp_upstream::cleanup_llama_processes(app_handle.clone())
-                            .await
-                    {
-                        log::warn!("Failed to cleanup llamacpp-upstream processes: {}", e);
-                    } else {
-                        log::info!("llamacpp-upstream processes cleaned up successfully");
-                    }
+                // Agent-started processes are ours to end: nothing else will, and
+                // they hold ports and CPU. Synchronous and cheap — signals only.
+                let killed = state.agent_pty_sessions.kill_all();
+                if killed > 0 {
+                    log::info!("[agent-pty] terminated {killed} agent process(es) on exit");
+                }
 
-                    #[cfg(feature = "mlx")]
-                    {
-                        use tauri_plugin_mlx::cleanup_mlx_processes;
-                        if let Err(e) = cleanup_mlx_processes(app_handle.clone()).await {
-                            log::warn!("Failed to cleanup MLX processes: {}", e);
-                        } else {
-                            log::info!("MLX processes cleaned up successfully");
-                        }
-                    }
-
-                    #[cfg(feature = "foundation-models")]
-                    {
-                        use tauri_plugin_foundation_models::cleanup_processes;
-                        cleanup_processes(&app_handle).await;
-                        log::info!("Foundation Models processes cleaned up successfully");
-                    }
-
-                    log::info!("App cleanup completed");
+                // Check if cleanup already ran.
+                // block_on is safe here: RunEvent callbacks run on the main
+                // thread, which is never a tokio runtime worker (block_in_place
+                // is a pass-through outside a runtime).
+                let cleanup_already_running = tokio::task::block_in_place(|| {
+                    tauri::async_runtime::block_on(async {
+                        let handle = state.background_cleanup_handle.lock().await;
+                        handle.is_some()
+                    })
                 });
-            });
+
+                if cleanup_already_running {
+                    return;
+                }
+
+                // Run cleanup synchronously and WAIT for it to complete
+                tokio::task::block_in_place(|| {
+                    tauri::async_runtime::block_on(async {
+                        use crate::core::mcp::helpers::background_cleanup_mcp_servers;
+
+                        let state = app_handle.state::<AppState>();
+
+                        // Desktop's public API runs in the core, which stopped above; only mobile
+                        // runs the app's own proxy.
+                        #[cfg(mobile)]
+                        if let Err(e) =
+                            crate::core::server::proxy::stop_server(state.server_handle.clone())
+                                .await
+                        {
+                            log::warn!("Local API Server shutdown failed: {e}");
+                        }
+
+                        // Increase timeout to 10 seconds and log if it times out
+                        let cleanup_future = background_cleanup_mcp_servers(&app_handle, &state);
+                        match tokio::time::timeout(
+                            tokio::time::Duration::from_secs(10),
+                            cleanup_future,
+                        )
+                        .await
+                        {
+                            Ok(_) => log::info!("MCP cleanup completed successfully"),
+                            Err(_) => log::warn!("MCP cleanup timed out after 10 seconds"),
+                        }
+
+                        log::info!("App cleanup completed");
+                    });
+                });
+            }
+            _ => {}
         }
     });
 }

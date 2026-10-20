@@ -1,13 +1,14 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import {
+  firstGgufShardPath,
   getProxyConfig,
+  isEmbeddingGguf,
+  ggufShardSetPaths,
+  parseGgufShard,
   isConcreteVersionBackend,
-  matchesMtpLoadFailure,
+  isDownloadableUrl,
   hasEmbeddedMtp,
-  isMtpCapable,
-  isCpuBackend,
-  cpuHasAvx,
-  isUnsupportedNoAvxCpu,
+  classifyProjector,
 } from './util'
 
 // Mock console.log and console.error to avoid noise in tests
@@ -588,48 +589,6 @@ describe('isConcreteVersionBackend (ATO-124)', () => {
   })
 })
 
-describe('matchesMtpLoadFailure (ATO-125)', () => {
-  it('matches "failed to create MTP context"', () => {
-    expect(matchesMtpLoadFailure('error: failed to create MTP context')).toBe(
-      true
-    )
-  })
-
-  it('matches "context type MTP requested"', () => {
-    expect(
-      matchesMtpLoadFailure('context type MTP requested but model ...')
-    ).toBe(true)
-  })
-
-  it("matches \"doesn't contain MTP layers\" (with apostrophe)", () => {
-    expect(
-      matchesMtpLoadFailure("model doesn't contain MTP layers")
-    ).toBe(true)
-  })
-
-  it('matches "doesnt contain MTP layers" (without apostrophe)', () => {
-    expect(matchesMtpLoadFailure('model doesnt contain MTP layers')).toBe(true)
-  })
-
-  it('matches case-insensitively', () => {
-    expect(matchesMtpLoadFailure('FAILED TO CREATE MTP CONTEXT')).toBe(true)
-  })
-
-  it('does not match an OOM error', () => {
-    expect(
-      matchesMtpLoadFailure('ggml_backend_cuda_buffer_type_alloc: out of memory')
-    ).toBe(false)
-  })
-
-  it('does not match an unrelated error', () => {
-    expect(matchesMtpLoadFailure('some unrelated failure')).toBe(false)
-  })
-
-  it('returns false for an empty string', () => {
-    expect(matchesMtpLoadFailure('')).toBe(false)
-  })
-})
-
 describe('hasEmbeddedMtp', () => {
   it('detects embedded MTP in a dense Qwen3.5 GGUF', () => {
     expect(
@@ -647,6 +606,29 @@ describe('hasEmbeddedMtp', () => {
         'general.architecture': 'qwen35moe',
         'qwen35moe.block_count': '41',
         'qwen35moe.nextn_predict_layers': '1',
+      })
+    ).toBe(true)
+  })
+
+  it.each([
+    'qwen3next',
+    'glm4moe',
+    'glm-dsa',
+    'deepseek2',
+    'deepseek32',
+    'deepseek4',
+    'nemotron_h_moe',
+    'step35',
+    'mimo2',
+    'bailingmoe3',
+    'hy_v3',
+    'cohere2moe',
+  ])('detects embedded MTP in a %s GGUF (upstream MTP graph)', (arch) => {
+    expect(
+      hasEmbeddedMtp({
+        'general.architecture': arch,
+        [`${arch}.block_count`]: '48',
+        [`${arch}.nextn_predict_layers`]: '1',
       })
     ).toBe(true)
   })
@@ -692,128 +674,226 @@ describe('hasEmbeddedMtp', () => {
       'gemma4.block_count': '49',
       'gemma4.nextn_predict_layers': '1',
     },
+    {
+      'general.architecture': 'nemotron_h',
+      'nemotron_h.block_count': '42',
+      'nemotron_h.nextn_predict_layers': '1',
+    },
   ])('rejects non-capable metadata %#', (metadata) => {
     expect(hasEmbeddedMtp(metadata)).toBe(false)
   })
 })
 
-describe('isMtpCapable', () => {
-  const embeddedMetadata = {
-    'general.architecture': 'qwen35',
-    'qwen35.block_count': '33',
-    'qwen35.nextn_predict_layers': '1',
-  }
-
-  it('keeps MTP enabled for an embedded head with an ordinary filename', () => {
-    expect(isMtpCapable(embeddedMetadata, '')).toBe(true)
+describe('GGUF shard paths', () => {
+  it('reads the shard marker from a published file name', () => {
+    expect(parseGgufShard('Qwen3-BF16-00002-of-00003.gguf')).toEqual({
+      index: 2,
+      total: 3,
+    })
   })
 
-  it('disables MTP when neither metadata nor a draft head is present', () => {
-    expect(isMtpCapable({}, '')).toBe(false)
+  it('reads the shard marker from the containing directory', () => {
+    // How a downloaded shard is laid out on disk: the marker is in the folder,
+    // the file itself is always `model.gguf`.
+    expect(
+      parseGgufShard('models/unsloth/BF16/Qwen3-BF16-00002-of-00002/model.gguf')
+    ).toEqual({ index: 2, total: 2 })
   })
 
-  it('keeps the separate Gemma draft-head branch enabled', () => {
-    expect(isMtpCapable({}, '/models/gemma/mtp-draft.gguf')).toBe(true)
-  })
-})
-
-describe('isCpuBackend (ATO-185)', () => {
-  it('matches the Windows x64 CPU backend', () => {
-    expect(isCpuBackend('win-cpu-x64')).toBe(true)
-  })
-
-  it('matches the Linux x64 CPU backend', () => {
-    expect(isCpuBackend('linux-cpu-x64')).toBe(true)
+  it('treats an unsharded model as standalone', () => {
+    expect(parseGgufShard('models/author/Model-Q4_K_M/model.gguf')).toBeNull()
+    expect(ggufShardSetPaths('models/author/Model-Q4_K_M/model.gguf')).toEqual([
+      'models/author/Model-Q4_K_M/model.gguf',
+    ])
+    expect(firstGgufShardPath('models/author/Model-Q4_K_M/model.gguf')).toBe(
+      'models/author/Model-Q4_K_M/model.gguf'
+    )
   })
 
-  it('matches arm64 CPU backends', () => {
-    expect(isCpuBackend('win-cpu-arm64')).toBe(true)
-    expect(isCpuBackend('linux-cpu-arm64')).toBe(true)
+  it('rewrites any shard to the first one llama.cpp accepts', () => {
+    expect(firstGgufShardPath('Hermes-4-405B-UD-Q2_K_XL-00004-of-00004.gguf')).toBe(
+      'Hermes-4-405B-UD-Q2_K_XL-00001-of-00004.gguf'
+    )
+    expect(
+      firstGgufShardPath(
+        'models/unsloth/BF16/Qwen3-BF16-00002-of-00002/model.gguf'
+      )
+    ).toBe('models/unsloth/BF16/Qwen3-BF16-00001-of-00002/model.gguf')
   })
 
-  it('does not match GPU backends', () => {
-    expect(isCpuBackend('win-cuda-13-x64')).toBe(false)
-    expect(isCpuBackend('win-vulkan-x64')).toBe(false)
-    expect(isCpuBackend('linux-vulkan-x64')).toBe(false)
+  it('leaves a first shard alone', () => {
+    const path = 'Model-00001-of-00003.gguf'
+    expect(firstGgufShardPath(path)).toBe(path)
   })
 
-  it('does not match macOS backends', () => {
-    expect(isCpuBackend('macos-x64')).toBe(false)
-    expect(isCpuBackend('macos-arm64')).toBe(false)
+  it('expands a shard into the whole set, first shard first', () => {
+    expect(
+      ggufShardSetPaths(
+        'https://huggingface.co/unsloth/M-GGUF/resolve/main/BF16/M-BF16-00003-of-00003.gguf'
+      )
+    ).toEqual([
+      'https://huggingface.co/unsloth/M-GGUF/resolve/main/BF16/M-BF16-00001-of-00003.gguf',
+      'https://huggingface.co/unsloth/M-GGUF/resolve/main/BF16/M-BF16-00002-of-00003.gguf',
+      'https://huggingface.co/unsloth/M-GGUF/resolve/main/BF16/M-BF16-00003-of-00003.gguf',
+    ])
   })
 
-  it('strips BOM / whitespace and is case-insensitive', () => {
-    expect(isCpuBackend('\uFEFF  WIN-CPU-X64 ')).toBe(true)
+  it('keys off the last marker when the repo name carries one too', () => {
+    expect(
+      parseGgufShard('repo-00001-of-00002/weights-00002-of-00005.gguf')
+    ).toEqual({ index: 2, total: 5 })
   })
 
-  it('returns false for nullish input', () => {
-    expect(isCpuBackend(undefined)).toBe(false)
-    expect(isCpuBackend(null)).toBe(false)
-    expect(isCpuBackend('')).toBe(false)
-  })
-})
-
-describe('cpuHasAvx (ATO-185)', () => {
-  it('is true when AVX is present', () => {
-    expect(cpuHasAvx(['sse', 'sse2', 'avx'])).toBe(true)
-  })
-
-  it('is true when AVX2 is present (implies AVX)', () => {
-    expect(cpuHasAvx(['sse4_2', 'avx2'])).toBe(true)
-  })
-
-  it('is true when an AVX-512 sub-feature is present', () => {
-    expect(cpuHasAvx(['avx512_f', 'avx512_dq'])).toBe(true)
-  })
-
-  it('is case-insensitive', () => {
-    expect(cpuHasAvx(['AVX2'])).toBe(true)
-  })
-
-  it('is false for an SSE-only (no-AVX) CPU', () => {
-    expect(cpuHasAvx(['fpu', 'mmx', 'sse', 'sse2', 'sse3', 'ssse3'])).toBe(false)
-  })
-
-  it('is false for an empty / nullish list', () => {
-    expect(cpuHasAvx([])).toBe(false)
-    expect(cpuHasAvx(undefined)).toBe(false)
-    expect(cpuHasAvx(null)).toBe(false)
+  it('ignores a malformed marker', () => {
+    expect(parseGgufShard('Model-00000-of-00003.gguf')).toBeNull()
+    expect(parseGgufShard('Model-00004-of-00003.gguf')).toBeNull()
   })
 })
 
-describe('isUnsupportedNoAvxCpu (ATO-185)', () => {
-  const noAvxExts = ['fpu', 'mmx', 'sse', 'sse2', 'sse3', 'ssse3', 'sse4_1']
-
-  it('blocks an x86_64 CPU backend with no AVX', () => {
-    expect(isUnsupportedNoAvxCpu('x86_64', 'win-cpu-x64', noAvxExts)).toBe(true)
-    expect(isUnsupportedNoAvxCpu('x86_64', 'linux-cpu-x64', noAvxExts)).toBe(
+describe('isEmbeddingGguf', () => {
+  it('flags encoder-only embedding backbones', () => {
+    expect(isEmbeddingGguf({ 'general.architecture': 'bert' })).toBe(true)
+    expect(isEmbeddingGguf({ 'general.architecture': 'nomic-bert' })).toBe(true)
+    expect(isEmbeddingGguf({ 'general.architecture': 'jina-bert-v3' })).toBe(
       true
     )
   })
 
-  it('allows an x86 CPU that has AVX', () => {
+  it('flags an embedding conversion of a generative architecture', () => {
+    // Qwen3-Embedding keeps `qwen3` as its arch and is only distinguishable
+    // by the pooling type.
     expect(
-      isUnsupportedNoAvxCpu('x86_64', 'win-cpu-x64', [...noAvxExts, 'avx'])
+      isEmbeddingGguf({
+        'general.architecture': 'qwen3',
+        'qwen3.pooling_type': '2',
+      })
+    ).toBe(true)
+  })
+
+  it('flags a reranker by its classifier head', () => {
+    expect(
+      isEmbeddingGguf({
+        'general.architecture': 'qwen3',
+        'qwen3.classifier.output_labels': ['yes', 'no'],
+      })
+    ).toBe(true)
+  })
+
+  it('leaves plain decoders alone', () => {
+    expect(isEmbeddingGguf({ 'general.architecture': 'llama' })).toBe(false)
+    // Pooling type 0 is NONE.
+    expect(
+      isEmbeddingGguf({
+        'general.architecture': 'qwen3',
+        'qwen3.pooling_type': '0',
+      })
     ).toBe(false)
   })
 
-  it('does not block GPU backends even on a no-AVX CPU', () => {
-    expect(isUnsupportedNoAvxCpu('x86_64', 'win-vulkan-x64', noAvxExts)).toBe(
-      false
-    )
+  it('does not guess without metadata', () => {
+    expect(isEmbeddingGguf(undefined)).toBe(false)
+    expect(isEmbeddingGguf({})).toBe(false)
+  })
+})
+
+describe('classifyProjector', () => {
+  it('recognises an audio projector', () => {
+    // Voxtral's mmproj, as libmtmd writes it. `read_gguf_metadata` renders
+    // GGUF booleans as the strings "true"/"false".
+    expect(
+      classifyProjector({
+        'general.architecture': 'clip',
+        'clip.has_audio_encoder': 'true',
+        'clip.audio.projector_type': 'voxtral',
+      })
+    ).toEqual({ vision: false, audio: true })
   })
 
-  it('does not block non-x86 hosts (no AVX concept)', () => {
-    expect(isUnsupportedNoAvxCpu('arm64', 'linux-cpu-arm64', [])).toBe(false)
-    expect(isUnsupportedNoAvxCpu('aarch64', 'win-cpu-arm64', [])).toBe(false)
+  it('recognises a vision projector', () => {
+    expect(
+      classifyProjector({
+        'general.architecture': 'clip',
+        'clip.has_vision_encoder': 'true',
+        'clip.vision.projector_type': 'gemma3',
+      })
+    ).toEqual({ vision: true, audio: false })
   })
 
-  it('never blocks when the extension list is empty (probe failure)', () => {
-    expect(isUnsupportedNoAvxCpu('x86_64', 'win-cpu-x64', [])).toBe(false)
-    expect(isUnsupportedNoAvxCpu('x86_64', 'win-cpu-x64', null)).toBe(false)
+  it('recognises a projector that carries both modalities', () => {
+    expect(
+      classifyProjector({
+        'clip.has_vision_encoder': 'true',
+        'clip.has_audio_encoder': 'true',
+      })
+    ).toEqual({ vision: true, audio: true })
   })
 
-  it('accepts the amd64 arch alias', () => {
-    expect(isUnsupportedNoAvxCpu('amd64', 'win-cpu-x64', noAvxExts)).toBe(true)
+  it('falls back to vision for metadata it cannot classify', () => {
+    // Regression guard: before this function existed every mmproj was treated
+    // as vision, and a projector we fail to read must not lose that.
+    expect(classifyProjector({})).toEqual({ vision: true, audio: false })
+    expect(classifyProjector(undefined)).toEqual({ vision: true, audio: false })
+    expect(classifyProjector(null)).toEqual({ vision: true, audio: false })
+    expect(classifyProjector({ 'general.architecture': 'clip' })).toEqual({
+      vision: true,
+      audio: false,
+    })
+  })
+
+  it('does not treat a false flag as present', () => {
+    expect(
+      classifyProjector({
+        'clip.has_vision_encoder': 'true',
+        'clip.has_audio_encoder': 'false',
+      })
+    ).toEqual({ vision: true, audio: false })
+  })
+
+  it('tolerates real booleans as well as strings', () => {
+    expect(
+      classifyProjector({
+        'clip.has_audio_encoder': true,
+        'clip.has_vision_encoder': false,
+      })
+    ).toEqual({ vision: false, audio: true })
+  })
+
+  it('ignores an empty projector-type string', () => {
+    expect(
+      classifyProjector({
+        'clip.vision.projector_type': '',
+        'clip.audio.projector_type': '  ',
+      })
+    ).toEqual({ vision: true, audio: false })
+  })
+})
+
+describe('isDownloadableUrl', () => {
+  it('takes any https address as something to download', () => {
+    expect(isDownloadableUrl('https://huggingface.co/org/repo/resolve/main/m.gguf')).toBe(true)
+    expect(isDownloadableUrl('https://mirror.example/m.gguf')).toBe(true)
+  })
+
+  it('takes plain http only from this machine', () => {
+    expect(isDownloadableUrl('http://127.0.0.1:8080/m.gguf')).toBe(true)
+    expect(isDownloadableUrl('http://localhost:8080/m.gguf')).toBe(true)
+    expect(isDownloadableUrl('http://LOCALHOST/m.gguf')).toBe(true)
+    expect(isDownloadableUrl('http://[::1]:8080/m.gguf')).toBe(true)
+  })
+
+  it('does not take plain http from anywhere else, however local it looks', () => {
+    expect(isDownloadableUrl('http://mirror.example/m.gguf')).toBe(false)
+    expect(isDownloadableUrl('http://192.168.1.10/m.gguf')).toBe(false)
+    expect(isDownloadableUrl('http://127.0.0.1.evil.example/m.gguf')).toBe(false)
+    expect(isDownloadableUrl('http://localhost.evil.example/m.gguf')).toBe(false)
+    expect(isDownloadableUrl('http://user@127.0.0.1@evil.example/m.gguf')).toBe(false)
+  })
+
+  it('leaves paths on disk and nonsense to the local-file branch', () => {
+    expect(isDownloadableUrl('/Users/me/models/m.gguf')).toBe(false)
+    expect(isDownloadableUrl('C:\\models\\m.gguf')).toBe(false)
+    expect(isDownloadableUrl('ftp://127.0.0.1/m.gguf')).toBe(false)
+    expect(isDownloadableUrl('http://')).toBe(false)
+    expect(isDownloadableUrl('')).toBe(false)
   })
 })

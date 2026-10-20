@@ -1,4 +1,4 @@
-import { useState, type ReactNode } from 'react'
+import { useEffect, useState, type ReactNode } from 'react'
 import { ChevronDownIcon } from 'lucide-react'
 import {
   Collapsible,
@@ -13,6 +13,9 @@ type AgentActivityProps = {
   durationLabel: string
   workingLabel: string
   hasDetails?: boolean
+  /** Start expanded — for a run whose details are the point, e.g. a failure. */
+  defaultOpen?: boolean
+  className?: string
   children: ReactNode
 }
 
@@ -21,15 +24,24 @@ export function AgentActivity({
   durationLabel,
   workingLabel,
   hasDetails = true,
+  defaultOpen = false,
+  className,
   children,
 }: AgentActivityProps) {
-  const [open, setOpen] = useState(false)
+  const [open, setOpen] = useState(defaultOpen)
+  // `defaultOpen` cannot be a mount-only seed: the block mounts when the turn
+  // starts, and only turns out to have failed some steps later. One-way on
+  // purpose — it opens a panel that has something to say, and never closes one
+  // the reader opened.
+  useEffect(() => {
+    if (defaultOpen) setOpen(true)
+  }, [defaultOpen])
 
   return (
     <Collapsible
       open={open}
       onOpenChange={setOpen}
-      className="not-prose mb-3 text-sm text-muted-foreground"
+      className={cn('not-prose mb-3 text-sm text-muted-foreground', className)}
     >
       <CollapsibleTrigger
         disabled={!hasDetails}
@@ -41,7 +53,7 @@ export function AgentActivity({
         )}
       >
         {active ? (
-          <Shimmer duration={1}>{workingLabel}</Shimmer>
+          <Shimmer duration={2}>{workingLabel}</Shimmer>
         ) : (
           <span>{durationLabel}</span>
         )}

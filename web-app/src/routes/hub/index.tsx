@@ -1,73 +1,150 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
 import { useVirtualizer } from '@tanstack/react-virtual'
 import { createFileRoute, useNavigate } from '@tanstack/react-router'
-import { route } from '@/constants/routes'
-import { useModelSources } from '@/hooks/useModelSources'
-import { cn, sanitizeModelId } from '@/lib/utils'
 import {
-  useState,
-  useMemo,
-  useEffect,
-  useLayoutEffect,
-  ChangeEvent,
   useCallback,
+  useEffect,
+  useMemo,
   useRef,
-  useTransition,
+  useState,
+  type ReactNode,
 } from 'react'
-import { useModelProvider } from '@/hooks/useModelProvider'
-import { extractModelName } from '@/lib/models'
-import { useResolvedRecommendedModels } from '@/hooks/useResolvedRecommendedModels'
-import { IconSearch } from '@tabler/icons-react'
-import { Switch } from '@/components/ui/switch'
-import {
-  DropdownMenu,
-  DropdownMenuContent,
-  DropdownMenuItem,
-  DropdownMenuTrigger,
-} from '@/components/ui/dropdown-menu'
-import { useServiceHub } from '@/hooks/useServiceHub'
-import type { CatalogModel } from '@/services/models/types'
+import { Loader } from 'lucide-react'
 import HeaderPage from '@/containers/HeaderPage'
-import { ChevronsUpDown, Loader } from 'lucide-react'
-import { useTranslation } from '@/i18n/react-i18next-compat'
+import { DecisionHub } from '@/containers/hub/DecisionHub'
+import { EmbeddingHub } from '@/containers/hub/EmbeddingHub'
+import { HubCategorySelect } from '@/containers/hub/HubCategorySelect'
+import { HubFilters } from '@/containers/hub/HubFilters'
+import { HubNoResults, HubSearchInput } from '@/containers/hub/HubSearch'
+import { MediaHub } from '@/containers/hub/MediaHub'
+import { ModelDetailPanel } from '@/containers/hub/ModelDetailPanel'
+import { ModelListRow } from '@/containers/hub/ModelListRow'
+import {
+  ManagedHubBlocked,
+  ManagedHubChecking,
+} from '@/containers/hub/ManagedHubStatus'
+import { RECOMMENDED_MODEL_FALLBACKS } from '@/constants/models'
+import { route } from '@/constants/routes'
 import { useGeneralSetting } from '@/hooks/useGeneralSetting'
-import { useModelCatalogStore } from '@/stores/model-catalog-store'
+import { useHardware } from '@/hooks/useHardware'
+import { useHuggingFaceFeed } from '@/hooks/useHuggingFaceFeed'
+import { useModelProvider } from '@/hooks/useModelProvider'
+import { useModelSources } from '@/hooks/useModelSources'
+import { useServiceHub } from '@/hooks/useServiceHub'
+import { useStaffPicks } from '@/hooks/useStaffPicks'
+import { useManagedCurated } from '@/hooks/useManagedCurated'
+import { useManagedHubStates } from '@/hooks/useManagedHubState'
+import { usePrismFamilies, usePrismHubVisible } from '@/hooks/useModelSetup'
+import { useFoundryLocalHub, useFoundryLocalHubVisible } from '@/hooks/useFoundryLocalHub'
+import { UNKNOWN_HUB_STATE } from '@/lib/managed-engine/hub-state'
+import { hubKey, managedEngine } from '@/lib/managed-engines'
+import { useTranslation } from '@/i18n/react-i18next-compat'
+import {
+  applyHubFilters,
+  hasLikeData,
+  hubFormats,
+  huggingFaceQueries,
+  isUncensoredModel,
+  modelDownloadSizeText,
+  modelFitsBudget,
+  normalizeHubFilters,
+  parseHubEngine,
+  readHubFilters,
+  sortModels,
+  writeHubFilters,
+  type HubFilterState,
+  type HubSortKey,
+} from '@/lib/hub-filters'
+import {
+  collectInstalledModels,
+  filterInstalledBySearch,
+  withStaffPicks,
+} from '@/lib/hub-installed'
+import { isAnyDecisionHostSupported } from '@/lib/decision/platform'
+import { isEmbeddingHostSupported } from '@/lib/embedding/engine'
+import {
+  HUB_CATEGORIES,
+  isHubCategory,
+  type HubCategory,
+} from '@/lib/hub-media'
+import { getMemoryBudgetBytes, type ModelFormat } from '@/lib/model-card'
+import {
+  foundryLocalRows,
+  hubListSources,
+  managedBrowseRows,
+  managedSearchRows,
+  type ManagedPrefilterContext,
+} from '@/lib/managed-engine/hub-feed'
+import { extractModelName } from '@/lib/models'
+import { PlatformFeatures } from '@/lib/platform/const'
+import { PlatformFeature } from '@/lib/platform/types'
+import { cn } from '@/lib/utils'
 import { getModelSearchService } from '@/services/model-search'
+import type { GpuFacts } from '@/services/managed-environment/types'
+import { normalizeRepository } from '@/services/managed-models/models'
+import {
+  selectEnvironment,
+  useManagedEnvironmentStore,
+} from '@/stores/managed-environment-store'
+import { useModelCatalogStore } from '@/stores/model-catalog-store'
+import type { DiffusionModality } from '@/services/diffusion/types'
+import type { CatalogModel, HuggingFaceFeedSort } from '@/services/models/types'
+import type {
+  StaffPick,
+  StaffPickFormat,
+} from '@/services/staff-picks-registry'
 import { useShallow } from 'zustand/shallow'
-import { switchToModel } from '@/utils/switchModel'
-import { DEFAULT_MODEL_QUANTIZATIONS } from '@/constants/models'
-import { Button } from '@/components/ui/button'
-import { HubModelCard } from '@/containers/HubModelCard'
+import {
+  getHubFormat,
+  getHubSearchQuery,
+  setHubFormat,
+  setHubSearchQuery,
+} from './hub-session'
 
 type SearchParams = {
-  repo: string
-  engine?: 'mlx' | 'gguf'
+  repo?: string
+  /** The format to open on (a provider page's "find a model"), applied once on entry. */
+  engine?: ModelFormat
   q?: string
+  /**
+   * Repo id of the model shown in the right-hand detail panel; in the Images
+   * and Video categories, the id of the catalog family; in Decision and
+   * Embedding, the catalog id of the model.
+   */
+  model?: string
+  /** Absent means Chat: every link into the Hub from a chat asks for one. */
+  category?: HubCategory
 }
 
-function pickDefaultQuant(model: CatalogModel) {
-  return (
-    model.quants?.find((m) =>
-      DEFAULT_MODEL_QUANTIZATIONS.some((e) =>
-        m.model_id.toLowerCase().includes(e)
-      )
-    ) ?? model.quants?.[0]
-  )
+/** A row in the left column, plus the provenance the row needs to render. */
+type HubListItem = {
+  model: CatalogModel
+  pick?: StaffPick
+  fromHuggingFace?: boolean
+  /** A heading painted above this row: the first row of a new section. */
+  sectionLabel?: string
 }
 
-function isJanCatalogModel(model: CatalogModel) {
-  const normalizedName = model.model_name.toLowerCase()
-  const normalizedDeveloper = model.developer?.toLowerCase() ?? ''
-  const normalizedRepoName =
-    extractModelName(model.model_name)?.toLowerCase() ?? ''
-
-  return (
-    normalizedDeveloper.includes('janhq') ||
-    normalizedName.includes('/jan') ||
-    normalizedName.includes('jan-') ||
-    normalizedRepoName.startsWith('jan')
-  )
+/** The Hub's sort dropdown, in Hugging Face's own vocabulary. */
+const FEED_SORT_FOR: Record<HubSortKey, HuggingFaceFeedSort> = {
+  'recommended': 'trending',
+  'downloads': 'downloads',
+  'likes': 'likes',
+  'last-modified': 'lastModified',
 }
+
+/** One empty list for every render without a snapshot: a fresh `[]` would re-render forever. */
+const NO_GPUS: GpuFacts[] = []
+
+/** How many rows before the end of the list the next page is asked for. */
+const FEED_PREFETCH_ROWS = 8
+
+/**
+ * A managed engine's prefilter can leave a whole page with nothing to show; after
+ * this many such pages in a row the feed stops asking on its own, rather than
+ * paging through every safetensors repository on Hugging Face.
+ */
+const MANAGED_EMPTY_PAGES_LIMIT = 3
 
 // Base (non-instruction-tuned) Gemma 4 MLX builds (e.g.
 // `mlx-community/gemma-4-12B-4bit`, converted from `google/gemma-4-12B`)
@@ -75,9 +152,6 @@ function isJanCatalogModel(model: CatalogModel) {
 // in chat — garbled output (stray markup / wrong-script tokens) that never
 // stops. Only the `-it` instruction-tuned variants are usable. Hide the base
 // builds from the MLX catalog/search so they can't be picked by mistake.
-// Scoped to MLX (the reported failure) and to the speculative drafter / EAGLE
-// / MTP artifacts are explicitly kept (they carry their own markers and are
-// not standalone chat targets anyway).
 function isUnsupportedBaseGemmaMlx(model: CatalogModel) {
   const is_mlx = model.is_mlx ?? model.library_name === 'mlx'
   if (!is_mlx) return false
@@ -98,41 +172,247 @@ function isUnsupportedBaseGemmaMlx(model: CatalogModel) {
 export const Route = createFileRoute(route.hub.index as any)({
   component: HubContent,
   validateSearch: (search: Record<string, unknown>): SearchParams => ({
-    repo: search.repo as SearchParams['repo'],
-    engine:
-      search.engine === 'mlx' || search.engine === 'gguf'
-        ? search.engine
-        : undefined,
+    repo: typeof search.repo === 'string' ? search.repo : undefined,
+    engine: parseHubEngine(search.engine),
     q: typeof search.q === 'string' ? search.q : undefined,
+    model: typeof search.model === 'string' ? search.model : undefined,
+    category: isHubCategory(search.category) ? search.category : undefined,
   }),
 })
 
-// Module-level cache (survives the Hub route remount on back-navigation) that preserves list scroll; `q` ties the offset to the search it belongs to.
+// Module-level cache (survives the Hub route remount on back-navigation) that
+// preserves list scroll; `q` ties the offset to the search it belongs to.
 const hubScrollCache: { q: string; offset: number } = { q: '', offset: 0 }
 
 function HubContent() {
-  const [isPending, startTransition] = useTransition()
-  const parentRef = useRef(null)
-  const huggingfaceToken = useGeneralSetting((state) => state.huggingfaceToken)
+  const navigate = useNavigate()
+  const { category: categorySearchParam } = Route.useSearch()
   const serviceHub = useServiceHub()
-  const { engine: engineSearchParam, q: querySearchParam } = Route.useSearch()
+  const decisionApiSupported = serviceHub.decision().isSupported()
+  const embeddingApiSupported = serviceHub.embedding().isSupported()
+  const cpuArch = useHardware((s) => s.hardwareData.cpu.arch)
+  // Image and video models need the local media engine, decision models a
+  // TurboQuant or llama.cpp build for this machine, embedding models a
+  // llama.cpp one; with none the Hub stays the chat catalog it always was,
+  // switch and all.
+  const mediaSupported = PlatformFeatures[PlatformFeature.MEDIA_GENERATION]
+  const decisionSupported =
+    PlatformFeatures[PlatformFeature.LOCAL_INFERENCE] &&
+    decisionApiSupported &&
+    isAnyDecisionHostSupported(cpuArch)
+  const embeddingSupported =
+    PlatformFeatures[PlatformFeature.LOCAL_INFERENCE] &&
+    embeddingApiSupported &&
+    isEmbeddingHostSupported(cpuArch)
+  const categories = useMemo(
+    () =>
+      HUB_CATEGORIES.filter((c) =>
+        c === 'decision'
+          ? decisionSupported
+          : c === 'embedding'
+            ? embeddingSupported
+            : c === 'chat' || mediaSupported
+      ),
+    [mediaSupported, decisionSupported, embeddingSupported]
+  )
+  const category: HubCategory =
+    categorySearchParam && categories.includes(categorySearchParam)
+      ? categorySearchParam
+      : 'chat'
 
+  const changeCategory = useCallback(
+    (next: HubCategory) => {
+      void navigate({
+        to: route.hub.index,
+        // The selection belongs to the category it was made in.
+        search: (prev: SearchParams) => ({
+          ...prev,
+          category: next === 'chat' ? undefined : next,
+          model: undefined,
+          repo: undefined,
+        }),
+        replace: true,
+      })
+    },
+    [navigate]
+  )
+
+  const categoryTabs =
+    categories.length > 1 ? (
+      <HubCategorySelect
+        categories={categories}
+        value={category}
+        onChange={changeCategory}
+      />
+    ) : undefined
+
+  if (category === 'chat') return <ChatHub categoryTabs={categoryTabs} />
+  if (category === 'decision') {
+    return <DecisionHubContent categoryTabs={categoryTabs} />
+  }
+  if (category === 'embedding') {
+    return <EmbeddingHubContent categoryTabs={categoryTabs} />
+  }
+  return (
+    <MediaHubContent
+      key={category}
+      modality={category}
+      categoryTabs={categoryTabs}
+    />
+  )
+}
+
+function DecisionHubContent({ categoryTabs }: { categoryTabs?: ReactNode }) {
+  const navigate = useNavigate()
+  const { q: querySearchParam, model: modelSearchParam } = Route.useSearch()
+  const [query, setQuery] = useState(querySearchParam ?? getHubSearchQuery())
+
+  const changeQuery = useCallback(
+    (next: string) => {
+      setQuery(next)
+      setHubSearchQuery(next)
+      void navigate({
+        to: route.hub.index,
+        search: (prev: SearchParams) => ({
+          ...prev,
+          q: next.trim() || undefined,
+        }),
+        replace: true,
+      })
+    },
+    [navigate]
+  )
+
+  const selectModel = useCallback(
+    (modelId: string, options?: { replace?: boolean }) => {
+      void navigate({
+        to: route.hub.index,
+        search: (prev: SearchParams) => ({ ...prev, model: modelId }),
+        replace: options?.replace ?? false,
+      })
+    },
+    [navigate]
+  )
+
+  return (
+    <DecisionHub
+      categoryTabs={categoryTabs}
+      query={query}
+      onQueryChange={changeQuery}
+      selectedModelId={modelSearchParam ?? null}
+      onSelectModel={selectModel}
+    />
+  )
+}
+
+function EmbeddingHubContent({ categoryTabs }: { categoryTabs?: ReactNode }) {
+  const navigate = useNavigate()
+  const { q: querySearchParam, model: modelSearchParam } = Route.useSearch()
+  const [query, setQuery] = useState(querySearchParam ?? getHubSearchQuery())
+
+  const changeQuery = useCallback(
+    (next: string) => {
+      setQuery(next)
+      setHubSearchQuery(next)
+      void navigate({
+        to: route.hub.index,
+        search: (prev: SearchParams) => ({
+          ...prev,
+          q: next.trim() || undefined,
+        }),
+        replace: true,
+      })
+    },
+    [navigate]
+  )
+
+  const selectModel = useCallback(
+    (modelId: string, options?: { replace?: boolean }) => {
+      void navigate({
+        to: route.hub.index,
+        search: (prev: SearchParams) => ({ ...prev, model: modelId }),
+        replace: options?.replace ?? false,
+      })
+    },
+    [navigate]
+  )
+
+  return (
+    <EmbeddingHub
+      categoryTabs={categoryTabs}
+      query={query}
+      onQueryChange={changeQuery}
+      selectedModelId={modelSearchParam ?? null}
+      onSelectModel={selectModel}
+    />
+  )
+}
+
+function MediaHubContent({
+  modality,
+  categoryTabs,
+}: {
+  modality: DiffusionModality
+  categoryTabs?: ReactNode
+}) {
+  const navigate = useNavigate()
+  const { q: querySearchParam, model: modelSearchParam } = Route.useSearch()
+  // One search box for every category: switching keeps what was typed.
+  const [query, setQuery] = useState(querySearchParam ?? getHubSearchQuery())
+
+  const changeQuery = useCallback(
+    (next: string) => {
+      setQuery(next)
+      setHubSearchQuery(next)
+      void navigate({
+        to: route.hub.index,
+        search: (prev: SearchParams) => ({
+          ...prev,
+          q: next.trim() || undefined,
+        }),
+        replace: true,
+      })
+    },
+    [navigate]
+  )
+
+  const selectFamily = useCallback(
+    (familyId: string, options?: { replace?: boolean }) => {
+      void navigate({
+        to: route.hub.index,
+        search: (prev: SearchParams) => ({ ...prev, model: familyId }),
+        replace: options?.replace ?? false,
+      })
+    },
+    [navigate]
+  )
+
+  return (
+    <MediaHub
+      modality={modality}
+      categoryTabs={categoryTabs}
+      query={query}
+      onQueryChange={changeQuery}
+      selectedFamilyId={modelSearchParam ?? null}
+      onSelectFamily={selectFamily}
+    />
+  )
+}
+
+function ChatHub({ categoryTabs }: { categoryTabs?: ReactNode }) {
   const { t } = useTranslation()
+  const navigate = useNavigate()
+  const serviceHub = useServiceHub()
+  const listScrollRef = useRef<HTMLDivElement>(null)
+  const huggingfaceToken = useGeneralSetting((state) => state.huggingfaceToken)
+  const scanLocalModelsEnabled = useGeneralSetting((s) => s.scanLocalModels)
+  const {
+    q: querySearchParam,
+    model: modelSearchParam,
+    repo: repoSearchParam,
+    engine: engineSearchParam,
+  } = Route.useSearch()
 
-  const sortOptions = [
-    { value: 'newest', name: t('hub:sortNewest') },
-    { value: 'most-downloaded', name: t('hub:sortMostDownloaded') },
-    ...(IS_MACOS
-      ? [
-          { value: 'mlx', name: 'MLX' },
-          { value: 'gguf', name: 'GGUF' },
-        ]
-      : []),
-  ]
-  // Subscribe to the model-catalog store so the search service rebuilds
-  // its index whenever a fresh catalog (or pre-built MiniSearch snapshot)
-  // arrives. The store exposes the platform-neutral list; useModelSources
-  // (below) handles MLX/platform filtering before rendering.
   const catalogSnapshot = useModelCatalogStore((s) => s.catalog)
   const catalogIndexPayload = useModelCatalogStore((s) => s.index)
 
@@ -153,468 +433,106 @@ function HubContent() {
     }))
   )
 
-  const [searchValue, setSearchValue] = useState(querySearchParam ?? '')
-  const [sortSelected, setSortSelected] = useState(
-    engineSearchParam === 'mlx' || engineSearchParam === 'gguf'
-      ? engineSearchParam
-      : 'newest'
+  const providers = useModelProvider((state) => state.providers)
+  const setProviders = useModelProvider((state) => state.setProviders)
+
+  const { total_memory, gpus } = useHardware(
+    useShallow((s) => ({
+      total_memory: s.hardwareData.total_memory,
+      gpus: s.hardwareData.gpus,
+    }))
   )
-  const [expandedModels, setExpandedModels] = useState<Record<string, boolean>>(
-    {}
+  const budgetBytes = useMemo(
+    () => getMemoryBudgetBytes({ total_memory, gpus }),
+    [total_memory, gpus]
   )
-  const [isSearching, setIsSearching] = useState(false)
+
+  const [searchValue, setSearchValue] = useState(
+    querySearchParam ?? getHubSearchQuery()
+  )
+  const [debouncedSearchValue, setDebouncedSearchValue] = useState(searchValue)
+  // Every managed engine's state in the Hub (vLLM, TensorRT-LLM), each by its own plan.
+  const managedHubs = useManagedHubStates()
+  const visibleManaged = managedHubs
+    .filter((entry) => entry.hub.visible)
+    .map((entry) => entry.engine.id)
+    .join(',')
+  // Sort and toggles are saved; the format is GGUF on every launch and kept only for this one
+  // (`hub-session.ts`). A format this machine does not offer (yet) reads as GGUF.
+  const [storedFilters, setFilters] = useState<HubFilterState>(() => {
+    const saved = readHubFilters()
+    const format = getHubFormat()
+    return format ? { ...saved, formats: [format] } : saved
+  })
+  const prismHubVisible = usePrismHubVisible()
+  const foundryLocalHubVisible = useFoundryLocalHubVisible()
+  const availableFormats = useMemo(
+    () =>
+      hubFormats({
+        mlx: IS_MACOS,
+        managed: visibleManaged === '' ? [] : visibleManaged.split(','),
+        prism: prismHubVisible,
+        foundryLocal: foundryLocalHubVisible,
+      }),
+    [visibleManaged, prismHubVisible, foundryLocalHubVisible]
+  )
+  const filters = useMemo(
+    () => normalizeHubFilters(storedFilters, availableFormats),
+    [storedFilters, availableFormats]
+  )
   const [showOnlyDownloaded, setShowOnlyDownloaded] = useState(false)
+  const [isSearching, setIsSearching] = useState(false)
+  const [hfSearching, setHfSearching] = useState(false)
   const [huggingFaceRepo, setHuggingFaceRepo] = useState<CatalogModel | null>(
     null
   )
-  const [isInitialLoad, setIsInitialLoad] = useState(true)
-  const addModelSourceTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(
+  const [hfCandidates, setHfCandidates] = useState<CatalogModel[]>([])
+  const [deepLinkedModel, setDeepLinkedModel] = useState<CatalogModel | null>(
     null
   )
-  const [enrichedOrphans, setEnrichedOrphans] = useState<
-    Record<string, CatalogModel>
-  >({})
-  const enrichedOrphansFetchedRef = useRef<Set<string>>(new Set())
-  const providers = useModelProvider((state) => state.providers)
-  const setProviders = useModelProvider((state) => state.setProviders)
-  const scanLocalModelsEnabled = useGeneralSetting((s) => s.scanLocalModels)
+  const hfCandidatesFetchedForRef = useRef<string>('')
+  const exactRepoTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null)
 
-  const toggleModelExpansion = useCallback((modelId: string) => {
-    setExpandedModels((prev) => ({
-      ...prev,
-      [modelId]: !prev[modelId],
-    }))
+  const updateFilters = useCallback((next: HubFilterState) => {
+    setFilters(next)
+    setHubFormat(next.formats[0] ?? null)
+    writeHubFilters(next)
   }, [])
 
-  // Sorting functionality
-  const sortedModels = useMemo(() => {
-    let sorted = [...sources]
+  // A link into the Hub that names a format (`?engine=`) opens on it, as if it
+  // were picked from the filter, then leaves the URL: coming back to this page
+  // must not undo a format chosen since. Kept as named: a format not offered
+  // (yet — the provider list may still be loading) reads as GGUF meanwhile.
+  useEffect(() => {
+    if (!engineSearchParam) return
+    updateFilters({ ...storedFilters, formats: [engineSearchParam] })
+    void navigate({
+      to: route.hub.index,
+      search: (prev: SearchParams) => ({ ...prev, engine: undefined }),
+      replace: true,
+    })
+    // Once per link: the filters it overrides are not a reason to apply it again.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [engineSearchParam])
 
-    // Apply MLX/GGUF filter first (only on Mac)
-    if (sortSelected === 'mlx') {
-      sorted = sorted.filter((m) => m.is_mlx)
-    } else if (sortSelected === 'gguf') {
-      sorted = sorted.filter((m) => !m.is_mlx)
-    }
-
-    // Apply sorting
-    if (sortSelected === 'most-downloaded') {
-      return sorted.sort((a, b) => (b.downloads || 0) - (a.downloads || 0))
-    }
-    return sorted.sort(
-      (a, b) =>
-        new Date(b.created_at || 0).getTime() -
-        new Date(a.created_at || 0).getTime()
-    )
-  }, [sortSelected, sources])
-
-  // Filtered models (debounced search). MiniSearch resolves a query against
-  // ~3k models in single-digit ms, so the historical 300ms debounce only
-  // bought a visible window during which the previous query's results were
-  // still on screen — perceived as a flicker on fast typing. 80ms is enough
-  // to coalesce a held key without stalling the eye. Clearing the field
-  // bypasses debounce entirely so "show me everything" feels instant.
-  const [debouncedSearchValue, setDebouncedSearchValue] = useState(searchValue)
-
+  // MiniSearch resolves a query against ~3k models in single-digit ms, so a
+  // long debounce only leaves the previous query's results on screen — read
+  // as a flicker. Clearing the field bypasses the debounce entirely.
   useEffect(() => {
     if (searchValue === '') {
       setDebouncedSearchValue('')
       return
     }
-    const handler = setTimeout(() => {
-      setDebouncedSearchValue(searchValue)
-    }, 80)
+    const handler = setTimeout(() => setDebouncedSearchValue(searchValue), 80)
     return () => clearTimeout(handler)
   }, [searchValue])
 
-  const recommendedItems = useResolvedRecommendedModels(sources)
-
-  const filteredModels = useMemo(() => {
-    let filtered = sortedModels
-    // Apply search filter via the MiniSearch-powered service. The service
-    // operates on the catalog snapshot held by `model-catalog-store`, so
-    // ranking is unaffected by transient sort/filter state in this
-    // component. We intersect the scored hit set against `sortedModels`
-    // so engine / downloaded toggles keep working.
-    if (debouncedSearchValue.length) {
-      const scored = searchService.search(debouncedSearchValue, { limit: 500 })
-      if (scored.length > 0) {
-        const allowedIds = new Set(filtered.map((m) => m.model_name))
-        const ordered: CatalogModel[] = []
-        const seen = new Set<string>()
-        for (const hit of scored) {
-          if (!allowedIds.has(hit.model_name)) continue
-          if (seen.has(hit.model_name)) continue
-          seen.add(hit.model_name)
-          const original = filtered.find(
-            (m) => m.model_name === hit.model_name
-          )
-          ordered.push(original ?? hit)
-        }
-        filtered = ordered
-      } else {
-        // No MiniSearch hits — fall through to an empty list rather than
-        // a stale `filtered` so the UI surfaces "no results" cleanly.
-        filtered = []
-      }
-    }
-    // Apply downloaded filter
-    if (showOnlyDownloaded) {
-      const providerState = useModelProvider.getState()
-      // Merge models from BOTH local llama.cpp providers — the turboquant
-      // `llamacpp` fork AND the vanilla `llamacpp-upstream` build. On
-      // Windows/Linux the downloaded model is registered under
-      // `llamacpp-upstream` (the default), so consulting only `llamacpp`
-      // hid downloaded models from the "Downloaded" filter.
-      const llamacppModels = [
-        ...(providerState.getProviderByName('llamacpp')?.models ?? []),
-        ...(providerState.getProviderByName('llamacpp-upstream')?.models ?? []),
-      ]
-      const mlxModels = providerState.getProviderByName('mlx')?.models ?? []
-
-      const matchedLlamacppIds = new Set<string>()
-      const matchedMlxIds = new Set<string>()
-
-      // MlxModelDownloadAction uses its own sanitize that preserves dots,
-      // unlike the utils version which replaces dots with underscores.
-      const sanitizeMlxId = (id: string) =>
-        id.replace(/\s+/g, '-').replace(/[^a-zA-Z0-9\-_./]/g, '')
-
-      filtered = filtered
-        .filter((model) => {
-          if (model.is_mlx) {
-            const modelName =
-              model.model_name.split('/').pop() ?? model.model_name
-            const mlxModelId = sanitizeMlxId(modelName)
-            const match = mlxModels.find(
-              (m: { id: string }) =>
-                m.id === mlxModelId ||
-                m.id === `${model.developer}/${mlxModelId}`
-            )
-            if (match) {
-              matchedMlxIds.add(match.id)
-              return true
-            }
-            return false
-          }
-
-          const hasDownloaded = model.quants?.some((variant) => {
-            const llamaMatch = llamacppModels.find(
-              (m: { id: string }) =>
-                m.id === variant.model_id ||
-                m.id ===
-                  `${model.developer}/${sanitizeModelId(variant.model_id)}`
-            )
-            if (llamaMatch) matchedLlamacppIds.add(llamaMatch.id)
-
-            const mlxMatch = mlxModels.find(
-              (m: { id: string }) =>
-                m.id === variant.model_id ||
-                m.id ===
-                  `${model.developer}/${sanitizeModelId(variant.model_id)}`
-            )
-            if (mlxMatch) matchedMlxIds.add(mlxMatch.id)
-
-            return !!llamaMatch || !!mlxMatch
-          })
-          return hasDownloaded
-        })
-        .map((model) => {
-          if (model.is_mlx) return model
-          return {
-            ...model,
-            quants: model.quants?.filter((variant) => {
-              const isLlamaCppDownloaded = llamacppModels.some(
-                (m: { id: string }) =>
-                  m.id === variant.model_id ||
-                  m.id ===
-                    `${model.developer}/${sanitizeModelId(variant.model_id)}`
-              )
-              const isMlxDownloaded = mlxModels.some(
-                (m: { id: string }) =>
-                  m.id === variant.model_id ||
-                  m.id ===
-                    `${model.developer}/${sanitizeModelId(variant.model_id)}`
-              )
-              return isLlamaCppDownloaded || isMlxDownloaded
-            }),
-          }
-        })
-
-      // Try to find a catalog entry matching an orphan model ID.
-      const findCatalogEntry = (modelId: string) =>
-        sources.find(
-          (s) =>
-            s.model_name === modelId ||
-            s.model_name.split('/').pop() === modelId
-        )
-
-      const buildOrphanEntry = (
-        modelId: string,
-        isMlx: boolean
-      ): CatalogModel => {
-        if (enrichedOrphans[modelId]) {
-          return {
-            ...enrichedOrphans[modelId],
-            ...(isMlx ? { is_mlx: true } : {}),
-          }
-        }
-        const parts = modelId.split('/')
-        const developer = parts.length > 1 ? parts[0] : undefined
-        return {
-          model_name: modelId,
-          description: '',
-          developer,
-          downloads: 0,
-          ...(isMlx
-            ? { is_mlx: true }
-            : {
-                quants: [{ model_id: modelId, path: '', file_size: '' }],
-              }),
-        }
-      }
-
-      // Add locally-downloaded models not present in the catalog
-      // Skip embedding models (e.g. Sentence-Transformers) as they are auxiliary
-      if (sortSelected !== 'mlx') {
-        const orphanLlamacpp = llamacppModels.filter(
-          (m: { id: string; embedding?: boolean }) =>
-            !matchedLlamacppIds.has(m.id) && !m.embedding
-        )
-        for (const m of orphanLlamacpp) {
-          const catalogMatch = findCatalogEntry(m.id as string)
-          filtered.push(catalogMatch ?? buildOrphanEntry(m.id as string, false))
-        }
-      }
-
-      if (sortSelected !== 'gguf') {
-        const orphanMlx = mlxModels.filter(
-          (m: { id: string; embedding?: boolean }) =>
-            !matchedMlxIds.has(m.id) && !m.embedding
-        )
-        for (const m of orphanMlx) {
-          const catalogMatch = findCatalogEntry(m.id as string)
-          filtered.push(
-            catalogMatch
-              ? { ...catalogMatch, is_mlx: true }
-              : buildOrphanEntry(m.id as string, true)
-          )
-        }
-      }
-    }
-    // Add HuggingFace repo at the beginning if available.
-    // Respect the active engine filter so that MLX/GGUF chips don't leak through.
-    if (huggingFaceRepo) {
-      const matchesEngineFilter =
-        sortSelected === 'mlx'
-          ? huggingFaceRepo.is_mlx === true
-          : sortSelected === 'gguf'
-            ? huggingFaceRepo.is_mlx !== true
-            : true
-      const hfName = huggingFaceRepo.model_name.toLowerCase()
-      const alreadyPresent = filtered.some(
-        (m) => m.model_name.toLowerCase() === hfName
-      )
-      // Only surface the single exact-repo card at the top when the curated
-      // catalog is sparse for this query. ``fetchHuggingFaceModel`` resolves
-      // asynchronously (500ms debounce + network), so prepending it once it
-      // lands would jump a card to the very top and shove an already-rendered
-      // list of catalog hits down — perceived as a flicker on keyword search.
-      // Mirrors the ``filteredModels.length >= 5`` suppression used by the
-      // ``hfCandidates`` long-tail fallback below.
-      if (matchesEngineFilter && !alreadyPresent && filtered.length < 5) {
-        filtered = [huggingFaceRepo, ...filtered]
-      }
-    }
-    return filtered.filter(
-      (model) =>
-        !isJanCatalogModel(model) && !isUnsupportedBaseGemmaMlx(model)
-    )
-  }, [
-    sortedModels,
-    debouncedSearchValue,
-    showOnlyDownloaded,
-    huggingFaceRepo,
-    searchService,
-    sortSelected,
-    sources,
-    enrichedOrphans,
-    // Recompute the downloaded-filtered set when provider models change so a
-    // deleted model's card disappears immediately (ATO-180).
-    providers,
-  ])
-
-  // Collect orphan model IDs that need HuggingFace enrichment
-  const orphanIdsToEnrich = useMemo(() => {
-    if (!showOnlyDownloaded) return []
-    return filteredModels
-      .filter(
-        (m) => !m.downloads && !m.description && !enrichedOrphans[m.model_name]
-      )
-      .map((m) => ({ id: m.model_name, isMlx: !!m.is_mlx }))
-  }, [filteredModels, showOnlyDownloaded, enrichedOrphans])
-
-  // Fetch HuggingFace data for orphan models
   useEffect(() => {
-    if (!orphanIdsToEnrich.length) return
-
-    for (const { id, isMlx } of orphanIdsToEnrich) {
-      if (enrichedOrphansFetchedRef.current.has(id)) continue
-      enrichedOrphansFetchedRef.current.add(id)
-
-      const repoId = id.includes('/') ? id : isMlx ? `mlx-community/${id}` : id
-
-      serviceHub
-        .models()
-        .fetchHuggingFaceRepo(repoId, huggingfaceToken)
-        .then((repo) => {
-          if (!repo) return
-          const catalog = serviceHub.models().convertHfRepoToCatalogModel(repo)
-          setEnrichedOrphans((prev) => ({ ...prev, [id]: catalog }))
-        })
-        .catch(() => {})
-    }
-  }, [orphanIdsToEnrich, serviceHub, huggingfaceToken])
-
-  const showRecommendedBlock =
-    debouncedSearchValue.length === 0 && !showOnlyDownloaded
-
-  // Long-tail Hugging Face fallback (Path B).
-  //
-  // Trigger only when the curated catalog returns sparse hits for a
-  // non-trivial query. We fan out to HF's public search endpoint, dedupe
-  // against `filteredModels`, and append the result as additional
-  // CatalogModel cards. They land at the tail of the virtual list so
-  // curated hits always rank first.
-  const [hfCandidates, setHfCandidates] = useState<CatalogModel[]>([])
-  const hfCandidatesFetchedForRef = useRef<string>('')
-
-  useEffect(() => {
-    if (showOnlyDownloaded) {
-      setHfCandidates([])
-      hfCandidatesFetchedForRef.current = ''
-      return
-    }
-    const query = debouncedSearchValue.trim()
-    if (query.length < 3 || filteredModels.length >= 5) {
-      if (filteredModels.length >= 5) setHfCandidates([])
-      return
-    }
-    const cacheKey = query.toLowerCase()
-    if (hfCandidatesFetchedForRef.current === cacheKey) return
-    hfCandidatesFetchedForRef.current = cacheKey
-
-    let cancelled = false
-    serviceHub
-      .models()
-      .searchHuggingFaceCandidates(query, huggingfaceToken, 10)
-      .then((candidates) => {
-        if (cancelled) return
-        const seen = new Set(filteredModels.map((m) => m.model_name))
-        if (huggingFaceRepo) seen.add(huggingFaceRepo.model_name)
-        setHfCandidates(
-          candidates.filter((c) => !seen.has(c.model_name) && c.model_name)
-        )
-      })
-      .catch(() => {
-        if (!cancelled) setHfCandidates([])
-      })
-    return () => {
-      cancelled = true
-    }
-  }, [
-    debouncedSearchValue,
-    filteredModels,
-    showOnlyDownloaded,
-    serviceHub,
-    huggingfaceToken,
-    huggingFaceRepo,
-  ])
-
-  //* Каталог рендерится всегда: при поиске/фильтре «скачанные» — сам по себе, иначе под блоком Recommended
-  const virtualListModels = useMemo(() => {
-    if (hfCandidates.length === 0) return filteredModels
-    const seen = new Set(filteredModels.map((m) => m.model_name))
-    const tail = hfCandidates.filter(
-      (c) =>
-        c.model_name &&
-        !seen.has(c.model_name) &&
-        !isUnsupportedBaseGemmaMlx(c)
-    )
-    return tail.length > 0 ? [...filteredModels, ...tail] : filteredModels
-  }, [filteredModels, hfCandidates])
-
-  //* Стабильная и РЕАЛИСТИЧНАЯ оценка высоты строки. Реальная высота карточки
-  //* ~141–175px (замерено), поэтому старые 95px давали огромную ошибку: при
-  //* скролле каждая измеренная карточка резко «дорастала», getTotalSize скакал,
-  //* а скролл-anchoring браузера дрался с виртуализатором — отсюда пустоты
-  //* сверху и «пропадающие» карточки. Держим оценку близкой к факту и НЕ
-  //* зависящей от раскрытия (раскрытие меряется measureElement по факту), чтобы
-  //* не пересоздавать опции виртуализатора на каждый тоггл.
-  const estimateSize = useCallback(() => 152, [])
-
-  //* Виртуальный список лежит НЕ в начале скролл-контейнера: над ним блок
-  //* Recommended + заголовок «All Models». Без scrollMargin виртуализатор
-  //* считает координаты от верха контейнера, поэтому верхние карточки
-  //* «исчезают» слишком рано и сверху появляется пустота. Меряем смещение
-  //* контейнера списка и отдаём его как scrollMargin.
-  const listRef = useRef<HTMLDivElement>(null)
-  const [listScrollMargin, setListScrollMargin] = useState(0)
-
-  //* Оставляем дефолтную компенсацию скролла react-virtual: она двигает скролл
-  //* только когда РАЗМЕР МЕНЯЕТСЯ У СТРОКИ ВЫШЕ текущего оффсета (чтобы вьюпорт
-  //* не «съезжал» при доизмерении карточек на скролле). Раскрытие вариантов у
-  //* видимой карточки её не триггерит (start >= scrollOffset), поэтому скачка
-  //* при тоггле нет — при условии точной estimateSize (см. выше).
-  // The virtualizer - count is 0 (renders nothing) when there are no models
-  const rowVirtualizer = useVirtualizer({
-    count: virtualListModels.length,
-    getScrollElement: () => parentRef.current,
-    estimateSize,
-    overscan: 8,
-    scrollMargin: listScrollMargin,
-    measureElement: (el: HTMLElement) => el.getBoundingClientRect().height,
-  })
-
-  //* Меряем, насколько контейнер списка смещён от верха скролл-контейнера
-  //* (высота блока Recommended + заголовка). rAF-троттлинг + порог >1px, чтобы
-  //* не дёргать стейт; ResizeObserver на контенте над списком ловит изменения
-  //* его высоты (подгрузка рекомендаций, аватарок, ресайз окна).
-  useLayoutEffect(() => {
-    const el = listRef.current
-    const parent = parentRef.current as HTMLElement | null
-    if (!el || !parent) return
-    let raf = 0
-    const measure = () => {
-      cancelAnimationFrame(raf)
-      raf = requestAnimationFrame(() => {
-        const top =
-          el.getBoundingClientRect().top -
-          parent.getBoundingClientRect().top +
-          parent.scrollTop
-        setListScrollMargin((prev) => (Math.abs(prev - top) > 1 ? top : prev))
-      })
-    }
-    measure()
-    const above = parent.firstElementChild
-    const ro = new ResizeObserver(measure)
-    if (above) ro.observe(above)
-    window.addEventListener('resize', measure)
-    return () => {
-      cancelAnimationFrame(raf)
-      ro.disconnect()
-      window.removeEventListener('resize', measure)
-    }
-  }, [showRecommendedBlock, recommendedItems.length, isInitialLoad, loading])
-
-  useEffect(() => {
-    // Use startTransition to keep UI responsive during data fetch
-    startTransition(() => {
-      fetchSources()
-    })
+    void fetchSources()
   }, [fetchSources])
 
-  // Re-list engines on Hub enter / window focus so a deleted external file shows its broken badge.
+  // Re-list engines on Hub enter / window focus so a deleted external file
+  // shows its broken badge.
   useEffect(() => {
     if (!scanLocalModelsEnabled) return
     let cancelled = false
@@ -635,108 +553,680 @@ function HubContent() {
     }
   }, [scanLocalModelsEnabled, serviceHub, setProviders])
 
-  // Reset initial load state after data loads or on filter change
+  // The curated list carries a GGUF and an MLX entry per model. Showing both
+  // at once would list every model twice, so MLX picks surface only once the
+  // user narrows the format filter to MLX alone.
+  const picksFormat: StaffPickFormat =
+    filters.formats.length === 1 && filters.formats[0] === 'mlx'
+      ? 'mlx'
+      : 'gguf'
+  const staffPickItems = useStaffPicks(sources, picksFormat)
+  // A managed engine's format (vLLM, TensorRT-LLM) lists its descriptor's
+  // curated models and a narrowed feed of any safetensors repository instead of
+  // the picks and the catalog.
+  const listSources = hubListSources(filters.formats[0] ?? 'gguf')
+  const managedSelected = managedEngine(filters.formats[0])
+  const managedFormat = managedSelected !== undefined
+  const managedHub =
+    managedHubs.find((entry) => entry.engine.id === managedSelected?.id)?.hub ??
+    UNKNOWN_HUB_STATE
+  // PrismML lists the Bonsai families of the core's model rules: no picks, no
+  // catalog, no Hugging Face feed or search.
+  const prismFormat = filters.formats[0] === 'atomic-prism'
+  const prismFamilies = usePrismFamilies(prismFormat)
+  // Foundry Local lists conf's curated models, then Microsoft's catalog: no picks, no catalog, no
+  // Hugging Face feed or search (change add-foundry-local).
+  const foundryFormat = filters.formats[0] === 'foundry-local'
+  const foundryLocal = useFoundryLocalHub(foundryFormat && !showOnlyDownloaded)
+  // Formats whose list is their own: nothing is asked of Hugging Face under them.
+  const ownListFormat = prismFormat || foundryFormat
+
+  // Under a managed engine's format the engine's state comes first: what blocks
+  // it, or nothing at all until the core has answered. "Downloaded" lists what
+  // is on disk whatever the format, so it is never replaced.
+  const managedPanel: 'blocked' | 'checking' | null =
+    !managedFormat || showOnlyDownloaded
+      ? null
+      : managedHub.state === 'blocked'
+        ? 'blocked'
+        : managedHub.state === 'unknown'
+          ? 'checking'
+          : null
+
+  // Uncensored builds are a search of their own: the curated picks carry none,
+  // so the filter opens the whole catalog plus Hugging Face even with no query.
+  const isSearchMode =
+    debouncedSearchValue.length > 0 || showOnlyDownloaded || filters.uncensored
+
+  // Under the picks, the rest of Hugging Face in the order the sort dropdown
+  // names — its own trending score by default — a page at a time.
+  const feed = useHuggingFaceFeed(
+    listSources.feedFormat,
+    FEED_SORT_FOR[filters.sort],
+    !isSearchMode && !managedPanel && !ownListFormat
+  )
+  const uncensoredQueries = useMemo(
+    () => huggingFaceQueries(debouncedSearchValue, true),
+    [debouncedSearchValue]
+  )
+  const uncensoredFeed = useHuggingFaceFeed(
+    listSources.feedFormat,
+    FEED_SORT_FOR[filters.sort],
+    filters.uncensored && !managedPanel && !ownListFormat,
+    uncensoredQueries[0] ?? ''
+  )
+  const abliteratedFeed = useHuggingFaceFeed(
+    listSources.feedFormat,
+    FEED_SORT_FOR[filters.sort],
+    filters.uncensored &&
+      !managedPanel &&
+      !ownListFormat &&
+      uncensoredQueries.length > 1,
+    uncensoredQueries[1] ?? ''
+  )
+
+  // The curated models of the engine's descriptor, and what narrows the feed:
+  // its architectures and this machine's cards.
+  const managedCurated = useManagedCurated(
+    managedSelected?.id ?? '',
+    managedFormat && !managedPanel ? managedHub.descriptorId : null
+  )
+  const managedGpus = useManagedEnvironmentStore(
+    (state) => selectEnvironment(state)?.gpus ?? NO_GPUS
+  )
+  const managedContext = useMemo<ManagedPrefilterContext>(
+    () => ({
+      engineId: managedSelected?.id ?? '',
+      supportedArchitectures: managedCurated.supportedArchitectures,
+      gpus: managedGpus,
+    }),
+    [managedSelected?.id, managedCurated.supportedArchitectures, managedGpus]
+  )
+
+  // ---- Staff picks mode -------------------------------------------------
+
+  const staffPickModels = useMemo(
+    () =>
+      staffPickItems
+        .filter((item) => item.model !== null)
+        .map((item) => item.model as CatalogModel),
+    [staffPickItems]
+  )
+
+  const pickByRepo = useMemo(() => {
+    const map = new Map<string, StaffPick>()
+    for (const item of staffPickItems) {
+      if (item.model) map.set(item.model.model_name, item.pick)
+    }
+    return map
+  }, [staffPickItems])
+
+  // ---- Search mode ------------------------------------------------------
+
+  const searchMatches = useMemo(() => {
+    if (debouncedSearchValue.length === 0) return sources
+    const scored = searchService.search(debouncedSearchValue, { limit: 500 })
+    if (scored.length === 0) return []
+    const bySource = new Map(sources.map((m) => [m.model_name, m]))
+    const ordered: CatalogModel[] = []
+    const seen = new Set<string>()
+    for (const hit of scored) {
+      if (seen.has(hit.model_name)) continue
+      const original = bySource.get(hit.model_name)
+      if (!original) continue
+      seen.add(hit.model_name)
+      ordered.push(original)
+    }
+    return ordered
+  }, [debouncedSearchValue, searchService, sources])
+
+  // Every locally installed model, not the catalog narrowed down to the ones it
+  // happens to carry: a model imported by hand or found by the local scan has
+  // no catalog entry to filter to.
+  //
+  // Reading `providers` reactively (rather than via `getState()`) is what makes
+  // a downloaded/deleted model appear or vanish immediately (ATO-180).
+  //
+  // The staff picks claim their downloads too: onboarding offers picks the
+  // catalog does not index, and the Hub must recognise the file it fetched.
+  const installedCatalog = useMemo(
+    () => withStaffPicks(sources, staffPickModels),
+    [sources, staffPickModels]
+  )
+  const installedModels = useMemo(
+    () =>
+      showOnlyDownloaded
+        ? collectInstalledModels(installedCatalog, providers)
+        : [],
+    [showOnlyDownloaded, installedCatalog, providers]
+  )
+
+  const installedResults = useMemo(
+    () => filterInstalledBySearch(installedModels, debouncedSearchValue),
+    [installedModels, debouncedSearchValue]
+  )
+
+  const catalogResults = useMemo(
+    () =>
+      listSources.catalog
+        ? searchMatches.filter((model) => !isUnsupportedBaseGemmaMlx(model))
+        : [],
+    [listSources.catalog, searchMatches]
+  )
+
+  // A repository typed in full under a managed engine's format is shown as it is, whatever
+  // the prefilter would say: the core's verdict in its card is the answer. A
+  // bare word is not one — the lookup behind it finds GGUF repositories.
+  const managedExactRepo = useMemo<CatalogModel | null>(() => {
+    if (!managedFormat || !huggingFaceRepo) return null
+    const typed = normalizeRepository(debouncedSearchValue).toLowerCase()
+    if (huggingFaceRepo.model_name.toLowerCase() !== typed) return null
+    return { ...huggingFaceRepo, is_mlx: false, is_managed: true }
+  }, [managedFormat, huggingFaceRepo, debouncedSearchValue])
+
+  // Exact-repo lookup: the user pasted a full `owner/name`.
+  const fetchExactRepo = useCallback(
+    (rawValue: string) => {
+      const normalized = rawValue.trim()
+      if (normalized.length < 3) return
+
+      setIsSearching(true)
+      if (exactRepoTimeoutRef.current) {
+        clearTimeout(exactRepoTimeoutRef.current)
+      }
+      exactRepoTimeoutRef.current = setTimeout(async () => {
+        try {
+          const repoInfo = await serviceHub
+            .models()
+            .fetchHuggingFaceRepo(normalized, huggingfaceToken)
+          if (repoInfo) {
+            setHuggingFaceRepo(
+              serviceHub.models().convertHfRepoToCatalogModel(repoInfo)
+            )
+          }
+        } catch (error) {
+          console.error('Error fetching repository info:', error)
+        } finally {
+          setIsSearching(false)
+        }
+      }, 500)
+    },
+    [serviceHub, huggingfaceToken]
+  )
+
+  // Long-tail Hugging Face fallback (Path B): fan out to HF's public search
+  // when the curated catalog returns sparse hits for a non-trivial query.
+  // Uncensored has cursor-based feeds of its own above; keeping it out of this
+  // one-shot path removes the old 20-results-per-term ceiling.
   useEffect(() => {
-    if (!isInitialLoad) return
-
-    // Hide skeleton after a short delay to show loading state
-    const timer = setTimeout(() => setIsInitialLoad(false), 150)
-    return () => clearTimeout(timer)
-  }, [isInitialLoad, filteredModels.length])
-
-  const fetchHuggingFaceModel = async (searchValue: string) => {
-    const normalizedSearchValue = searchValue.trim()
-
-    if (normalizedSearchValue.length < 3) {
+    // Behind a managed engine's panel nothing is listed, so nothing is asked;
+    // PrismML lists its own families only.
+    if (showOnlyDownloaded || managedPanel || ownListFormat) {
+      setHfCandidates((current) => (current.length > 0 ? [] : current))
+      hfCandidatesFetchedForRef.current = ''
       return
     }
-
-    setIsSearching(true)
-    if (addModelSourceTimeoutRef.current) {
-      clearTimeout(addModelSourceTimeoutRef.current)
+    if (filters.uncensored) {
+      setHfCandidates((current) => (current.length > 0 ? [] : current))
+      hfCandidatesFetchedForRef.current = ''
+      setHfSearching(false)
+      return
     }
+    const query = debouncedSearchValue.trim()
+    if (query.length < 3 || catalogResults.length >= 5) {
+      if (catalogResults.length >= 5) setHfCandidates([])
+      return
+    }
+    const queries = huggingFaceQueries(query, false)
+    const cacheKey =
+      `${listSources.feedFormat}\n${queries.join('\n')}`.toLowerCase()
+    if (hfCandidatesFetchedForRef.current === cacheKey) return
+    hfCandidatesFetchedForRef.current = cacheKey
 
-    addModelSourceTimeoutRef.current = setTimeout(async () => {
-      try {
-        const repoInfo = await serviceHub
+    // A managed format's hits are narrowed by the prefilter afterwards, so it asks for more.
+    const limit = managedFormat ? 30 : 10
+    let cancelled = false
+    let settled = false
+    setHfSearching(true)
+    Promise.all(
+      queries.map((q) =>
+        serviceHub
           .models()
-          .fetchHuggingFaceRepo(normalizedSearchValue, huggingfaceToken)
-        if (repoInfo) {
-          const catalogModel = serviceHub
-            .models()
-            .convertHfRepoToCatalogModel(repoInfo)
-          if (
-            !sources.some(
-              (s) =>
-                catalogModel.model_name.trim().split('/').pop() ===
-                  s.model_name.trim() &&
-                catalogModel.developer?.trim() === s.developer?.trim()
-            )
-          ) {
-            setHuggingFaceRepo(catalogModel)
-          }
+          .searchHuggingFaceCandidates(
+            q,
+            huggingfaceToken,
+            limit,
+            managedFormat ? 'safetensors' : undefined
+          )
+      )
+    )
+      .then((batches) => {
+        if (cancelled) return
+        const seen = new Set(catalogResults.map((m) => m.model_name))
+        if (huggingFaceRepo) seen.add(huggingFaceRepo.model_name)
+        const merged: CatalogModel[] = []
+        for (const candidate of batches.flat()) {
+          if (!candidate.model_name || seen.has(candidate.model_name)) continue
+          seen.add(candidate.model_name)
+          merged.push(candidate)
         }
-      } catch (error) {
-        console.error('Error fetching repository info:', error)
-      } finally {
-        setIsSearching(false)
+        setHfCandidates(merged)
+      })
+      .catch(() => {
+        if (!cancelled) setHfCandidates([])
+      })
+      .finally(() => {
+        settled = true
+        if (!cancelled) setHfSearching(false)
+      })
+    return () => {
+      cancelled = true
+      setHfSearching(false)
+      // A run superseded mid-flight (the catalog finished loading, say) drops
+      // its answer, so let the next run ask again instead of hitting the cache.
+      if (!settled) hfCandidatesFetchedForRef.current = ''
+    }
+  }, [
+    debouncedSearchValue,
+    catalogResults,
+    showOnlyDownloaded,
+    filters.uncensored,
+    serviceHub,
+    huggingfaceToken,
+    huggingFaceRepo,
+    managedFormat,
+    managedPanel,
+    ownListFormat,
+    listSources.feedFormat,
+  ])
+
+  // ---- Unified list -----------------------------------------------------
+
+  const listItems = useMemo<HubListItem[]>(() => {
+    if (managedPanel) return []
+    if (showOnlyDownloaded) {
+      // The format and fit filters describe what to look for in the catalog;
+      // applied here they would hide models the user already has on disk.
+      // Uncensored is about the model itself, so it still narrows the list.
+      const installed = filters.uncensored
+        ? installedResults.filter(isUncensoredModel)
+        : installedResults
+      return sortModels(installed, filters.sort).map((model) => ({
+        model,
+        pick: pickByRepo.get(model.model_name),
+      }))
+    }
+
+    if (foundryFormat) {
+      // Curated first, then Microsoft's catalog, each narrowed by name. Sizes are a variant's, not
+      // a GGUF quant's, so the fit filter does not apply; the card shows each variant's verdict.
+      const rows = foundryLocalRows({
+        curated: foundryLocal.curated,
+        catalog: foundryLocal.catalog,
+        query: debouncedSearchValue,
+      })
+      return rows.map((row, index) => ({
+        model: row.model,
+        sectionLabel:
+          index === 0 || rows[index - 1].section !== row.section
+            ? t(row.section === 'curated' ? 'hub:foundryLocal.curated' : 'hub:foundryLocal.microsoftCatalog')
+            : undefined,
+      }))
+    }
+
+    if (prismFormat) {
+      // A search narrows the families by name; fit and Uncensored apply as
+      // they do to any GGUF.
+      const query = debouncedSearchValue.trim().toLowerCase()
+      const matching = query
+        ? prismFamilies.models.filter(
+            (model) =>
+              model.model_name.toLowerCase().includes(query) ||
+              model.description.toLowerCase().includes(query)
+          )
+        : prismFamilies.models
+      const filtered = applyHubFilters(
+        matching,
+        { ...filters, formats: ['gguf'] },
+        { budgetBytes, applyFitFilter: true }
+      )
+      return filtered.map((model, index) => ({
+        model,
+        sectionLabel: index === 0 ? t('hub:prismCurated') : undefined,
+      }))
+    }
+
+    if (!isSearchMode && managedFormat) {
+      // The feed waits for the descriptor's architectures: narrowed only once
+      // they arrive, its rows would vanish under the pointer.
+      const rows = managedBrowseRows({
+        curated: managedCurated.models,
+        feed: managedCurated.loading ? [] : feed.models,
+        context: managedContext,
+      })
+      return rows.map((row, index) => ({
+        model: row.model,
+        fromHuggingFace: row.section !== 'curated',
+        sectionLabel:
+          index === 0 || rows[index - 1].section !== row.section
+            ? t(
+                row.section === 'curated' && managedSelected
+                  ? hubKey(managedSelected)('curated')
+                  : 'hub:feedTitle'
+              )
+            : undefined,
+      }))
+    }
+
+    if (!isSearchMode) {
+      const filtered = applyHubFilters(staffPickModels, filters, {
+        budgetBytes,
+        applyFitFilter: true,
+      })
+      const picks: HubListItem[] = filtered.map((model, index) => ({
+        model,
+        pick: pickByRepo.get(model.model_name),
+        sectionLabel: index === 0 ? t('hub:staffPicks') : undefined,
+      }))
+
+      // The feed is already in Hugging Face's order for this sort, so it is
+      // appended as a section rather than re-sorted into the picks. A repo
+      // the catalog knows is shown from the catalog, sizes included; one the
+      // user has scrolled to shows the card fetched for it; the rest stay
+      // lightweight until they come on screen.
+      const taken = new Set(
+        staffPickModels.map((m) => m.model_name.toLowerCase())
+      )
+      const bySource = new Map(
+        sources.map((m) => [m.model_name.toLowerCase(), m])
+      )
+      const feedRows: HubListItem[] = []
+      for (const entry of feed.models) {
+        const key = entry.model_name.toLowerCase()
+        if (taken.has(key)) continue
+        taken.add(key)
+        const model =
+          bySource.get(key) ?? feed.details.get(entry.model_name) ?? entry
+        if (isUnsupportedBaseGemmaMlx(model)) continue
+        // A size the row does not know yet cannot fail the fit filter.
+        if (
+          filters.onlyFitting &&
+          budgetBytes > 0 &&
+          modelDownloadSizeText(model) !== undefined &&
+          !modelFitsBudget(model, budgetBytes)
+        ) {
+          continue
+        }
+        feedRows.push({
+          model,
+          fromHuggingFace: true,
+          sectionLabel: feedRows.length === 0 ? t('hub:feedTitle') : undefined,
+        })
       }
-    }, 500)
-  }
-
-  const handleSearchChange = (e: ChangeEvent<HTMLInputElement>) => {
-    const next = e.target.value
-    setIsSearching(false)
-    setSearchValue(next)
-    // Only drop the "found outside catalog" card when the new query can
-    // not yield a result anyway (matches the ``< 3`` early-return in
-    // ``fetchHuggingFaceModel``). Clearing it on every keystroke made the
-    // card disappear → reappear on fast typing, which read as a flicker
-    // even when the underlying repo was still relevant.
-    if (next.trim().length < 3) {
-      setHuggingFaceRepo(null)
+      return [...picks, ...feedRows]
     }
 
-    if (!showOnlyDownloaded) {
-      fetchHuggingFaceModel(next)
+    const seen = new Set(catalogResults.map((m) => m.model_name))
+    const head: CatalogModel[] =
+      huggingFaceRepo &&
+      !seen.has(huggingFaceRepo.model_name) &&
+      catalogResults.length < 5
+        ? [huggingFaceRepo]
+        : []
+    for (const model of head) seen.add(model.model_name)
+
+    // A managed row keeps its listing entry: a card fetched for the same
+    // repository as a GGUF or MLX row carries none of its architectures.
+    const pagedUncensored = !filters.uncensored
+      ? []
+      : managedFormat
+        ? [...uncensoredFeed.models, ...abliteratedFeed.models]
+        : [...uncensoredFeed.models, ...abliteratedFeed.models].map(
+            (model) => uncensoredFeed.details.get(model.model_name) ?? model
+          )
+
+    if (managedFormat) {
+      const rows = managedSearchRows({
+        exact: managedExactRepo,
+        candidates: filters.uncensored ? pagedUncensored : hfCandidates,
+        context: managedContext,
+      })
+      const exact = rows.filter((row) => row.section === 'exact').map((row) => row.model)
+      // The memory-budget fit is a GGUF reading of system memory; managed
+      // weights were already weighed against the cards by the prefilter.
+      const found = applyHubFilters(
+        rows.filter((row) => row.section !== 'exact').map((row) => row.model),
+        filters,
+        { applyFitFilter: false }
+      )
+      return [...exact, ...found].map((model, index) => ({
+        model,
+        fromHuggingFace: true,
+        sectionLabel:
+          filters.uncensored && index === 0 ? t('hub:uncensored') : undefined,
+      }))
     }
-  }
-
-  const navigate = useNavigate()
-
-  // Mirror the (debounced) search query into the URL `q` param so it survives opening a model detail page and coming back (Hub re-seeds `searchValue` from `q`); `replace` avoids history spam.
-  useEffect(() => {
-    const current = querySearchParam ?? ''
-    const next = debouncedSearchValue.trim()
-    if (next === current) return
-    void navigate({
-      to: route.hub.index,
-      search: (prev) => ({ ...prev, q: next || undefined }),
-      replace: true,
+    // A search hit carries no file list, so the detail panel has nothing to
+    // offer for download until the card fetched for the selected row replaces
+    // it — the same swap the feed and the uncensored listing make.
+    const tailSource = filters.uncensored
+      ? pagedUncensored
+      : hfCandidates.map((model) => feed.details.get(model.model_name) ?? model)
+    const tail = tailSource.filter((candidate) => {
+      if (
+        seen.has(candidate.model_name) ||
+        isUnsupportedBaseGemmaMlx(candidate)
+      ) {
+        return false
+      }
+      seen.add(candidate.model_name)
+      return true
     })
-  }, [debouncedSearchValue, querySearchParam, navigate])
 
-  // Open a model detail page, remembering the search query and list scroll position so the back button restores where the user was (see restore effect below).
-  const openModel = useCallback(
-    (modelId: string) => {
-      const el = parentRef.current as HTMLElement | null
-      const query = searchValue.trim()
-      hubScrollCache.q = query
+    const hfNames = new Set([
+      ...head.map((m) => m.model_name),
+      ...tail.map((m) => m.model_name),
+    ])
+
+    const filtered = applyHubFilters(
+      [...head, ...catalogResults, ...tail],
+      filters,
+      { budgetBytes, applyFitFilter: true }
+    )
+
+    return filtered.map((model, index) => ({
+      model,
+      fromHuggingFace: hfNames.has(model.model_name),
+      sectionLabel:
+        filters.uncensored && index === 0 ? t('hub:uncensored') : undefined,
+    }))
+  }, [
+    managedPanel,
+    managedFormat,
+    prismFormat,
+    prismFamilies.models,
+    foundryFormat,
+    foundryLocal.curated,
+    foundryLocal.catalog,
+    debouncedSearchValue,
+    managedCurated.models,
+    managedCurated.loading,
+    managedContext,
+    managedExactRepo,
+    isSearchMode,
+    showOnlyDownloaded,
+    installedResults,
+    staffPickModels,
+    pickByRepo,
+    catalogResults,
+    huggingFaceRepo,
+    hfCandidates,
+    uncensoredFeed.models,
+    uncensoredFeed.details,
+    uncensoredFeed.detailsVersion,
+    abliteratedFeed.models,
+    abliteratedFeed.detailsVersion,
+    filters,
+    budgetBytes,
+    sources,
+    feed.models,
+    feed.details,
+    // The details map keeps its identity; its version is what changes.
+    feed.detailsVersion,
+    t,
+  ])
+
+  const showLikesSort = useMemo(
+    () => hasLikeData(listItems.map((item) => item.model)),
+    [listItems]
+  )
+
+  // ---- Selection --------------------------------------------------------
+
+  const selectedRepo = modelSearchParam ?? null
+
+  const selectedItem = useMemo(() => {
+    if (!selectedRepo) return null
+    const fromList = listItems.find(
+      (item) => item.model.model_name === selectedRepo
+    )
+    if (fromList) return fromList
+    const fromSources = sources.find((m) => m.model_name === selectedRepo)
+    if (fromSources) {
+      return { model: fromSources, pick: pickByRepo.get(selectedRepo) }
+    }
+    if (deepLinkedModel?.model_name === selectedRepo) {
+      return { model: deepLinkedModel, pick: pickByRepo.get(selectedRepo) }
+    }
+    return null
+  }, [selectedRepo, listItems, sources, deepLinkedModel, pickByRepo])
+
+  // Deep link into a repo the catalog does not carry: resolve it from HF once.
+  useEffect(() => {
+    if (!selectedRepo || selectedItem) return
+    const fallback =
+      RECOMMENDED_MODEL_FALLBACKS[repoSearchParam ?? selectedRepo]
+    if (fallback) {
+      setDeepLinkedModel(fallback)
+      return
+    }
+    let cancelled = false
+    serviceHub
+      .models()
+      .fetchHuggingFaceRepo(repoSearchParam ?? selectedRepo, huggingfaceToken)
+      .then((repo) => {
+        if (cancelled || !repo) return
+        setDeepLinkedModel(
+          serviceHub.models().convertHfRepoToCatalogModel(repo)
+        )
+      })
+      .catch((error) => {
+        console.error('Failed to resolve deep-linked model:', error)
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [
+    selectedRepo,
+    selectedItem,
+    repoSearchParam,
+    serviceHub,
+    huggingfaceToken,
+  ])
+
+  const selectModel = useCallback(
+    (repoId: string) => {
+      const el = listScrollRef.current
+      hubScrollCache.q = searchValue.trim()
       hubScrollCache.offset = el ? el.scrollTop : 0
       void navigate({
-        to: route.hub.model,
-        params: { modelId },
-        search: query ? { q: query } : {},
+        to: route.hub.index,
+        search: (prev: SearchParams) => ({ ...prev, model: repoId }),
+        replace: false,
       })
     },
     [navigate, searchValue]
   )
 
-  // Restore the saved scroll offset once the list is populated after back-navigation; the container can still be growing (clamping an early `scrollTop`), so re-apply across a few frames until it sticks, then consume it.
+  // A repository typed in full under a managed format opens its card at once, to
+  // show the core's verdict; once per repository, so a row picked afterwards
+  // stays picked.
+  const openedExactRef = useRef<string | null>(null)
+  const exactRepoName = managedExactRepo?.model_name ?? null
+  useEffect(() => {
+    if (!exactRepoName || openedExactRef.current === exactRepoName) return
+    openedExactRef.current = exactRepoName
+    if (selectedRepo === exactRepoName) return
+    void navigate({
+      to: route.hub.index,
+      search: (prev: SearchParams) => ({ ...prev, model: exactRepoName }),
+      replace: true,
+    })
+  }, [exactRepoName, selectedRepo, navigate])
+
+  // Open on a populated panel rather than on an empty right-hand column: with
+  // nothing selected the widest part of the page carries no information. Only
+  // fires while the URL names no model, so it never overrides a deep link and
+  // never fights the user's own selection.
+  useEffect(() => {
+    if (selectedRepo || listItems.length === 0) return
+    void navigate({
+      to: route.hub.index,
+      search: (prev: SearchParams) => ({
+        ...prev,
+        model: listItems[0].model.model_name,
+      }),
+      replace: true,
+    })
+  }, [selectedRepo, listItems, navigate])
+
+  // ---- URL sync ---------------------------------------------------------
+
+  useEffect(() => {
+    const current = querySearchParam ?? ''
+    const next = debouncedSearchValue.trim()
+    setHubSearchQuery(next)
+    if (next === current) return
+    void navigate({
+      to: route.hub.index,
+      search: (prev: SearchParams) => ({ ...prev, q: next || undefined }),
+      replace: true,
+    })
+  }, [debouncedSearchValue, querySearchParam, navigate])
+
+  const handleSearchChange = (next: string) => {
+    setIsSearching(false)
+    setSearchValue(next)
+    setHubSearchQuery(next)
+    // Only drop the "found outside catalog" card when the new query can not
+    // yield a result anyway (matches the `< 3` early return in
+    // `fetchExactRepo`); clearing it on every keystroke read as a flicker.
+    if (next.trim().length < 3) {
+      setHuggingFaceRepo(null)
+    }
+    // A format with its own list asks Hugging Face nothing.
+    if (!showOnlyDownloaded && !ownListFormat) {
+      fetchExactRepo(next)
+    }
+  }
+
+  // ---- Virtual list -----------------------------------------------------
+
+  const rowVirtualizer = useVirtualizer({
+    count: listItems.length,
+    getScrollElement: () => listScrollRef.current,
+    estimateSize: useCallback(() => 72, []),
+    overscan: 8,
+    measureElement: (el: HTMLElement) => el.getBoundingClientRect().height,
+  })
+
+  // Restore the saved scroll offset once the list is populated after
+  // back-navigation; the container can still be growing (clamping an early
+  // `scrollTop`), so re-apply across a few frames until it sticks.
   const didRestoreScroll = useRef(false)
   useEffect(() => {
     if (didRestoreScroll.current) return
-    if (virtualListModels.length === 0) return
+    if (listItems.length === 0) return
 
     const target = hubScrollCache.offset
     const matchesQuery = hubScrollCache.q === (querySearchParam ?? '')
@@ -749,7 +1239,7 @@ function HubContent() {
     hubScrollCache.offset = 0
     let attempts = 0
     const apply = () => {
-      const el = parentRef.current as HTMLElement | null
+      const el = listScrollRef.current
       if (!el) return
       el.scrollTop = target
       attempts += 1
@@ -758,359 +1248,260 @@ function HubContent() {
       }
     }
     requestAnimationFrame(apply)
-  }, [virtualListModels.length, querySearchParam])
+  }, [listItems.length, querySearchParam])
 
-  const isRecommendedModel = useCallback((modelId: string) => {
-    return (extractModelName(modelId)?.toLowerCase() ===
-      'jan-nano-gguf') as boolean
-  }, [])
-
-  const handleUseModel = useCallback(
-    (modelId: string) => {
-      const allProviders = useModelProvider.getState().providers
-      const upstream = allProviders.find(
-        (p) => p.provider === 'llamacpp-upstream'
-      )
-      const fork = allProviders.find((p) => p.provider === 'llamacpp')
-      const upstreamHasModel = upstream?.models.some((m) => m.id === modelId)
-      const forkHasModel = fork?.models.some((m) => m.id === modelId)
-      const targetLlamaProvider: 'llamacpp' | 'llamacpp-upstream' =
-        upstreamHasModel
-          ? 'llamacpp-upstream'
-          : forkHasModel
-            ? 'llamacpp'
-            : upstream
-              ? 'llamacpp-upstream'
-              : 'llamacpp'
-
-      console.log(
-        '[hub/index] handleUseModel:',
-        modelId,
-        '→ provider:',
-        targetLlamaProvider,
-        '(upstreamHasModel:',
-        upstreamHasModel,
-        'forkHasModel:',
-        forkHasModel,
-        ')'
-      )
-
-      useModelProvider
-        .getState()
-        .selectModelProvider(targetLlamaProvider, modelId)
-      switchToModel({
-        modelId,
-        providerName: targetLlamaProvider,
-        serviceHub,
-      }).catch((error) => {
-        console.error('[hub/index] switchToModel failed:', error)
-      })
-      navigate({
-        to: route.home,
-        params: {},
-        search: {
-          threadModel: {
-            id: modelId,
-            provider: targetLlamaProvider,
-          },
-        },
-      })
-    },
-    [navigate, serviceHub]
-  )
-
-  const getDownloadedModel = useCallback(
-    (model: CatalogModel, variant?: { model_id: string }) => {
-      const mlxProvider = providers.find((p) => p.provider === 'mlx')
-      const llamaProvider = providers.find((p) => p.provider === 'llamacpp')
-      const upstreamProvider = providers.find(
-        (p) => p.provider === 'llamacpp-upstream'
-      )
-
-      if (model.is_mlx) {
-        const modelName = model.model_name.split('/').pop() ?? model.model_name
-        const mlxModelId = modelName
-          .replace(/\s+/g, '-')
-          .replace(/[^a-zA-Z0-9\-_./]/g, '')
-        const downloaded = mlxProvider?.models.find(
-          (m: { id: string }) =>
-            m.id === mlxModelId || m.id === `${model.developer}/${mlxModelId}`
+  // The next page is asked for a few rows before the end, and the rows on
+  // screen that still lack a size get their card fetched — both from what the
+  // virtualizer is actually painting, so a fast scroll costs what it shows.
+  // Feed entries and list rows when a managed format's page last arrived, and how
+  // many pages in a row added no row (see MANAGED_EMPTY_PAGES_LIMIT).
+  const managedFeedPages = useRef({ format: '', feed: 0, rows: 0, empty: 0 })
+  const virtualItems = rowVirtualizer.getVirtualItems()
+  const lastVisibleIndex = virtualItems[virtualItems.length - 1]?.index ?? -1
+  const visibleFeedRepos = useMemo(
+    () =>
+      virtualItems
+        .map((v) => listItems[v.index])
+        .filter(
+          (item): item is HubListItem =>
+            !!item?.fromHuggingFace &&
+            // A managed row needs no file sizes: its card asks the engines.
+            !item.model.is_managed &&
+            modelDownloadSizeText(item.model) === undefined
         )
-
-        return downloaded && mlxProvider
-          ? { provider: mlxProvider, modelId: downloaded.id }
-          : undefined
-      }
-
-      const modelId =
-        variant?.model_id ??
-        pickDefaultQuant(model)?.model_id ??
-        model.model_name
-      const prefixedModelId = `${model.developer}/${sanitizeModelId(modelId)}`
-      const llamaMatch = llamaProvider?.models.find(
-        (m: { id: string }) => m.id === modelId || m.id === prefixedModelId
-      )
-      if (llamaMatch && llamaProvider) {
-        return { provider: llamaProvider, modelId: llamaMatch.id }
-      }
-
-      const upstreamMatch = upstreamProvider?.models.find(
-        (m: { id: string }) => m.id === modelId || m.id === prefixedModelId
-      )
-      return upstreamMatch && upstreamProvider
-        ? { provider: upstreamProvider, modelId: upstreamMatch.id }
-        : undefined
-    },
-    [providers]
+        .map((item) => item.model.model_name)
+        .join('\n'),
+    // The virtual window is a new array every render; its contents are what
+    // matter, and `lastVisibleIndex` moves whenever they do.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [lastVisibleIndex, listItems]
   )
+  useEffect(() => {
+    if (listItems.length === 0) return
+    if (filters.uncensored) {
+      if (lastVisibleIndex >= listItems.length - FEED_PREFETCH_ROWS) {
+        uncensoredFeed.loadMore()
+        abliteratedFeed.loadMore()
+      }
+      if (visibleFeedRepos) {
+        const repos = visibleFeedRepos.split('\n')
+        uncensoredFeed.ensureDetails(repos)
+        abliteratedFeed.ensureDetails(repos)
+      }
+      return
+    }
+    if (isSearchMode) return
+    if (managedFormat) {
+      // vLLM and TensorRT-LLM share one feed but not one prefilter: pages one emptied may fill
+      // rows for the other, so the count starts over with the format.
+      const format = managedSelected?.id ?? ''
+      if (managedFeedPages.current.format !== format) {
+        managedFeedPages.current = { format, feed: 0, rows: 0, empty: 0 }
+      }
+      const seen = managedFeedPages.current
+      if (feed.models.length !== seen.feed) {
+        seen.empty = listItems.length > seen.rows ? 0 : seen.empty + 1
+        seen.feed = feed.models.length
+        seen.rows = listItems.length
+      }
+    }
+    if (
+      lastVisibleIndex >= listItems.length - FEED_PREFETCH_ROWS &&
+      !(managedFormat && managedFeedPages.current.empty >= MANAGED_EMPTY_PAGES_LIMIT)
+    ) {
+      feed.loadMore()
+    }
+    if (visibleFeedRepos) feed.ensureDetails(visibleFeedRepos.split('\n'))
+  }, [
+    isSearchMode,
+    managedFormat,
+    managedSelected?.id,
+    filters.uncensored,
+    listItems.length,
+    lastVisibleIndex,
+    visibleFeedRepos,
+    feed,
+    uncensoredFeed,
+    abliteratedFeed,
+  ])
 
-  // Check if we're on the last step
-  const renderFilter = () => {
-    return (
-      <>
-        {/* Sort dropdown - always visible */}
-        <DropdownMenu>
-          <DropdownMenuTrigger asChild>
-            <Button variant="outline" size="sm">
-              {
-                sortOptions.find((option) => option.value === sortSelected)
-                  ?.name
-              }
-              <ChevronsUpDown className="size-4 shrink-0 text-muted-foreground ml-2" />
-            </Button>
-          </DropdownMenuTrigger>
-          <DropdownMenuContent side="bottom" align="end">
-            {sortOptions.map((option) => (
-              <DropdownMenuItem
-                className={cn(
-                  'cursor-pointer my-0.5',
-                  sortSelected === option.value && 'bg-secondary'
-                )}
-                key={option.value}
-                onClick={() => {
-                  setIsInitialLoad(true)
-                  setSortSelected(option.value)
-                }}
-              >
-                {option.name}
-              </DropdownMenuItem>
-            ))}
-          </DropdownMenuContent>
-        </DropdownMenu>
-        <div className="flex items-center gap-2">
-          <Switch
-            checked={showOnlyDownloaded}
-            onCheckedChange={(checked) => {
-              setIsInitialLoad(true)
+  // A selected feed row needs its card whether or not it is still on screen:
+  // the detail panel's download options come from it.
+  useEffect(() => {
+    const model = selectedItem?.model
+    if (!model || !('fromHuggingFace' in selectedItem)) return
+    if (!selectedItem.fromHuggingFace) return
+    if (model.is_managed) return
+    if (modelDownloadSizeText(model) !== undefined) return
+    feed.ensureDetails([model.model_name])
+  }, [selectedItem, feed])
+
+  const isEmpty = listItems.length === 0
+  const uncensoredLoading =
+    filters.uncensored &&
+    (uncensoredFeed.loading || abliteratedFeed.loading)
+  const managedLoading =
+    managedFormat &&
+    !isSearchMode &&
+    (managedCurated.loading || feed.loading)
+  const showSkeleton =
+    isEmpty &&
+    (prismFormat
+      ? prismFamilies.loading
+      : foundryFormat
+        ? foundryLocal.loading
+        : (loading && !isSearchMode) ||
+        hfSearching ||
+        uncensoredLoading ||
+        managedLoading)
+
+  return (
+    <div className="grid h-svh w-full grid-cols-[minmax(320px,420px)_1fr] grid-rows-[auto_minmax(0,1fr)]">
+      <HeaderPage>
+        <div
+          className={cn(
+            'relative z-20 flex h-10 w-full items-center gap-2 py-3 pr-3',
+            !IS_MACOS && !IS_WINDOWS && 'pr-30'
+          )}
+          {...(IS_WINDOWS || IS_MACOS
+            ? { 'data-tauri-drag-region': true }
+            : {})}
+        >
+          <HubSearchInput
+            value={searchValue}
+            onChange={handleSearchChange}
+            placeholder={t('hub:searchPlaceholder')}
+            busy={isSearching || hfSearching}
+          />
+        </div>
+      </HeaderPage>
+
+      <div className="col-start-1 row-start-2 flex min-h-0 min-w-0 flex-col border-r border-border">
+        <div className="flex flex-col gap-2 border-b border-border p-3">
+          {categoryTabs}
+          <HubFilters
+            state={filters}
+            onChange={updateFilters}
+            showLikesSort={showLikesSort}
+            showOnlyDownloaded={showOnlyDownloaded}
+            onShowOnlyDownloadedChange={(checked) => {
               setShowOnlyDownloaded(checked)
               if (checked) {
                 setHuggingFaceRepo(null)
-              } else {
-                // Re-trigger HuggingFace search when switching back to "All models"
-                fetchHuggingFaceModel(searchValue)
+              } else if (!ownListFormat) {
+                fetchExactRepo(searchValue)
               }
             }}
           />
-          <span className="text-xs text-foreground font-medium whitespace-nowrap">
-            {t('hub:downloaded')}
-          </span>
         </div>
-      </>
-    )
-  }
 
-  return (
-    <div className="flex flex-col h-svh w-full">
-      <div className="flex flex-col h-full w-full ">
-        <HeaderPage>
-          <div
-            className={cn(
-              'pr-3 py-3  h-10 w-full flex items-center justify-between relative z-20',
-              !IS_MACOS && 'pr-30'
-            )}
-          >
-            <div className="flex items-center gap-2 w-full min-w-0">
-              {isSearching ? (
-                <Loader className="shrink-0 size-4 animate-spin text-muted-foreground" />
-              ) : (
-                <IconSearch
-                  className="shrink-0 text-muted-foreground"
-                  size={14}
-                />
-              )}
-              <input
-                placeholder={t('hub:searchPlaceholder')}
-                value={searchValue}
-                onChange={handleSearchChange}
-                autoComplete="off"
-                className="hub-models-search-input w-full min-w-0 flex-1 bg-transparent bg-clip-padding text-foreground placeholder:text-muted-foreground focus:outline-none focus-visible:ring-0 focus-visible:ring-offset-0 shadow-none animate-none transition-none"
-              />
+        <div ref={listScrollRef} className="min-h-0 flex-1 overflow-y-auto p-2">
+          {foundryFormat && !showOnlyDownloaded && foundryLocal.catalogUnavailable && (
+            <p className="px-2 pb-2 text-xs text-muted-foreground" role="status">
+              {t('hub:foundryLocal.catalogUnavailable')}
+            </p>
+          )}
+          {managedPanel === 'blocked' ? (
+            managedSelected && (
+              <ManagedHubBlocked engine={managedSelected} blockers={managedHub.blockers} />
+            )
+          ) : managedPanel === 'checking' ? (
+            managedSelected && <ManagedHubChecking engine={managedSelected} />
+          ) : showSkeleton ? (
+            <div className="flex animate-pulse flex-col gap-2">
+              {[...Array(6)].map((_, index) => (
+                <div key={index} className="h-16 rounded-lg bg-muted" />
+              ))}
             </div>
-            <div className="sm:flex items-center gap-2 shrink-0 hidden">
-              {renderFilter()}
-            </div>
-          </div>
-        </HeaderPage>
-        <div
-          ref={parentRef}
-          className="p-4 w-full h-[calc(100%-60px)] overflow-y-auto!"
-        >
-          <div className="flex flex-col h-full justify-between gap-4 w-full md:w-4/5 xl:w-4/6 mx-auto">
-            {/* Recommended сверху со своим разделителем, затем блок «All Models» с таким же разделителем, затем каталог */}
-            {showRecommendedBlock && (
-              <section className="shrink-0 border-b border-border pb-4">
-                <h2 className="text-sm font-medium mb-3 text-muted-foreground">
-                  {t('hub:recTitle')}
-                </h2>
-                <div className="flex flex-col gap-1">
-                  {recommendedItems.map(({ rec, model }) => {
-                    const key = `${rec.modelName}-${rec.descriptionKey}`
-                    //* Модель ещё не разрешилась из catalog/HF — лёгкая
-                    //* заглушка в стиле новой карточки, пока подтянутся данные.
-                    if (!model) {
-                      return (
-                        <div
-                          key={key}
-                          className="bg-card rounded-2xl border border-border px-[18px] py-4 shadow-sm"
-                        >
-                          <div className="flex items-center gap-2 min-w-0">
-                            <h1
-                              className="min-w-0 truncate text-foreground font-semibold text-base capitalize cursor-pointer"
-                              title={
-                                extractModelName(rec.modelName) || rec.modelName
-                              }
-                              onClick={() => openModel(rec.modelName)}
-                            >
-                              {extractModelName(rec.modelName) || rec.modelName}
-                            </h1>
-                          </div>
-                          <p className="text-[13px] text-muted-foreground mt-1">
-                            {t('hub:by')} {rec.modelName.split('/')[0]}
-                          </p>
-                        </div>
-                      )
-                    }
-                    return (
-                      <HubModelCard
-                        key={key}
-                        model={model}
-                        expanded={!!expandedModels[model.model_name]}
-                        isRecommended={isRecommendedModel(model.model_name)}
-                        onToggleVariants={() =>
-                          toggleModelExpansion(model.model_name)
-                        }
-                        onOpenModel={() => openModel(model.model_name)}
-                        handleUseModel={handleUseModel}
-                        getDownloadedModel={getDownloadedModel}
-                      />
-                    )
-                  })}
-                </div>
-              </section>
-            )}
-            {showRecommendedBlock && (
-              <section className="shrink-0">
-                <h2 className="text-sm font-medium text-muted-foreground">
-                  {t('hub:allModelsTitle')}
-                </h2>
-              </section>
-            )}
-            {isInitialLoad || (loading && !filteredModels.length) ? (
-              // Skeleton loading state for better perceived performance
-              <div className="flex flex-col gap-3 animate-pulse">
-                {[...Array(5)].map((_, i) => (
+          ) : isEmpty ? (
+            <HubNoResults
+              message={
+                !isSearchMode && filters.onlyFitting && !managedFormat && !foundryFormat
+                  ? t('hub:noFittingPicks')
+                  : t('hub:noModels')
+              }
+              onClearSearch={
+                searchValue.length > 0
+                  ? () => handleSearchChange('')
+                  : undefined
+              }
+            />
+          ) : (
+            <div
+              style={{
+                height: `${rowVirtualizer.getTotalSize()}px`,
+                width: '100%',
+                position: 'relative',
+              }}
+            >
+              {rowVirtualizer.getVirtualItems().map((virtualItem) => {
+                const item = listItems[virtualItem.index]
+                return (
                   <div
-                    key={i}
-                    className="bg-card border border-border rounded-lg p-4"
+                    key={virtualItem.key}
+                    data-index={virtualItem.index}
+                    ref={rowVirtualizer.measureElement}
+                    style={{
+                      position: 'absolute',
+                      top: 0,
+                      left: 0,
+                      width: '100%',
+                      transform: `translateY(${virtualItem.start}px)`,
+                      paddingBottom: 4,
+                    }}
                   >
-                    <div className="flex items-center justify-between gap-x-2">
-                      <div className="h-5 bg-muted rounded w-1/3" />
-                      <div className="flex items-center gap-3">
-                        <div className="h-4 bg-muted rounded w-20" />
-                        <div className="h-8 w-8 bg-muted rounded" />
-                      </div>
-                    </div>
-                    <div className="mt-3 h-4 bg-muted rounded w-full" />
-                    <div className="mt-2 h-4 bg-muted rounded w-2/3" />
-                    <div className="flex items-center gap-4 mt-3">
-                      <div className="h-4 bg-muted rounded w-16" />
-                      <div className="h-4 bg-muted rounded w-16" />
-                    </div>
+                    {item.sectionLabel && (
+                      <h2 className="px-2 pb-2 pt-4 text-base font-semibold text-foreground">
+                        {item.sectionLabel}
+                      </h2>
+                    )}
+                    <ModelListRow
+                      model={item.model}
+                      managedFormat={
+                        managedSelected ? (managedSelected.id as ModelFormat) : undefined
+                      }
+                      pick={item.pick}
+                      fromHuggingFace={item.fromHuggingFace}
+                      selected={item.model.model_name === selectedRepo}
+                      onSelect={() => selectModel(item.model.model_name)}
+                    />
                   </div>
-                ))}
-              </div>
-            ) : filteredModels.length === 0 && !showRecommendedBlock ? (
-              <div className="flex items-center justify-center">
-                <div className="text-center text-muted-foreground">
-                  {t('hub:noModels')}
-                </div>
-              </div>
-            ) : virtualListModels.length === 0 ? null : (
-              <div
-                className={cn(
-                  'flex flex-col pb-2 mb-2 transition-opacity duration-200',
-                  isPending ? 'opacity-70' : 'opacity-100'
-                )}
-              >
-                <div className="flex items-center gap-2 justify-end sm:hidden">
-                  {renderFilter()}
-                </div>
-                <div
-                  ref={listRef}
-                  style={{
-                    height: `${rowVirtualizer.getTotalSize()}px`,
-                    width: '100%',
-                    position: 'relative',
-                  }}
-                >
-                  {rowVirtualizer.getVirtualItems().map((virtualItem) => (
-                    <div
-                      key={virtualItem.key}
-                      data-index={virtualItem.index}
-                      ref={rowVirtualizer.measureElement}
-                      style={{
-                        position: 'absolute',
-                        top: 0,
-                        left: 0,
-                        width: '100%',
-                        //* start включает scrollMargin — вычитаем его, т.к.
-                        //* контейнер списка уже начинается со смещения.
-                        transform: `translateY(${virtualItem.start - listScrollMargin}px)`,
-                        //* Симметрия вокруг разделителя: раньше был только paddingBottom — зазор визуально смещался вниз
-                        paddingTop: 4,
-                        paddingBottom: 0,
-                      }}
-                    >
-                      <HubModelCard
-                        model={virtualListModels[virtualItem.index]}
-                        expanded={
-                          !!expandedModels[
-                            virtualListModels[virtualItem.index].model_name
-                          ]
-                        }
-                        isRecommended={isRecommendedModel(
-                          virtualListModels[virtualItem.index].model_name
-                        )}
-                        onToggleVariants={() =>
-                          toggleModelExpansion(
-                            virtualListModels[virtualItem.index].model_name
-                          )
-                        }
-                        onOpenModel={() =>
-                          openModel(
-                            virtualListModels[virtualItem.index].model_name
-                          )
-                        }
-                        handleUseModel={handleUseModel}
-                        getDownloadedModel={getDownloadedModel}
-                      />
-                    </div>
-                  ))}
-                </div>
-              </div>
-            )}
-          </div>
+                )
+              })}
+            </div>
+          )}
+          {!isSearchMode && !isEmpty && feed.loading && (
+            <p
+              className="flex items-center justify-center gap-2 py-3 text-xs text-muted-foreground"
+              role="status"
+            >
+              <Loader className="size-3 animate-spin" />
+              {t('hub:feedLoading')}
+            </p>
+          )}
+          {filters.uncensored && !isEmpty && uncensoredLoading && (
+            <p
+              className="flex items-center justify-center gap-2 py-3 text-xs text-muted-foreground"
+              role="status"
+            >
+              <Loader className="size-3 animate-spin" />
+              {t('hub:feedLoading')}
+            </p>
+          )}
+          {!isSearchMode && !isEmpty && !feed.loading && feed.error && (
+            <p className="py-3 text-center text-xs text-muted-foreground">
+              {t('hub:feedFailed')}
+            </p>
+          )}
         </div>
+      </div>
+
+      <div className="col-start-2 row-span-2 row-start-1 min-h-0 min-w-0 overflow-y-auto">
+        <ModelDetailPanel
+          model={selectedItem?.model ?? null}
+          pick={selectedItem?.pick}
+          managedFormat={managedSelected ? (managedSelected.id as ModelFormat) : undefined}
+        />
       </div>
     </div>
   )

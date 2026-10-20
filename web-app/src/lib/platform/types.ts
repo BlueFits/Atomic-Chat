@@ -61,4 +61,34 @@ export enum PlatformFeature {
 
   // File attachments/RAG UI and tooling (desktop-only for now)
   FILE_ATTACHMENTS = 'fileAttachments',
+
+  // Voice input / dictation. Needs native microphone capture and the local
+  // llama.cpp engine, so desktop only.
+  VOICE_INPUT = 'voiceInput',
+
+  // Signing in with a ChatGPT subscription. Needs a loopback HTTP listener on
+  // a fixed port for the OAuth callback and a place to keep a refresh token
+  // out of browser storage, so desktop only.
+  CHATGPT_SUBSCRIPTION = 'chatgptSubscription',
+
+  // Local image (and later video) generation. Needs the native diffusion
+  // plugin that supervises `sd-server`, so desktop only.
+  MEDIA_GENERATION = 'mediaGeneration',
+
+  // Remote access over the internet via the bundled cloudflared tunnel. LAN
+  // access to the local server is not part of it.
+  REMOTE_ACCESS = 'remoteAccess',
+
+  // The TurboQuant llama.cpp fork (`llamacpp` provider). It is not shipped on
+  // Windows or Linux arm64, where upstream llama.cpp is the only engine.
+  TURBOQUANT_ENGINE = 'turboquantEngine',
+
+  // Agent mode (the Rust agent engine as an opt-in for chat turns). Hidden
+  // while it is unfinished; the persisted toggle is kept so bringing it back
+  // is this flag alone.
+  AGENT_MODE = 'agentMode',
+
+  // Running terminal commands and scripts from chat. Needs native process
+  // spawning, so desktop only.
+  CHAT_EXEC = 'chatExec',
 }

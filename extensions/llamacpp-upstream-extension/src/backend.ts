@@ -1,65 +1,93 @@
 import { getJanDataFolderPath, fs, joinPath } from '@janhq/core'
-import { fetch as tauriFetch } from '@tauri-apps/plugin-http'
-import { getSystemInfo } from './hardware'
 import { getProxyConfig } from './util'
+import { getBackendCatalog } from './adapter/coreRuntime'
+import type { CoreBackendCatalog, CoreProxyConfig } from './adapter/coreRuntime'
 import {
   getLocalInstalledBackendsInternal,
-  normalizeFeatures,
-  determineSupportedBackends,
-  listSupportedBackendsFromRust,
   BackendVersion,
-  getSupportedFeaturesFromRust,
   mapOldBackendToNew,
-  fetchManifestHttp1,
 } from '../../../src-tauri/plugins/tauri-plugin-llamacpp-upstream/guest-js/index'
+import type { SettingUpdateResult } from '../../../src-tauri/plugins/tauri-plugin-llamacpp-upstream/guest-js/types'
 
 // Upstream provider points at the official ggml-org/llama.cpp release stream.
 // Note: this is intentionally NOT janhq/llama.cpp (legacy fork mirror) and
 // NOT AtomicBot-ai/atomic-llama-cpp-turboquant (our TurboQuant fork).
 //
-// The backend *index* (what builds exist) is resolved from a static manifest
-// in our atomic-chat-conf repo, served via raw.githubusercontent.com (no
-// per-IP rate limit). This dodges GitHub's unauthenticated API limit
-// (60 req/hr/IP) that dead-ended fresh installs on shared/NAT/VPN networks
-// (ATO-199). The manifest mirrors the GitHub release shape
-// ({ tag_name, assets: [{ name }] }) so the parser below is unchanged. The
-// backend *archives* themselves are still downloaded from the ggml-org CDN
-// via LLAMACPP_DOWNLOAD_BASE.
-const LLAMACPP_BACKEND_MANIFEST_URL =
-  'https://raw.githubusercontent.com/AtomicBot-ai/atomic-chat-conf/main/backends/manifest.json'
-const LLAMACPP_DOWNLOAD_BASE =
+// Since ADR 2026-09-27 the backend *index* (what builds exist, which of them
+// this machine can run, which one is recommended) is a question for
+// atomic-chat-core: `loadCatalog` below asks `POST /backends/llamacpp-upstream/catalog`
+// and everything in this extension reads from that one answer. The core owns
+// the release list (atomic-chat-conf's llamacpp-upstream-releases.json, which
+// release each core may take, its fallbacks and its offline baseline), the
+// hardware probe and the tier policy, so a decision is made once, from one set
+// of facts, for the app and the CLI alike.
+//
+// The *archives* come from wherever the manifest's `download_base` points —
+// normally our own signed mirror in atomic-chat-conf, whose Windows binaries
+// are Authenticode-signed and whose macOS binaries carry a Developer ID
+// signature. A tag we have not mirrored carries no `download_base` and falls
+// back to the ggml-org CDN below, so a broken mirror degrades to the old
+// behaviour instead of blocking engine updates.
+const GGML_ORG_DOWNLOAD_BASE =
   'https://github.com/ggml-org/llama.cpp/releases/download'
-const MANIFEST_FETCH_TIMEOUT_MS = 8_000
-export const LLAMACPP_UPSTREAM_PINNED_TAG = 'b9937'
 
-// Bundled baseline manifest — a known-good snapshot that ships with the
-// extension. Parsed by `fetchRemoteBackends` as a last resort when ALL
-// network transports fail (e.g. ATO-243: Linux h2-stall + WebKitGTK
-// unreachability). The baseline intentionally keeps serving real backend
-// ids and tags so the download path still works; it will simply be older
-// than the live manifest until the network recovers. Update this whenever
-// the atomic-chat-conf manifest is updated.
-const BUNDLED_MANIFEST_BASELINE = {
-  tag_name: LLAMACPP_UPSTREAM_PINNED_TAG,
-  assets: [
-    { name: 'llama-b9937-bin-win-cpu-x64.zip' },
-    { name: 'llama-b9937-bin-win-cuda-12.4-x64.zip' },
-    { name: 'llama-b9937-bin-win-cuda-13.3-x64.zip' },
-    { name: 'llama-b9937-bin-win-vulkan-x64.zip' },
-    { name: 'llama-b9937-bin-ubuntu-x64.tar.gz' },
-    { name: 'llama-b9937-bin-ubuntu-vulkan-x64.tar.gz' },
-    { name: 'cudart-llama-bin-win-cuda-12.4-x64.zip' },
-    { name: 'cudart-llama-bin-win-cuda-13.3-x64.zip' },
-  ],
+export interface UpstreamManifestAsset {
+  name: string
+  /** Present only on assets our mirror actually hosts. */
+  sha256?: string
+  size?: number
 }
 
-// In-memory manifest cache: populated ONLY on a genuinely successful live
-// fetch, so a later transient network stall (e.g. the ATO-243 Linux h2-stall)
-// can reuse the last good manifest within the same session. The bundled
-// baseline is deliberately NEVER stored here — caching it would pin the
-// session to a stale snapshot and keep returning it even after the network
-// recovers (the ATO-243 cache-poisoning regression).
-let _cachedManifest: typeof BUNDLED_MANIFEST_BASELINE | null = null
+export interface UpstreamManifest {
+  tag_name: string
+  /** Absent for tags that were never mirrored; see GGML_ORG_DOWNLOAD_BASE. */
+  download_base?: string
+  assets: UpstreamManifestAsset[]
+}
+
+/**
+ * The last catalog the core answered with. Every reader in this session shares
+ * it, so the core is asked once per launch unless a caller explicitly forces a
+ * refresh (the "check for engine updates" button, a "Latest <variant>" pick).
+ * A failed call leaves the previous answer in place.
+ */
+let _catalog: CoreBackendCatalog | null = null
+
+/**
+ * What builds exist for this provider on this machine, as the core sees it.
+ *
+ * `available` is the hardware-gated merge of the manifest and the disk that
+ * `listSupportedBackends` used to compute here; `remote` is the manifest alone;
+ * `recommended` / `recommended_installed` / `latest_by_type` / `static_variants`
+ * are the picks `configureBackends` used to make itself. `force` bypasses both
+ * this module's memo and the core's manifest cache, so a release published
+ * while the app was open becomes visible.
+ */
+export async function loadCatalog(options?: {
+  /** Ask the core to refetch the release stream too (a user-driven check). */
+  force?: boolean
+  /**
+   * Ask the core again instead of answering from this module's memo, without forcing a refetch:
+   * the core rescans the packs on disk (a backend installed from a file never passes through it),
+   * while its own manifest cache still answers the remote half.
+   */
+  refresh?: boolean
+  appVersion?: string | null
+}): Promise<CoreBackendCatalog> {
+  if (!options?.force && !options?.refresh && _catalog) return _catalog
+  const catalog = await getBackendCatalog({
+    force: options?.force ?? false,
+    app_version: options?.appVersion ?? null,
+    proxy: (getProxyConfig() as unknown as CoreProxyConfig | null) ?? null,
+  })
+  _catalog = catalog
+  return catalog
+}
+
+/** The memoized catalog for readers that cannot await, or `null` before the first successful load. */
+export function catalogSnapshot(): CoreBackendCatalog | null {
+  return _catalog
+}
 
 export async function getLocalInstalledBackends(): Promise<BackendVersion[]> {
   const janDataFolderPath = await getJanDataFolderPath()
@@ -75,6 +103,132 @@ export async function getLocalInstalledBackends(): Promise<BackendVersion[]> {
 // folder structure
 // <Jan's data folder>/llamacpp-upstream/backends/<backend_version>/<backend_type>
 
+export interface InstalledBackendPack {
+  version: string
+  backend: string
+  path: string
+  active: boolean
+}
+
+const clean = (value: string) => value.replace(/\uFEFF/g, '').trim()
+
+export interface BackendOption {
+  value: string
+  name: string
+}
+
+/**
+ * Flattens the version-dropdown tiers into one list.
+ *
+ * The tiers are passed most-preferred first and the first spelling of a
+ * `version/backend` wins, so a build that appears in several tiers keeps its
+ * richest label. `recommended` is forced into the list because a
+ * recommendation the dropdown cannot offer is a dead end: the UI would mark a
+ * version the user has no way to select.
+ */
+export function mergeBackendOptions(
+  tiers: BackendOption[][],
+  recommended?: BackendOption
+): BackendOption[] {
+  const merged: BackendOption[] = []
+  const seen = new Set<string>()
+
+  for (const tier of tiers) {
+    for (const option of tier) {
+      const value = clean(option.value)
+      if (!value || seen.has(value)) continue
+      seen.add(value)
+      merged.push({ value, name: option.name })
+    }
+  }
+
+  const recommendedValue = recommended ? clean(recommended.value) : ''
+  if (recommendedValue && !seen.has(recommendedValue)) {
+    merged.unshift({ value: recommendedValue, name: recommended!.name })
+  }
+
+  return merged
+}
+
+/**
+ * Every backend build sitting in this provider's tree, with the absolute path
+ * of each so the UI can reveal it in the file manager, and a flag marking the
+ * one currently selected (which must not be deletable).
+ */
+export async function listInstalledBackendPacks(
+  providerId: string,
+  currentVersionBackend: string
+): Promise<InstalledBackendPack[]> {
+  const janDataFolderPath = await getJanDataFolderPath()
+  const backendsRoot = await joinPath([
+    janDataFolderPath,
+    providerId,
+    'backends',
+  ])
+  const current = clean(currentVersionBackend)
+  const installed = await getLocalInstalledBackends()
+
+  return Promise.all(
+    installed.map(async (entry) => {
+      const version = clean(entry.version)
+      const backend = clean(entry.backend)
+      return {
+        version,
+        backend,
+        path: await joinPath([backendsRoot, version, backend]),
+        active: `${version}/${backend}` === current,
+      }
+    })
+  )
+}
+
+/**
+ * Removes one installed backend build. The selected build is refused rather
+ * than silently skipped: deleting it would leave `version_backend` pointing at
+ * a directory that no longer exists and the next model load would fail with a
+ * missing-binary error instead of anything actionable.
+ */
+export async function deleteBackendPack(
+  providerId: string,
+  currentVersionBackend: string,
+  version: string,
+  backend: string
+): Promise<void> {
+  const cleanVersion = clean(version)
+  const cleanBackend = clean(backend)
+  if (!cleanVersion || !cleanBackend) {
+    throw new Error(`Invalid backend pack: '${version}/${backend}'`)
+  }
+  if (/[/\\]/.test(cleanVersion) || /[/\\]/.test(cleanBackend)) {
+    throw new Error(`Invalid backend pack: '${version}/${backend}'`)
+  }
+  if (`${cleanVersion}/${cleanBackend}` === clean(currentVersionBackend)) {
+    throw new Error('Cannot remove the backend that is currently selected')
+  }
+
+  const janDataFolderPath = await getJanDataFolderPath()
+  const versionDir = await joinPath([
+    janDataFolderPath,
+    providerId,
+    'backends',
+    cleanVersion,
+  ])
+  const backendDir = await joinPath([versionDir, cleanBackend])
+
+  if (await fs.existsSync(backendDir)) {
+    await fs.rm(backendDir)
+  }
+
+  // A version dir holding no builds is an empty husk that would keep showing
+  // up in the packs list.
+  const remaining: string[] = (await fs.existsSync(versionDir))
+    ? await fs.readdirSync(versionDir)
+    : []
+  if (remaining.length === 0 && (await fs.existsSync(versionDir))) {
+    await fs.rm(versionDir)
+  }
+}
+
 /**
  * Mapping from internal Linux backend id → ggml-org upstream asset name
  * infix (the part between `bin-` and `.tar.gz`). Upstream calls its
@@ -82,381 +236,48 @@ export async function getLocalInstalledBackends(): Promise<BackendVersion[]> {
  * Rust matrix in `tauri-plugin-llamacpp-upstream` consistent and to
  * leave room for non-Ubuntu Linux variants if we ever ship them.
  *
- * Whitelist is deliberately narrow: `s390x`, `arm64`, `rocm-7.2-x64`,
- * `openvino-2026.0-x64`, and `vulkan-arm64` are dropped here. Adding
+ * Whitelist is deliberately narrow: `s390x`, `snapdragon-arm64`,
+ * `rocm-7.2-x64` and `openvino-2026.0-x64` are dropped here. Adding
  * one is a one-line edit in this map + a feature detector in the Rust
- * `get_supported_features`.
+ * `get_supported_features`. The arm64 CUDA 13 build carries its toolkit
+ * minor, so it is matched by `LINUX_CUDA_BACKEND_RE` instead.
  */
 const LINUX_UPSTREAM_ASSET_BY_BACKEND: Record<string, string> = {
   'linux-cpu-x64': 'ubuntu-x64',
   'linux-vulkan-x64': 'ubuntu-vulkan-x64',
+  'linux-cpu-arm64': 'ubuntu-arm64',
+  'linux-vulkan-arm64': 'ubuntu-vulkan-arm64',
 }
-
-const LINUX_BACKEND_BY_UPSTREAM_ASSET: Record<string, string> = Object.fromEntries(
-  Object.entries(LINUX_UPSTREAM_ASSET_BY_BACKEND).map(([k, v]) => [v, k])
-)
+const LINUX_CUDA_BACKEND_RE = /^linux-cuda-(13\.\d+)-arm64$/
 
 /**
- * Maps the app's stored proxy config (`getProxyConfig`, shaped for the Rust
- * `download_files` command) onto the option shape `@tauri-apps/plugin-http`'s
- * `fetch` expects. Returns `{}` when no proxy is enabled so the caller can
- * spread it unconditionally.
+ * The manifest as the core resolved it for this platform and architecture, as
+ * `version/backend` pairs. The core reads the atomic-chat-conf mirror (with its
+ * own fallbacks and offline baseline), so the answer is never empty on a
+ * platform the provider ships for; `force` re-reads the mirror.
  */
-function buildHttpProxyOptions(): {
-  proxy?: {
-    all: {
-      url: string
-      basicAuth?: { username: string; password: string }
-      noProxy?: string
-    }
-  }
-  danger?: { acceptInvalidCerts?: boolean; acceptInvalidHostnames?: boolean }
-} {
-  const cfg = getProxyConfig()
-  if (!cfg || typeof cfg.url !== 'string' || !cfg.url) {
-    return {}
-  }
-
-  const proxyConfig: {
-    url: string
-    basicAuth?: { username: string; password: string }
-    noProxy?: string
-  } = { url: cfg.url }
-
-  if (typeof cfg.username === 'string' && typeof cfg.password === 'string') {
-    proxyConfig.basicAuth = { username: cfg.username, password: cfg.password }
-  }
-  if (Array.isArray(cfg.no_proxy) && cfg.no_proxy.length > 0) {
-    proxyConfig.noProxy = (cfg.no_proxy as string[]).join(',')
-  }
-
-  if (cfg.ignore_ssl === true) {
-    return {
-      proxy: { all: proxyConfig },
-      danger: { acceptInvalidCerts: true, acceptInvalidHostnames: true },
-    }
-  }
-  return { proxy: { all: proxyConfig } }
-}
-
-async function fetchManifestWithTimeout(
-  useProxy: boolean
-): Promise<Response> {
-  // Guard each request with a hard Promise timeout because some
-  // `@tauri-apps/plugin-http` code paths may ignore AbortSignal under
-  // certain network/proxy failures, which then lets the outer
-  // `recheckOptimalBackend` 20s guard fire first and forces a false
-  // detection-failed (current backend kept) even when fallback paths
-  // could have succeeded.
-  let timeoutHandle: ReturnType<typeof setTimeout> | null = null
-  const request = tauriFetch(LLAMACPP_BACKEND_MANIFEST_URL, {
-    headers: { 'User-Agent': 'atomic-chat' },
-    connectTimeout: MANIFEST_FETCH_TIMEOUT_MS,
-    ...(useProxy ? buildHttpProxyOptions() : {}),
-  })
-  const timeout = new Promise<Response>((_, reject) => {
-    timeoutHandle = setTimeout(() => {
-      reject(
-        new Error(
-          `Manifest fetch timed out after ${MANIFEST_FETCH_TIMEOUT_MS}ms`
-        )
-      )
-    }, MANIFEST_FETCH_TIMEOUT_MS)
-  })
-  try {
-    return await Promise.race([request, timeout])
-  } finally {
-    if (timeoutHandle) clearTimeout(timeoutHandle)
-  }
-}
-
-async function fetchManifestWithWebFetch(): Promise<Response> {
-  const controller = new AbortController()
-  let timeoutHandle: ReturnType<typeof setTimeout> | null = null
-  // `globalThis.fetch` (NOT bare `fetch`) is mandatory here: the production
-  // rolldown build injects `fetch` -> `@tauri-apps/plugin-http`'s fetch (see
-  // rolldown.config.mjs), so a bare `fetch` call would silently route through
-  // plugin-http too. `globalThis.fetch` is the real WebView fetch, which the
-  // registry loaders (provider-registry.ts etc.) prove resolves reliably and
-  // quickly against raw.githubusercontent.com while plugin-http hangs on this
-  // host. This is the primary/preferred manifest transport.
-  const request = globalThis.fetch(LLAMACPP_BACKEND_MANIFEST_URL, {
-    headers: { Accept: 'application/json', 'User-Agent': 'atomic-chat' },
-    signal: controller.signal,
-  })
-  const timeout = new Promise<Response>((_, reject) => {
-    timeoutHandle = setTimeout(() => {
-      controller.abort()
-      reject(
-        new Error(
-          `Manifest web fetch timed out after ${MANIFEST_FETCH_TIMEOUT_MS}ms`
-        )
-      )
-    }, MANIFEST_FETCH_TIMEOUT_MS)
-  })
-  try {
-    return await Promise.race([request, timeout])
-  } finally {
-    if (timeoutHandle) clearTimeout(timeoutHandle)
-  }
+export async function fetchRemoteBackends(options?: {
+  force?: boolean
+  appVersion?: string | null
+}): Promise<BackendVersion[]> {
+  return (await loadCatalog(options)).remote
 }
 
 /**
- * Fetch the manifest via the Rust reqwest client forced to HTTP/1.1.
+ * Builds the download URL for a specific backend version on the ggml-org CDN.
  *
- * This is the primary workaround for ATO-243: on Linux hosts Fastly's CDN
- * (which backs raw.githubusercontent.com) negotiates HTTP/2 with reqwest
- * but the h2 SETTINGS frame stalls indefinitely (the socket is open but
- * no data arrives). Forcing HTTP/1.1 (`http1_only` in reqwest) completely
- * bypasses the h2 negotiation and reliably succeeds on affected hosts.
- * The Rust command returns the raw JSON body as a string, which we wrap
- * into a minimal `Response`-like object for the rest of the pipeline.
- */
-async function fetchManifestWithRustHttp1(): Promise<Response> {
-  let timeoutHandle: ReturnType<typeof setTimeout> | null = null
-  const rustFetch = fetchManifestHttp1(
-    LLAMACPP_BACKEND_MANIFEST_URL,
-    MANIFEST_FETCH_TIMEOUT_MS
-  ).then((body) => {
-    // Synthesise a Response-like object so callers can call `.json()` on it.
-    return new Response(body, {
-      status: 200,
-      headers: { 'Content-Type': 'application/json' },
-    })
-  })
-  const timeout = new Promise<Response>((_, reject) => {
-    timeoutHandle = setTimeout(() => {
-      reject(
-        new Error(
-          `Rust HTTP/1.1 manifest fetch timed out after ${MANIFEST_FETCH_TIMEOUT_MS}ms`
-        )
-      )
-    }, MANIFEST_FETCH_TIMEOUT_MS + 1_000) // slight extra buffer for IPC overhead
-  })
-  try {
-    return await Promise.race([rustFetch, timeout])
-  } finally {
-    if (timeoutHandle) clearTimeout(timeoutHandle)
-  }
-}
-
-async function fetchManifestWithFallbacks(): Promise<Response> {
-  // Transport priority (ATO-243):
-  //   1. Rust HTTP/1.1 (fetchManifestHttp1) — bypasses the reqwest h2-stall
-  //      on Linux where Fastly's CDN hangs HTTP/2 indefinitely. This is the
-  //      most reliable transport on the affected hosts.
-  //   2. WebView fetch (globalThis.fetch / WebKitGTK) — may also be slow on
-  //      Linux (WebKitGTK doesn't share network state with the user's browser)
-  //      but is a useful cross-check for proxy setups.
-  //   3-4. plugin-http tauri fetch (proxy-aware + direct) — reqwest with HTTP/2
-  //      enabled; kept for air-gapped/corporate environments where the WebView
-  //      is intercepted but the Rust HTTP client is allowed through. May stall
-  //      on Linux (see above), so relies on the JS timeout guard.
-  //
-  // All run in parallel; `Promise.any` takes whichever resolves first.
-  const attempts: Array<{
-    label: string
-    runner: () => Promise<Response>
-  }> = [
-    { label: 'rust-http1 fetch', runner: () => fetchManifestWithRustHttp1() },
-    { label: 'webview fetch', runner: () => fetchManifestWithWebFetch() },
-    { label: 'proxy-aware tauri fetch', runner: () => fetchManifestWithTimeout(true) },
-    { label: 'direct tauri fetch', runner: () => fetchManifestWithTimeout(false) },
-  ]
-
-  const wrapped = attempts.map(({ label, runner }) =>
-    runner()
-      .then((resp) => ({ label, resp }))
-      .catch((err) => {
-        const reason = err instanceof Error ? err.message : String(err)
-        throw new Error(`${label}: ${reason}`)
-      })
-  )
-
-  try {
-    const winner = await Promise.any(wrapped)
-    console.info(
-      `[fetchRemoteBackends] Manifest fetch succeeded via ${winner.label}`
-    )
-    return winner.resp
-  } catch (aggregateErr) {
-    const reasons =
-      aggregateErr instanceof AggregateError
-        ? aggregateErr.errors
-            .map((e) => (e instanceof Error ? e.message : String(e)))
-            .join(' | ')
-        : aggregateErr instanceof Error
-          ? aggregateErr.message
-          : String(aggregateErr)
-    throw new Error(`All manifest fetch attempts failed: ${reasons}`)
-  }
-}
-
-/**
- * Parse a manifest object (as fetched from atomic-chat-conf or as the bundled
- * baseline) into `BackendVersion[]` for the given OS and architecture. Shared
- * by the live-fetch path, the in-memory cache path, and the bundled-baseline
- * path so there is a single authoritative parser.
- */
-function parseManifestForPlatform(
-  release: { tag_name: string; assets: { name: string }[] },
-  osType: string,
-  archSuffix: string
-): BackendVersion[] {
-  const tag = release.tag_name
-  if (!tag) return []
-  const assets = release.assets ?? []
-  const escapedTag = tag.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-
-  if (osType === 'windows') {
-    const re = new RegExp(`^llama-${escapedTag}-bin-(win-.+)\\.zip$`)
-    const isAllowedWindowsBackend = (name: string): boolean =>
-      name === 'win-cpu-x64' ||
-      /^win-cuda-12\.\d+-x64$/.test(name) ||
-      /^win-cuda-13\.\d+-x64$/.test(name) ||
-      name === 'win-vulkan-x64'
-    const backends: BackendVersion[] = []
-    for (const asset of assets) {
-      const match = re.exec(asset.name)
-      if (!match) continue
-      const backendName = match[1]
-      if (!isAllowedWindowsBackend(backendName)) continue
-      if (!backendName.endsWith(`-${archSuffix}`)) continue
-      backends.push({ version: tag, backend: backendName, order: 0 })
-    }
-    return backends
-  }
-
-  if (osType === 'linux') {
-    if (archSuffix !== 'x64') return []
-    const re = new RegExp(`^llama-${escapedTag}-bin-(ubuntu-.+)\\.tar\\.gz$`)
-    const backends: BackendVersion[] = []
-    for (const asset of assets) {
-      const match = re.exec(asset.name)
-      if (!match) continue
-      const backendName = LINUX_BACKEND_BY_UPSTREAM_ASSET[match[1]]
-      if (!backendName) continue
-      backends.push({ version: tag, backend: backendName, order: 0 })
-    }
-    return backends
-  }
-
-  return []
-}
-
-/**
- * Fetches the list of available backend builds from ggml-org/llama.cpp
- * GitHub releases for the current platform/arch.
- *
- * macOS: returns `[]` deliberately — see the ADR "Ship upstream
- * `ggml-org/llama.cpp` as a second macOS provider, no fork". macOS users
- * only get the bundled (re-codesigned) build that ships with each Atomic
- * Chat release.
- *
- * Windows: returns the ggml-org Windows assets (CPU / CUDA 12.x / CUDA 13.x
- * / Vulkan) so the runtime update flow can fetch fresh builds without
- * shipping a new installer.
- *
- * Linux: returns the ggml-org Ubuntu assets (CPU + Vulkan, x64 only) so
- * the runtime update flow can fetch fresh builds. See the 2026-05-28 ADR
- * *Linux ships only `llamacpp-upstream`*.
- *
- * Returns `[]` on network failure so the app can still work offline with
- * only bundled/local backends.
- */
-export async function fetchRemoteBackends(): Promise<BackendVersion[]> {
-  const sysInfo = await getSystemInfo()
-  const osType = sysInfo.os_type
-  const arch = sysInfo.cpu.arch
-
-  // macOS: bundled-only by design (see backend ADR). The upstream macOS
-  // tarball is hand-picked + re-codesigned at build time; we deliberately
-  // don't pull from ggml-org at runtime.
-  if (osType === 'macos') {
-    return []
-  }
-
-  if (osType !== 'windows' && osType !== 'linux') {
-    return []
-  }
-
-  const archSuffix =
-    arch.includes('aarch64') || arch.includes('arm64') ? 'arm64' : 'x64'
-
-  // --- In-memory cache check -------------------------------------------------
-  // If we've already fetched a LIVE manifest this session, return it
-  // immediately. This avoids repeated network round-trips. Only successful
-  // live fetches land here (see assignment below); the bundled baseline is
-  // never cached, so a transient failure does not pin subsequent calls to a
-  // stale snapshot once the network recovers.
-  if (_cachedManifest) {
-    console.info('[fetchRemoteBackends] Using in-memory manifest cache')
-    return parseManifestForPlatform(_cachedManifest, osType, archSuffix)
-  }
-
-  try {
-    console.info(
-      `[fetchRemoteBackends] Fetching ${LLAMACPP_BACKEND_MANIFEST_URL}...`
-    )
-    const resp = await fetchManifestWithFallbacks()
-    if (!resp.ok) {
-      console.warn(
-        `[fetchRemoteBackends] Backend manifest returned ${resp.status}; using bundled baseline (not cached, will retry next call)`
-      )
-      return parseManifestForPlatform(BUNDLED_MANIFEST_BASELINE, osType, archSuffix)
-    }
-
-    const release = await resp.json()
-    const tag: string = release.tag_name
-    if (!tag) {
-      console.warn(
-        '[fetchRemoteBackends] Manifest missing tag_name; using bundled baseline (not cached, will retry next call)'
-      )
-      return parseManifestForPlatform(BUNDLED_MANIFEST_BASELINE, osType, archSuffix)
-    }
-    if (tag !== LLAMACPP_UPSTREAM_PINNED_TAG) {
-      console.warn(
-        `[fetchRemoteBackends] Manifest tag ${tag} is not the verified ${LLAMACPP_UPSTREAM_PINNED_TAG} pin; using bundled baseline until a compatibility update lands`
-      )
-      return parseManifestForPlatform(BUNDLED_MANIFEST_BASELINE, osType, archSuffix)
-    }
-
-    // Cache ONLY a genuinely successful live manifest for this session. The
-    // bundled baseline is never stored here (see _cachedManifest comment).
-    _cachedManifest = release
-
-    const backends = parseManifestForPlatform(release, osType, archSuffix)
-    console.info(
-      `[fetchRemoteBackends] Found ${backends.length} remote backends for ${osType}-${archSuffix}:`,
-      backends.map((b) => b.backend)
-    )
-    return backends
-  } catch (err) {
-    // All transports failed. Log the real cause (each per-transport reason is
-    // embedded in the AggregateError message from fetchManifestWithFallbacks),
-    // then fall back to the bundled baseline so the user can still download
-    // GPU backends. The baseline may be one release behind, but it is always
-    // better than a dead-end. It is deliberately NOT cached, so the next call
-    // retries the network and self-heals once the stall clears.
-    console.warn(
-      '[fetchRemoteBackends] All manifest fetch transports failed; falling back to bundled baseline (not cached, will retry next call).',
-      err instanceof Error ? err.message : String(err)
-    )
-    return parseManifestForPlatform(BUNDLED_MANIFEST_BASELINE, osType, archSuffix)
-  }
-}
-
-/**
- * Builds the download URL for a specific backend version from ggml-org/llama.cpp.
+ * This is the un-mirrored fallback shape. The core resolves the real download
+ * source (our signed mirror when the manifest lists the asset); this function
+ * stays for callers that only need a URL.
  *
  * Asset naming differs by platform:
- *   - macOS: `llama-{tag}-bin-macos-{arm64,x64}.zip`
+ *   - macOS: `llama-{tag}-bin-macos-{arm64,x64}.tar.gz`
  *   - Windows: `llama-{tag}-bin-win-{variant}.zip`
  *   - Linux: `llama-{tag}-bin-ubuntu-{variant}.tar.gz` (note: internal
  *     backend ids are `linux-*` but upstream filenames carry `ubuntu-*`;
  *     `LINUX_UPSTREAM_ASSET_BY_BACKEND` provides the mapping).
  *
- * macOS / Windows use `.zip`, Linux uses `.tar.gz`. The Tauri `decompress`
+ * macOS / Linux use `.tar.gz`, Windows uses `.zip`. The Tauri `decompress`
  * command handles both formats transparently.
  */
 export function getBackendDownloadUrl(
@@ -475,21 +296,25 @@ export function getBackendDownloadUrl(
       `getBackendDownloadUrl: unresolved 'latest' tag for backend '${backend}'. The latest/<backend> sentinel must be resolved to a concrete release tag before download.`
     )
   }
-  const linuxInfix = LINUX_UPSTREAM_ASSET_BY_BACKEND[backend]
-  if (linuxInfix) {
-    return `${LLAMACPP_DOWNLOAD_BASE}/${version}/llama-${version}-bin-${linuxInfix}.tar.gz`
-  }
-  return `${LLAMACPP_DOWNLOAD_BASE}/${version}/llama-${version}-bin-${backend}.zip`
+  const archiveName = getBackendArchiveName(version, backend)
+  return `${GGML_ORG_DOWNLOAD_BASE}/${version}/${archiveName}`
 }
 
-export function getBackendArchiveName(version: string, backend: string): string {
+export function getBackendArchiveName(
+  version: string,
+  backend: string
+): string {
   version = version.replace(/\uFEFF/g, '').trim()
   backend = backend.replace(/\uFEFF/g, '').trim()
-  const linuxInfix = LINUX_UPSTREAM_ASSET_BY_BACKEND[backend]
+  const linuxCuda = LINUX_CUDA_BACKEND_RE.exec(backend)
+  const linuxInfix =
+    LINUX_UPSTREAM_ASSET_BY_BACKEND[backend] ??
+    (linuxCuda ? `ubuntu-cuda-${linuxCuda[1]}-arm64` : undefined)
   if (linuxInfix) {
     return `llama-${version}-bin-${linuxInfix}.tar.gz`
   }
-  return `llama-${version}-bin-${backend}.zip`
+  const extension = backend.startsWith('macos-') ? 'tar.gz' : 'zip'
+  return `llama-${version}-bin-${backend}.${extension}`
 }
 
 /**
@@ -499,227 +324,162 @@ export function getBackendArchiveName(version: string, backend: string): string 
  */
 export function friendlyBackendLabel(backend: string): string {
   const id = backend.replace(/\uFEFF/g, '').trim()
-  if (id.endsWith('cpu-x64')) return 'CPU'
+  if (id.endsWith('cpu-x64') || id.endsWith('cpu-arm64')) return 'CPU'
+  if (id.includes('opencl-adreno')) return 'OpenCL (Adreno)'
   if (id.includes('cuda-13')) return 'CUDA 13'
   if (id.includes('cuda-12')) return 'CUDA 12'
+  if (id.includes('rocm')) {
+    // The version-less family id (`win-rocm-x64`) has nothing to append; a
+    // concrete asset carries the HIP version worth showing.
+    const version = /rocm-(\d+\.\d+)/.exec(id)?.[1]
+    return version ? `ROCm ${version} (~1 GB)` : 'ROCm (~1 GB)'
+  }
   if (id.includes('vulkan')) return 'Vulkan'
+  if (id === 'macos-arm64') return 'Apple Silicon'
+  if (id === 'macos-x64') return 'Intel'
   return id
 }
 
+/// Unpacked size of the Windows HIP tree, measured from the archive's zip
+/// central directory: 1072 MB on b10809 (ROCm 10.0), up from 936 MB on b10431
+/// (ROCm 7.14). `ggml-hip.dll` alone is 896 MB because the whole HIP runtime is
+/// linked into it, and ROCm 10 adds a 116 MB `amd_comgr.dll` beside it. By far
+/// the largest backend in the product, and the reason a free-space precondition
+/// exists at all. Re-measure on the next HIP major — the tree only grows.
+const WIN_ROCM_UNPACKED_BYTES = 1080 * 1024 * 1024
+/// Headroom over archive + unpacked so the check does not green-light an
+/// install that lands the volume at zero free bytes.
+const BACKEND_INSTALL_HEADROOM_BYTES = 200 * 1024 * 1024
+/// Used when the manifest carries no size for the archive (an unmirrored tag).
+/// Measured at 232.9 MB for `win-rocm-10.0-x64` in b10809.
+const WIN_ROCM_ARCHIVE_BYTES_FALLBACK = 250 * 1024 * 1024
+
 /**
- * Maps a Windows CUDA backend variant id (e.g. `win-cuda-13.4-x64`) to
- * the matching cudart asset on the same ggml-org/llama.cpp release.
+ * Bytes that must be free before downloading `backend`, or `null` when the
+ * backend is small enough that no precondition is warranted (every non-HIP
+ * upstream archive unpacks to well under 300 MB).
  *
- * The main `llama-{tag}-bin-win-cuda-{12.4,13.x}-x64.zip` archives ship
- * only the llama-server executable and its direct deps; the CUDA Toolkit
- * runtime DLLs (cudart64_*.dll, cublas64_*.dll, cublasLt64_*.dll, …)
- * live in a sibling `cudart-llama-bin-win-cuda-{12.4,13.x}-x64.zip`.
- * Without those DLLs, `llama-server.exe --list-devices` returns an empty
- * device list on machines that don't have the CUDA Toolkit installed
- * system-wide (GitHub issue AtomicBot-ai/Atomic-Chat#14).
- *
- * ggml-org dropped CUDA 11 release artifacts — the lowest CUDA tier
- * shipped is CUDA 12.4. Hosts whose driver only supports CUDA 11 fall
- * back to the CPU build via runtime driver-version gating.
+ * The archive is counted alongside the unpacked tree because it stays in the
+ * staging directory until extraction finishes.
  */
-const WINDOWS_CUDA_BACKEND_RE = /^win-cuda-(12\.\d+|13\.\d+)-x64$/
-
-function matchWindowsCudaBackend(
-  backend: string
-): string | null {
-  const match = WINDOWS_CUDA_BACKEND_RE.exec(backend.replace(/\uFEFF/g, '').trim())
-  if (!match) return null
-  return match[1]
-}
-
-function buildWindowsCudartArchiveName(cudaToolkitVersion: string): string {
-  return `cudart-llama-bin-win-cuda-${cudaToolkitVersion}-x64.zip`
+export function requiredDiskSpaceForBackend(
+  backend: string,
+  archiveBytes?: number
+): number | null {
+  const id = backend.replace(/\uFEFF/g, '').trim()
+  if (!id.includes('rocm')) return null
+  const archive =
+    archiveBytes && archiveBytes > 0
+      ? archiveBytes
+      : WIN_ROCM_ARCHIVE_BYTES_FALLBACK
+  return archive + WIN_ROCM_UNPACKED_BYTES + BACKEND_INSTALL_HEADROOM_BYTES
 }
 
 /**
- * Returns the download URL for the cudart companion archive that must be
- * merged into `<backendDir>/build/bin/` for a Windows CUDA backend, or
- * `null` if `backend` is not one of the Windows CUDA variants.
+ * Matches a *minor-less* CUDA family id (e.g. `win-cuda-13-x64`,
+ * `win-cuda-12-x64`, `win-cuda-13-arm64`, `linux-cuda-13-arm64`). These are
+ * the family ids the Rust matrix (`determine_supported_backends`) and the TS
+ * dropdown `staticVariants` emit — the concrete minor (`13.3`, `12.4`) is only
+ * known once the ggml-org release stream is queried (ATO-105/ATO-174).
  */
-export function getCudartDownloadUrl(
-  version: string,
-  backend: string
-): string | null {
-  const toolkitVersion = matchWindowsCudaBackend(backend)
-  if (!toolkitVersion) return null
-  const filename = buildWindowsCudartArchiveName(toolkitVersion)
-  const cleanVersion = version.replace(/\uFEFF/g, '').trim()
-  return `${LLAMACPP_DOWNLOAD_BASE}/${cleanVersion}/${filename}`
-}
+const CUDA_FAMILY_RE = /^(win-cuda-(\d+)-(x64|arm64)|linux-cuda-(\d+)-(arm64))$/
 
 /**
- * Returns the cudart filename (without URL) for a Windows CUDA backend,
- * or `null` if the backend is not a Windows CUDA variant.
+ * The ROCm equivalent. HIP has no major to pin at all: upstream publishes a
+ * single `win-rocm-<major>.<minor>-x64` asset per release and moves that
+ * version wholesale (7.14 today), so the family id carries no version and the
+ * concrete one always comes from the manifest.
  */
-export function getCudartArchiveName(backend: string): string | null {
-  const toolkitVersion = matchWindowsCudaBackend(backend)
-  if (!toolkitVersion) return null
-  return buildWindowsCudartArchiveName(toolkitVersion)
-}
-
-/**
- * Returns the CUDA Toolkit version string (e.g. `13.3`) that the Rust
- * `is_cuda_installed` command expects for a given Windows CUDA backend.
- * `null` for non-CUDA backends.
- */
-export function getCudaToolkitVersion(backend: string): string | null {
-  return matchWindowsCudaBackend(backend)
-}
-
-/**
- * Matches a *minor-less* Windows CUDA family id (e.g. `win-cuda-13-x64`,
- * `win-cuda-12-x64`). These are the family ids the Rust matrix
- * (`determine_supported_backends`) and the TS dropdown `staticVariants`
- * emit — the concrete minor (`13.3`, `12.4`) is only known once the
- * ggml-org release stream is queried (ATO-105/ATO-174).
- */
-const WIN_CUDA_FAMILY_RE = /^win-cuda-(\d+)-x64$/
+const WIN_ROCM_FAMILY_ID = 'win-rocm-x64'
+const WIN_ROCM_CONCRETE_RE = /^win-rocm-(\d+)\.(\d+)-x64$/
 
 /**
  * The CUDA major (`"13"`, `"12"`) of a minor-less family id, or `null` if
- * `backend` is not a minor-less Windows CUDA family id (concrete ids like
+ * `backend` is not a minor-less CUDA family id (concrete ids like
  * `win-cuda-13.3-x64` deliberately return `null` here — they need no
  * family resolution).
  */
 export function cudaFamilyMajor(backend: string): string | null {
-  const m = WIN_CUDA_FAMILY_RE.exec(backend.replace(/\uFEFF/g, '').trim())
-  return m ? m[1] : null
+  const m = CUDA_FAMILY_RE.exec(backend.replace(/\uFEFF/g, '').trim())
+  return m ? (m[2] ?? m[4]) : null
 }
 
 /**
- * True when `concrete` (e.g. `win-cuda-13.3-x64`) belongs to the minor-less
- * CUDA family `familyBackend` (e.g. `win-cuda-13-x64`). False for a
- * non-family `familyBackend` or a non-matching major.
+ * Regex matching every concrete asset id of a version-less GPU family id, with
+ * the version components captured so the newest can be picked. `null` when
+ * `familyBackend` is not a family id.
  */
-export function isConcreteOfCudaFamily(
+function gpuFamilyConcreteRe(familyBackend: string): RegExp | null {
+  const id = familyBackend.replace(/\uFEFF/g, '').trim()
+  if (id === WIN_ROCM_FAMILY_ID) return WIN_ROCM_CONCRETE_RE
+  const m = CUDA_FAMILY_RE.exec(id)
+  if (!m) return null
+  return m[2]
+    ? new RegExp(`^win-cuda-(${m[2]})\\.(\\d+)-${m[3]}$`)
+    : new RegExp(`^linux-cuda-(${m[4]})\\.(\\d+)-${m[5]}$`)
+}
+
+/**
+ * True when `concrete` (e.g. `win-cuda-13.3-x64`, `win-rocm-7.14-x64`) belongs
+ * to the version-less GPU family `familyBackend` (`win-cuda-13-x64`,
+ * `win-rocm-x64`). False for a non-family `familyBackend` or a non-matching
+ * major.
+ */
+export function isConcreteOfGpuFamily(
   familyBackend: string,
   concrete: string
 ): boolean {
-  const major = cudaFamilyMajor(familyBackend)
-  if (!major) return false
-  return new RegExp(`^win-cuda-${major}\\.\\d+-x64$`).test(
-    concrete.replace(/\uFEFF/g, '').trim()
-  )
+  const concreteRe = gpuFamilyConcreteRe(familyBackend)
+  if (!concreteRe) return false
+  return concreteRe.test(concrete.replace(/\uFEFF/g, '').trim())
 }
 
 /**
- * Resolves a minor-less CUDA family id (`win-cuda-13-x64`) to the newest
- * concrete `<tag>/<backend>` of that major in `remote` (e.g.
- * `b9596/win-cuda-13.3-x64`). Picks the highest minor when ggml-org ships
- * more than one. Returns `null` when `familyBackend` is not a family id or
- * no concrete asset of that major is present.
+ * Resolves a version-less GPU family id (`win-cuda-13-x64`, `win-rocm-x64`) to
+ * the newest concrete `<tag>/<backend>` of that family in `remote` (e.g.
+ * `b9596/win-cuda-13.3-x64`, `b10405/win-rocm-7.14-x64`). Picks the highest
+ * version when upstream ships more than one. Returns `null` when
+ * `familyBackend` is not a family id or no concrete asset is present.
  */
-export function resolveCudaFamilyConcrete(
+export function resolveGpuFamilyConcrete(
   familyBackend: string,
   remote: BackendVersion[]
 ): string | null {
-  const major = cudaFamilyMajor(familyBackend)
-  if (!major) return null
-  const concreteRe = new RegExp(`^win-cuda-${major}\\.(\\d+)-x64$`)
-  let best: { version: string; backend: string; minor: number } | null = null
+  const concreteRe = gpuFamilyConcreteRe(familyBackend)
+  if (!concreteRe) return null
+  let best: {
+    version: string
+    backend: string
+    rank: [number, number]
+  } | null = null
   for (const b of remote) {
     const backendName = b.backend.replace(/\uFEFF/g, '').trim()
     const m = concreteRe.exec(backendName)
     if (!m) continue
-    const minor = parseInt(m[1], 10)
-    if (!best || minor > best.minor) {
-      best = { version: b.version, backend: backendName, minor }
+    const rank: [number, number] = [parseInt(m[1], 10), parseInt(m[2], 10)]
+    if (
+      !best ||
+      rank[0] > best.rank[0] ||
+      (rank[0] === best.rank[0] && rank[1] > best.rank[1])
+    ) {
+      best = { version: b.version, backend: backendName, rank }
     }
   }
   return best ? `${best.version}/${best.backend}` : null
 }
 
-export async function listSupportedBackends(): Promise<BackendVersion[]> {
-  const sysInfo = await getSystemInfo()
-  const osType = sysInfo.os_type
-  const arch = sysInfo.cpu.arch
-
-  console.info('[listSupportedBackends] sysInfo:', osType, arch)
-
-  const rawFeatures = await _getSupportedFeatures()
-  const features = normalizeFeatures(rawFeatures)
-
-  const supportedBackends = await determineSupportedBackends(
-    osType,
-    arch,
-    features
-  )
-  console.info('[listSupportedBackends] supportedBackends:', supportedBackends)
-
-  const [localBackendVersions, remoteBackendVersions] = await Promise.all([
-    getLocalInstalledBackends(),
-    fetchRemoteBackends(),
-  ])
-  console.info(
-    '[listSupportedBackends] local backends:',
-    localBackendVersions.length,
-    localBackendVersions
-  )
-  console.info(
-    '[listSupportedBackends] remote backends:',
-    remoteBackendVersions.length,
-    remoteBackendVersions.map((b) => `${b.version}/${b.backend}`)
-  )
-
-  const mergedBackends = await listSupportedBackendsFromRust(
-    remoteBackendVersions,
-    localBackendVersions
-  )
-
-  // Hardware-gated backend matrix applies on Windows: the user only sees
-  // backends whose driver/Vulkan/CUDA requirements are actually met on
-  // this host. macOS keeps the merged list unfiltered (every ggml-org
-  // macOS asset is supported on the matching arch).
-  if (osType !== 'windows') {
-    void supportedBackends
-    void mapOldBackendToNew
-    return mergedBackends
-  }
-
-  const supportedSet = new Set(supportedBackends)
-  // CUDA-13 is matched family-wise (ATO-105): ggml-org periodically bumps
-  // the toolkit minor (13.1 -> 13.3 -> 13.x) in its release assets, so the
-  // supported set carries the minor-less family id `win-cuda-13-x64` (emitted
-  // by `determine_supported_backends`) instead of a hardcoded concrete minor.
-  // Any concrete `win-cuda-13.<minor>-x64` asset is accepted when the family
-  // is supported, and the concrete id (e.g. `win-cuda-13.4-x64`) keeps
-  // flowing downstream unchanged so the right asset is downloaded.
-  const WIN_CUDA13_CONCRETE_RE = /^win-cuda-13\.\d+-(x64|arm64)$/
-  const isSupported = (rawBackend: string, normalizedBackend: string): boolean => {
-    if (supportedSet.has(normalizedBackend)) return true
-    const m = WIN_CUDA13_CONCRETE_RE.exec(rawBackend)
-    if (m) {
-      return supportedSet.has(`win-cuda-13-${m[1]}`)
-    }
-    return false
-  }
-
-  const filteredBackends = await Promise.all(
-    mergedBackends.map(async (backendInfo) => ({
-      backendInfo,
-      rawBackend: backendInfo.backend.replace(/\uFEFF/g, '').trim(),
-      normalizedBackend: await mapOldBackendToNew(backendInfo.backend),
-    }))
-  )
-
-  const supportedMergedBackends = filteredBackends
-    .filter(({ rawBackend, normalizedBackend }) =>
-      isSupported(rawBackend, normalizedBackend)
-    )
-    .map(({ backendInfo }) => backendInfo)
-
-  console.info(
-    '[listSupportedBackends] windows filtered backends:',
-    supportedMergedBackends.length,
-    supportedMergedBackends.map((b) => `${b.version}/${b.backend}`)
-  )
-
-  return supportedMergedBackends
+/**
+ * The builds this machine can run, as the core merged them: the manifest and the
+ * installed packs, gated by the hardware tiers the core detected (Windows CUDA /
+ * ROCm / Vulkan families, Linux Vulkan-or-CPU, the matching macOS arch). This
+ * used to be assembled here from the plugin's feature flags; the core now
+ * answers the same question for the app and the CLI from one probe.
+ */
+export async function listSupportedBackends(options?: {
+  force?: boolean
+  appVersion?: string | null
+}): Promise<BackendVersion[]> {
+  return (await loadCatalog(options)).available
 }
 
 export async function getBackendDir(
@@ -763,67 +523,6 @@ export async function isBackendInstalled(
 }
 
 /**
- * Compute the set of backend type strings that are equivalent to `backendType`
- * for the purpose of compatibility checking (ATO-233). In particular, ggml-org
- * Linux tarballs carry `ubuntu-*` asset names (e.g. `ubuntu-vulkan-x64`), but
- * the extension stores backends under `linux-*` internal ids
- * (`linux-vulkan-x64`). Backends installed via "Install Backend from File"
- * with an unpatched version of the app may therefore be on disk under the
- * ubuntu name. This helper returns ALL names that should be treated as the
- * same type so `findCompatibleInstalledBackend` can find them.
- */
-function backendTypeEquivalents(backendType: string): Set<string> {
-  const ids = new Set<string>()
-  const bt = backendType.replace(/\uFEFF/g, '').trim()
-  ids.add(bt)
-  // linux-vulkan-x64 ↔ ubuntu-vulkan-x64
-  if (bt === 'linux-vulkan-x64') ids.add('ubuntu-vulkan-x64')
-  if (bt === 'linux-vulkan-arm64') ids.add('ubuntu-vulkan-arm64')
-  if (bt === 'linux-cpu-x64') ids.add('ubuntu-x64')
-  if (bt === 'linux-cpu-arm64') ids.add('ubuntu-arm64')
-  // Reverse mappings: when the on-disk name is the ubuntu variant
-  if (bt === 'ubuntu-vulkan-x64') ids.add('linux-vulkan-x64')
-  if (bt === 'ubuntu-vulkan-arm64') ids.add('linux-vulkan-arm64')
-  if (bt === 'ubuntu-x64') ids.add('linux-cpu-x64')
-  if (bt === 'ubuntu-arm64') ids.add('linux-cpu-arm64')
-  return ids
-}
-
-/**
- * Find a working, already-installed backend of the SAME type as `backendType`
- * (e.g. `macos-arm64`), regardless of its release tag. Used as a fallback
- * (ATO-179, AC2) when the model's pinned `version_backend` can't be obtained
- * (download failed / the tag was pruned upstream) but a compatible build is
- * already on disk — so the load degrades to a working backend instead of
- * failing with `BINARY_NOT_FOUND`.
- *
- * "Compatible" is deliberately limited to the identical backend type: every
- * release tag of the same type targets the same platform / GPU variant and is
- * interchangeable. We do NOT cross types here (e.g. cuda → cpu) — that is a
- * feature/perf trade-off that must stay an explicit user choice.
- *
- * ATO-233: also recognises `ubuntu-*` ↔ `linux-*` name equivalents so that
- * backends installed via "Install Backend from File" with ggml-org upstream
- * tarball names are found even if the on-disk directory still uses the old
- * ubuntu name.
- *
- * Returns the newest (by on-disk mtime, via `order`) matching backend, or
- * `null` when none is installed.
- */
-export async function findCompatibleInstalledBackend(
-  backendType: string
-): Promise<BackendVersion | null> {
-  const equivalents = backendTypeEquivalents(backendType)
-  const installed = await getLocalInstalledBackends()
-  const sameType = installed.filter((b) =>
-    equivalents.has(b.backend.replace(/\uFEFF/g, '').trim())
-  )
-  if (sameType.length === 0) return null
-  sameType.sort((a, b) => (b.order ?? 0) - (a.order ?? 0))
-  return sameType[0]
-}
-
-/**
  * Remove orphan / incomplete backend directories from this provider's
  * backends tree (ATO-179, AC3). An "incomplete" directory is one that exists
  * on disk but carries no `llama-server` executable — e.g. an empty stub left
@@ -858,6 +557,9 @@ export async function cleanupIncompleteBackends(): Promise<string[]> {
     }
 
     for (const backendType of backendTypes) {
+      // `<backend>.incoming-<ts>` is atomic-chat-core staging an install it is running right now
+      // (possibly for the CLI); it renames the folder into place when the archive is unpacked.
+      if (backendType.includes('.incoming-')) continue
       if (await isBackendInstalled(backendType, version)) continue
       const dir = await getBackendDir(backendType, version)
       await fs.rm(dir)
@@ -876,11 +578,43 @@ export async function cleanupIncompleteBackends(): Promise<string[]> {
   return removed
 }
 
-async function _getSupportedFeatures() {
-  const sysInfo = await getSystemInfo()
-  return await getSupportedFeaturesFromRust(
-    sysInfo.os_type,
-    sysInfo.cpu.extensions,
-    sysInfo.gpus
-  )
+/**
+ * What a `version_backend` setting change asks for, ported from the plugin's
+ * `handle_setting_update` (`backend.rs`) so the Rust command can retire.
+ *
+ * The value is `version/backend` (a BOM left by PowerShell-generated files is
+ * stripped first); the backend id is normalized through `mapOldBackendToNew`
+ * so a legacy id persisted before the ggml-org switch still resolves, and the
+ * preference is reported as updated when that normalized id differs from the
+ * one stored (or nothing is stored). Rejects anything that is not exactly two
+ * non-empty parts, as the Rust command did.
+ */
+export async function parseVersionBackendSetting(
+  value: string,
+  currentStoredBackend: string | undefined,
+  mapBackend: (backend: string) => Promise<string> = mapOldBackendToNew
+): Promise<SettingUpdateResult> {
+  const cleanValue = value.replace(/\uFEFF/g, '')
+  const parts = cleanValue.split('/')
+  if (parts.length !== 2) {
+    throw new Error(`Invalid backend format: ${cleanValue}`)
+  }
+  const version = parts[0].trim()
+  const backend = parts[1].trim()
+  if (!version || !backend) {
+    throw new Error(`Invalid backend format: ${value}`)
+  }
+
+  const effectiveBackendType = (await mapBackend(backend)) || backend
+  const backendTypeUpdated =
+    currentStoredBackend === undefined ||
+    currentStoredBackend !== effectiveBackendType
+
+  return {
+    backend_type_updated: backendTypeUpdated,
+    effective_backend_type: effectiveBackendType,
+    needs_backend_installation: true,
+    version,
+    backend,
+  }
 }

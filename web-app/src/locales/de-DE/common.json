@@ -1,7 +1,11 @@
 {
+  "api": "API",
+  "cloud": "Cloud",
   "assistants": "Assistenten",
   "hardware": "Hardware",
   "mcp-servers": "Mcp Server",
+  "connectors": "Konnektoren",
+  "plugins": "Plugins",
   "local_api_server": "Lokaler API Server",
   "https_proxy": "HTTPS Proxy",
   "extensions": "Erweiterungen",
@@ -22,12 +26,17 @@
   "recents": "Kürzlich",
   "hub": "Hub",
   "models": "Modelle",
+  "images": "Images",
+  "video": "Video",
+  "media": "Media",
   "helpSupport": "Hilfe & Support",
   "helpUsImproveJan": "Hilf uns Atomic Bot zu verbessern",
   "unstarAll": "Alle De-Favorisieren",
   "unstar": "De-Favorisieren",
   "deleteAll": "Alles löschen",
   "star": "Favorisieren",
+  "openInNewWindow": "In neuem Fenster öffnen",
+  "openInNewWindowFailed": "Dieser Chat konnte nicht in einem neuen Fenster geöffnet werden",
   "rename": "Umbenennen",
   "delete": "Löschen",
   "copied": "Kopiert!",
@@ -239,16 +248,13 @@
     "deleteThread": {
       "description": "Bist Du sicher, daß Du diesen Thread löschen möchtest? Diese Aktion kann nicht rückgängig gemacht werden."
     },
-    "editMessage": {
-      "title": "Nachricht bearbeiten"
-    },
     "messageMetadata": {
       "title": "Nachricht Metadaten"
     }
   },
   "projects": {
     "title": "Projekte",
-    "new": "Neue Projekte",
+    "new": "Neues Projekt",
     "addProject": "Projekt hinzufügen",
     "addToProject": "Zum Projekt hinzufügen",
     "removeFromProject": "Vom Projekt entfernen",
@@ -382,5 +388,18 @@
       "title": "Download abgeschlossen",
       "description": "Modell \"{{item}}\" erfolgreich heruntergeladen und verifiziert"
     }
+  },
+  "skills": "Skills",
+  "pluginsMenu": {
+    "title": "Plugins",
+    "emptySkills": "Noch keine Skills",
+    "manageSkills": "Skills verwalten"
+  },
+  "desktopNotification": {
+    "modelReadyTitle": "Modell heruntergeladen",
+    "modelReadyBody": "{{name}} ist einsatzbereit.",
+    "engineReadyTitle": "Engine installiert",
+    "chatEngineReadyBody": "llama.cpp ist bereit, Modelle auszuführen.",
+    "mediaEngineReadyBody": "Die Bild- und Video-Engine ist bereit."
   }
 }

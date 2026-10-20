@@ -9,15 +9,16 @@ import {
   DialogTitle,
   DialogTrigger,
 } from '@/components/ui/dialog'
-import { useModelProvider } from '@/hooks/useModelProvider'
 import { useServiceHub } from '@/hooks/useServiceHub'
+import { isManagedProvider, managedEngines } from '@/lib/managed-engines'
+import { deleteLocalModel } from '@/lib/model-deletion'
+import { formatBytes } from '@/lib/utils'
 
 import { IconTrash } from '@tabler/icons-react'
 
 import { useState, useEffect } from 'react'
 import { toast } from 'sonner'
 import { useTranslation } from '@/i18n/react-i18next-compat'
-import { useFavoriteModel } from '@/hooks/useFavoriteModel'
 
 type DialogDeleteModelProps = {
   provider: ModelProvider
@@ -30,42 +31,42 @@ export const DialogDeleteModel = ({
 }: DialogDeleteModelProps) => {
   const { t } = useTranslation()
   const [selectedModelId, setSelectedModelId] = useState<string>('')
-  const { setProviders, deleteModel: deleteModelCache } = useModelProvider()
-  const { removeFavorite } = useFavoriteModel()
   const serviceHub = useServiceHub()
 
   const removeModel = async () => {
-    // Remove model from favorites if it exists
-    removeFavorite(selectedModelId)
-
-    deleteModelCache(selectedModelId)
-    serviceHub
-      .models()
-      .deleteModel(selectedModelId, provider.provider)
-      .then(() => {
-        serviceHub
-          .providers()
-          .getProviders()
-          .then((providers) => {
-            // Filter out the deleted model from all providers
-            const filteredProviders = providers.map((provider) => ({
-              ...provider,
-              models: provider.models.filter(
-                (model) => model.id !== selectedModelId
-              ),
-            }))
-            setProviders(filteredProviders)
-          })
-        toast.success(
-          t('providers:deleteModel.title', { modelId: selectedModel?.id }),
-          {
-            id: `delete-model-${selectedModel?.id}`,
-            description: t('providers:deleteModel.success', {
-              modelId: selectedModel?.id,
-            }),
-          }
-        )
-      })
+    try {
+      const report = await deleteLocalModel(
+        serviceHub,
+        selectedModelId,
+        provider.provider
+      )
+      toast.success(
+        t('providers:deleteModel.title', { modelId: selectedModelId }),
+        {
+          id: `delete-model-${selectedModelId}`,
+          description: report
+            ? t('providers:deleteModel.successFreed', {
+                modelId: selectedModelId,
+                size: formatBytes(report.freedBytes),
+              })
+            : t('providers:deleteModel.success', {
+                modelId: selectedModelId,
+              }),
+        }
+      )
+    } catch (error) {
+      // Previously this rejection was dropped on the floor while the model had
+      // already been removed from the cache: the row vanished, the weights
+      // stayed, and it reappeared on the next provider refresh.
+      console.error('[DialogDeleteModel] deleteModel failed:', error)
+      toast.error(
+        t('providers:deleteModel.title', { modelId: selectedModelId }),
+        {
+          id: `delete-model-${selectedModelId}`,
+          description: error instanceof Error ? error.message : String(error),
+        }
+      )
+    }
   }
 
   // Initialize with the provided model ID or the first model if available
@@ -107,6 +108,16 @@ export const DialogDeleteModel = ({
             {t('providers:deleteModel.description')}
           </DialogDescription>
         </DialogHeader>
+        {isManagedProvider(provider.provider) && (
+          // One copy in the shared store serves every managed engine (spec `vllm-desktop`).
+          <p className="text-sm text-muted-foreground">
+            {t('providers:deleteModel.managedShared', {
+              engines: managedEngines()
+                .map((engine) => engine.label)
+                .join(', '),
+            })}
+          </p>
+        )}
 
         <DialogFooter className="mt-2">
           <DialogClose asChild>

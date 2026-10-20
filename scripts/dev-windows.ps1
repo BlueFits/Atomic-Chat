@@ -291,10 +291,16 @@ function Test-BackendSatisfiedBy {
 
 function Resolve-BackendFromManifest {
     # Given the parsed backend manifest object from atomic-chat-conf and a
-    # selected backend id, resolve to @{ Backend; Tag }. Minor-less CUDA family
-    # ids (win-cuda-13-x64 / win-cuda-12-x64) are resolved to the highest
-    # concrete minor listed in manifest assets. Mirrors the runtime resolver in
+    # selected backend id, resolve to @{ Backend; Tag; Asset; Url; Sha256; Size }.
+    # Minor-less CUDA family ids (win-cuda-13-x64 / win-cuda-12-x64) are
+    # resolved to the highest concrete minor listed in manifest assets. Mirrors
+    # the runtime resolver in
     # extensions/llamacpp-upstream-extension/src/backend.ts.
+    #
+    # Deliberately NOT delegating to scripts/resolve-upstream-backend.mjs like
+    # the Makefile does: that script exits non-zero when an asset is missing,
+    # while this one must return $null so the caller keeps a working backend on
+    # disk instead of deleting it over a bad manifest (ATO-174 follow-up).
     param([object]$Manifest, [string]$Backend)
     if (-not $Manifest -or -not $Manifest.tag_name -or -not $Manifest.assets) {
         return $null
@@ -313,17 +319,42 @@ function Resolve-BackendFromManifest {
                 }
             }
         }
-        if ($best) {
-            return [pscustomobject]@{ Backend = $best; Tag = $Manifest.tag_name }
-        }
-        return $null
+        if (-not $best) { return $null }
+        return New-BackendSource -Manifest $Manifest -Backend $best
     }
 
     $want = "llama-$($Manifest.tag_name)-bin-$Backend.zip"
     if ($Manifest.assets | Where-Object { $_.name -eq $want }) {
-        return [pscustomobject]@{ Backend = $Backend; Tag = $Manifest.tag_name }
+        return New-BackendSource -Manifest $Manifest -Backend $Backend
     }
     return $null
+}
+
+function New-BackendSource {
+    # Where the archive comes from and what it must hash to. Our own signed
+    # mirror is used only when the manifest names a download_base and lists this
+    # asset with a hash; a tag we never mirrored falls back to the ggml-org CDN
+    # unverified, exactly as this script did before the mirror existed.
+    param([object]$Manifest, [string]$Backend)
+    $tag = $Manifest.tag_name
+    $asset = "llama-$tag-bin-$Backend.zip"
+    $entry = $Manifest.assets | Where-Object { $_.name -eq $asset } | Select-Object -First 1
+    $base = 'https://github.com/ggml-org/llama.cpp/releases/download'
+    $sha = $null
+    $size = $null
+    if ($Manifest.download_base -and $entry -and $entry.sha256 -and $entry.size) {
+        $base = $Manifest.download_base
+        $sha = $entry.sha256
+        $size = $entry.size
+    }
+    return [pscustomobject]@{
+        Backend = $Backend
+        Tag     = $tag
+        Asset   = $asset
+        Url     = "$base/$tag/$asset"
+        Sha256  = $sha
+        Size    = $size
+    }
 }
 
 function Invoke-BackendManifest {
@@ -491,9 +522,9 @@ if ($skipDownload) {
             New-Item -ItemType Directory -Path $llamacppDir -Force | Out-Null
         }
 
-        # ggml-org publishes Windows binaries as .zip (not .tar.gz like the
-        # legacy janhq mirror), so use Expand-Archive instead of tar.
-        $archiveUrl = "https://github.com/ggml-org/llama.cpp/releases/download/$tag/llama-$tag-bin-$backend.zip"
+        # Windows binaries ship as .zip (not .tar.gz like the legacy janhq
+        # mirror), so use Expand-Archive instead of tar.
+        $archiveUrl = $resolved.Url
         $archivePath = Join-Path $env:TEMP 'llamacpp-upstream-backend.zip'
 
         Write-Host "  Release: $tag  Backend: $backend"
@@ -513,6 +544,18 @@ if ($skipDownload) {
         if (-not $downloaded) {
             Write-Host "[FATAL] Failed to download $archiveUrl after 5 attempts" -ForegroundColor Red
             exit 1
+        }
+
+        if ($resolved.Sha256) {
+            $actual = (Get-FileHash -Path $archivePath -Algorithm SHA256).Hash.ToLower()
+            if ($actual -ne $resolved.Sha256) {
+                Remove-Item $archivePath -Force -ErrorAction SilentlyContinue
+                Write-Host "[FATAL] sha256 mismatch for $($resolved.Asset): expected $($resolved.Sha256), got $actual" -ForegroundColor Red
+                exit 1
+            }
+            Write-Host "  sha256 verified: $($resolved.Asset)"
+        } else {
+            Write-Host "  No sha256 published for $($resolved.Asset); skipping integrity check" -ForegroundColor Yellow
         }
 
         Set-Content -Path "$llamacppDir/version.txt" -Value $tag -NoNewline
@@ -566,42 +609,98 @@ if ($skipDownload) {
 # llamacpp-upstream (which stays the default). Bundle the offline-fallback
 # `windows-x64-cpu` build into the turboquant resource dir; the
 # llamacpp-extension auto-downloads the optimal CUDA/Vulkan variant at runtime.
-# Index resolved from the static turboquant manifest in atomic-chat-conf
-# (raw.githubusercontent.com — no api.github.com rate limit); each entry
-# carries its OWN tag because the variants live in scattered releases. The
-# archive itself comes from the AtomicBot-ai releases CDN. This step is
-# NON-FATAL: a failure here only skips the offline fallback (the runtime
-# download path still serves the provider), so it must never abort `make dev`.
+# No tag is pinned: the newest stable release is resolved from index.json on the
+# fork's own releases/latest, falling back to the legacy atomic-chat-conf
+# manifest. Set $env:TURBOQUANT_TAG to pin one. The archive itself comes from
+# the AtomicBot-ai releases CDN. This step is NON-FATAL: a failure here only
+# skips the offline fallback (the runtime download path still serves the
+# provider), so it must never abort `make dev`.
 Write-Step 'Download TurboQuant llamacpp backend: windows-x64-cpu'
 $tqDir = 'src-tauri/resources/llamacpp-backend'
 $tqServerExe = "$tqDir/build/bin/llama-server.exe"
 $tqBackend = 'windows-x64-cpu'
 
-# A bundle counts as a real TurboQuant backend only when its version.txt starts
-# with "turboquant-". A stale/legacy llama-server.exe (e.g. an old janhq "b8892"
-# build left over in this dir) must NOT satisfy the skip-guard, or the app will
-# run a non-TurboQuant binary that silently downgrades turbo3 KV -> q8_0.
+# A bundle counts as a real TurboQuant backend only when its version.txt names a
+# tag from the fork's release train: a legacy per-variant tag ("turboquant-*")
+# or a unified release tag ("b10018-1.3.0"). A stale/legacy llama-server.exe
+# (e.g. an old janhq "b8892" build left over in this dir) carries a plain
+# "b<build>" tag and must NOT satisfy the skip-guard, or the app will run a
+# non-TurboQuant binary that silently downgrades turbo3 KV -> q8_0.
 $tqVersionFile = "$tqDir/version.txt"
-$tqIsTurboquant = (Test-Path $tqServerExe) -and (Test-Path $tqVersionFile) -and `
-    ((Get-Content -Path $tqVersionFile -Raw -ErrorAction SilentlyContinue).Trim().StartsWith('turboquant-'))
+$tqVersionText = if (Test-Path $tqVersionFile) {
+    (Get-Content -Path $tqVersionFile -Raw -ErrorAction SilentlyContinue).Trim()
+} else { '' }
+$tqIsTurboquant = (Test-Path $tqServerExe) -and `
+    ($tqVersionText.StartsWith('turboquant-') -or ($tqVersionText -match '^b\d+-\d+\.\d+\.\d+$'))
 
-if ($SkipBackendDownload -and $tqIsTurboquant) {
+# Resolve the pinned release BEFORE deciding whether to skip. Belonging to the
+# fork's release train is not enough — a bundle from an older fork release is
+# just as stale as a foreign build, and a dev tree that silently keeps it never
+# picks up a release bump. `-SkipBackendDownload` opts out of the fetch entirely
+# so `dev-windows-fast` stays offline-capable, which is its whole point.
+$tqReuseWithoutFetch = $SkipBackendDownload -and $tqIsTurboquant
+$tqEntry = $null
+$tqPinnedTag = ''
+if (-not $tqReuseWithoutFetch) {
+    $tqHeaders = @{ 'User-Agent' = 'atomic-chat-dev' }
+    $tqOverride = $env:TURBOQUANT_TAG
+
+    if ($tqOverride) {
+        Write-Host "  Using pinned TurboQuant release: $tqOverride"
+        $tqEntry = [pscustomobject]@{
+            tag   = $tqOverride
+            asset = "llama-turboquant-$tqBackend.zip"
+        }
+    } else {
+        Write-Host '  Resolving the newest stable TurboQuant release...'
+        $tqIndexUrl = 'https://github.com/AtomicBot-ai/atomic-llama-cpp-turboquant/releases/latest/download/index.json'
+        $tqIndex = Invoke-BackendManifest -Uri $tqIndexUrl -Headers $tqHeaders
+        if ($tqIndex -and $tqIndex.releases) {
+            $tqRelease = $tqIndex.releases |
+                Where-Object {
+                    $_.prerelease -ne $true -and
+                    $_.tag -match '^b\d+-\d+\.\d+\.\d+$' -and
+                    ($_.variants | Where-Object { $_.id -eq $tqBackend })
+                } | Select-Object -First 1
+            if ($tqRelease) {
+                $tqVariant = $tqRelease.variants | Where-Object { $_.id -eq $tqBackend } | Select-Object -First 1
+                $tqEntry = [pscustomobject]@{
+                    tag   = $tqRelease.tag
+                    asset = if ($tqVariant.asset) { $tqVariant.asset } else { "llama-turboquant-$tqBackend.zip" }
+                }
+            }
+        }
+
+        if (-not $tqEntry) {
+            Write-Host '  Release index unavailable; falling back to the legacy atomic-chat-conf manifest.'
+            $tqManifestUrl = 'https://raw.githubusercontent.com/AtomicBot-ai/atomic-chat-conf/main/backends/turboquant-manifest.json'
+            $tqManifest = Invoke-BackendManifest -Uri $tqManifestUrl -Headers $tqHeaders
+            if ($tqManifest -and $tqManifest.backends) {
+                $tqEntry = $tqManifest.backends | Where-Object { $_.id -eq $tqBackend } | Select-Object -First 1
+            }
+        }
+    }
+
+    if ($tqEntry -and $tqEntry.tag) { $tqPinnedTag = $tqEntry.tag }
+}
+
+# Unreachable sources yield no resolved tag; keep whatever fork build is on
+# disk rather than wiping a working offline fallback over a network blip.
+$tqIsCurrent = $tqIsTurboquant -and `
+    ((-not $tqPinnedTag) -or ($tqVersionText -eq $tqPinnedTag))
+
+if ($tqReuseWithoutFetch) {
     Write-Host "  -SkipBackendDownload: reusing existing TurboQuant backend ($tqBackend), no fetch." -ForegroundColor Yellow
-} elseif ($tqIsTurboquant) {
-    Write-Host "  TurboQuant backend ($tqBackend) already present, skipping download."
+} elseif ($tqIsCurrent) {
+    Write-Host "  TurboQuant backend ($tqBackend, $tqVersionText) already present, skipping download."
 } else {
     if (Test-Path $tqServerExe) {
-        Write-Host "  Existing backend in $tqDir is not a TurboQuant build (version.txt missing or != 'turboquant-*'); replacing it." -ForegroundColor Yellow
+        if ($tqIsTurboquant) {
+            Write-Host "  Existing TurboQuant backend in $tqDir is release '$tqVersionText' but the newest stable is '$tqPinnedTag'; replacing it." -ForegroundColor Yellow
+        } else {
+            Write-Host "  Existing backend in $tqDir is not a TurboQuant build (version.txt missing or not a fork release tag); replacing it." -ForegroundColor Yellow
+        }
         Remove-Item -Path $tqDir -Recurse -Force -ErrorAction SilentlyContinue
-    }
-    $tqManifestUrl = 'https://raw.githubusercontent.com/AtomicBot-ai/atomic-chat-conf/f149c30e55a3dfcdcbcc5d4a72be7c691db8f5e2/backends/turboquant-manifest.json'
-    $tqHeaders = @{ 'User-Agent' = 'atomic-chat-dev' }
-
-    Write-Host '  Fetching TurboQuant backend manifest...'
-    $tqManifest = Invoke-BackendManifest -Uri $tqManifestUrl -Headers $tqHeaders
-    $tqEntry = $null
-    if ($tqManifest -and $tqManifest.backends) {
-        $tqEntry = $tqManifest.backends | Where-Object { $_.id -eq $tqBackend } | Select-Object -First 1
     }
 
     if ($tqEntry -and $tqEntry.tag -and $tqEntry.asset) {
@@ -650,7 +749,7 @@ if ($SkipBackendDownload -and $tqIsTurboquant) {
             Write-Host '  WARN: failed to download TurboQuant backend after 5 attempts; skipping offline fallback (runtime download still works).' -ForegroundColor Yellow
         }
     } else {
-        Write-Host '  WARN: TurboQuant manifest unreachable or missing windows-x64-cpu; skipping offline fallback (runtime download still works).' -ForegroundColor Yellow
+        Write-Host '  WARN: could not resolve a stable TurboQuant windows-x64-cpu release; skipping offline fallback (runtime download still works).' -ForegroundColor Yellow
     }
 }
 
@@ -661,16 +760,9 @@ if (-not (Test-Path 'src-tauri/resources/bin')) {
     New-Item -ItemType Directory -Path 'src-tauri/resources/bin' -Force | Out-Null
 }
 
-Push-Location src-tauri
-cargo build --features cli --bin jan-cli
-if ($LASTEXITCODE -ne 0) {
-    Pop-Location
-    Write-Host 'cargo build jan-cli failed' -ForegroundColor Red
-    exit 1
-}
-Pop-Location
-
-Copy-Item -Path 'src-tauri/target/debug/jan-cli.exe' -Destination $cliBin -Force
+node scripts/download-core.mjs
+if ($LASTEXITCODE -ne 0) { Write-Host 'download-core failed' -ForegroundColor Red; exit 1 }
+Copy-Item -Path 'src-tauri/resources/bin/atomic-chat-core.exe' -Destination $cliBin -Force
 Write-Host "  CLI built: $cliBin"
 
 # ── Generate icons (tauri icon, skip macOS-only Python padding) ─

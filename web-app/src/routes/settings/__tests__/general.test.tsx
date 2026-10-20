@@ -59,12 +59,16 @@ vi.mock('@/containers/dialogs/ChangeDataFolderLocation', () => ({
   ),
 }))
 
+const mockSetPreloadModelOnStartup = vi.hoisted(() => vi.fn())
+
 vi.mock('@/hooks/useGeneralSetting', () => ({
   useGeneralSetting: () => ({
     spellCheckChatInput: true,
     setSpellCheckChatInput: vi.fn(),
     huggingfaceToken: 'test-token',
     setHuggingfaceToken: vi.fn(),
+    preloadModelOnStartup: false,
+    setPreloadModelOnStartup: mockSetPreloadModelOnStartup,
   }),
 }))
 
@@ -72,6 +76,9 @@ vi.mock('@/hooks/useGeneralSetting', () => ({
 const mockCheckForUpdate = vi.fn()
 const mockOpenerOpen = vi.fn()
 const mockRevealItemInDir = vi.fn()
+const mockExportLogs = vi.fn()
+const mockOpenPath = vi.fn()
+const mockGetCoreVersion = vi.fn()
 
 vi.mock('@/hooks/useAppUpdater', () => ({
   useAppUpdater: () => ({
@@ -284,7 +291,9 @@ describe('General Settings Route', () => {
         factoryReset: vi.fn(),
         getJanDataFolder: vi.fn().mockResolvedValue('/test/data/folder'),
         relocateJanDataFolder: vi.fn(),
-      } as ReturnType<ServiceHub['app']>,
+        exportLogs: mockExportLogs,
+        getCoreVersion: mockGetCoreVersion,
+      } as unknown as ReturnType<ServiceHub['app']>,
       models: {
         stopAllModels: vi.fn(),
       } as ReturnType<ServiceHub['models']>,
@@ -300,12 +309,14 @@ describe('General Settings Route', () => {
       opener: {
         open: mockOpenerOpen,
         revealItemInDir: mockRevealItemInDir,
+        openPath: mockOpenPath,
       } as ReturnType<ServiceHub['opener']>,
     })
     // Reset the mock to return a promise that resolves immediately by default
     mockCheckForUpdate.mockResolvedValue(null)
     mockOpenerOpen.mockResolvedValue(undefined)
     mockRevealItemInDir.mockResolvedValue(undefined)
+    mockGetCoreVersion.mockResolvedValue('0.7.1')
   })
 
   it('should render the general settings page', async () => {
@@ -326,6 +337,38 @@ describe('General Settings Route', () => {
     })
 
     expect(screen.getByText('v1.0.0')).toBeInTheDocument()
+  })
+
+  it('renders the core version right under the app version', async () => {
+    const Component = GeneralRoute.component as React.ComponentType
+    await act(async () => {
+      render(<Component />)
+    })
+
+    const titles = screen
+      .getAllByTestId('card-item')
+      .map((el) => el.getAttribute('data-title'))
+    const appRow = titles.indexOf('settings:general.appVersion')
+    expect(titles[appRow + 1]).toBe('settings:general.coreVersion')
+    expect(screen.getByText('v0.7.1')).toBeInTheDocument()
+  })
+
+  it('leaves the core version out when the app cannot tell it', async () => {
+    mockGetCoreVersion.mockResolvedValue(undefined)
+    const Component = GeneralRoute.component as React.ComponentType
+    await act(async () => {
+      render(<Component />)
+    })
+
+    expect(screen.getByText('v1.0.0')).toBeInTheDocument()
+    expect(
+      screen
+        .getAllByTestId('card-item')
+        .some(
+          (el) =>
+            el.getAttribute('data-title') === 'settings:general.coreVersion'
+        )
+    ).toBe(false)
   })
 
   // TODO: This test is currently commented out due to missing implementation
@@ -361,6 +404,40 @@ describe('General Settings Route', () => {
       fireEvent.click(switches[0])
     })
     expect(switches[0]).toBeInTheDocument()
+  })
+
+  it('renders the model preload toggle off, next to the startup settings', async () => {
+    const Component = GeneralRoute.component as React.ComponentType
+    await act(async () => {
+      render(<Component />)
+    })
+
+    const item = screen
+      .getAllByTestId('card-item')
+      .find(
+        (el) =>
+          el.getAttribute('data-title') ===
+          'settings:general.preloadModelOnStartup'
+      )
+    expect(item).toBeDefined()
+
+    // It belongs to the General card, alongside "Launch at startup" — not to
+    // the "Others" card it used to live in.
+    expect(item?.closest('[data-testid="card"]')).toHaveAttribute(
+      'data-title',
+      'common:general'
+    )
+
+    const toggle = item?.querySelector(
+      '[data-testid="switch"]'
+    ) as HTMLInputElement
+    expect(toggle).toBeDefined()
+    expect(toggle.checked).toBe(false)
+
+    await act(async () => {
+      fireEvent.click(toggle)
+    })
+    expect(mockSetPreloadModelOnStartup).toHaveBeenCalledWith(true)
   })
 
   it('should handle huggingface token change', async () => {
@@ -499,6 +576,39 @@ describe('General Settings Route', () => {
       })
       expect(revealLogsButton).toBeInTheDocument()
     }
+  })
+
+  it('exports the logs from the App Logs row and says where they went', async () => {
+    const { toast } = await import('sonner')
+    mockExportLogs.mockResolvedValue({
+      path: 'C:\\Users\\me\\Desktop\\atomic-chat-logs.log',
+      bytes: 42,
+    })
+    mockOpenPath.mockResolvedValue(undefined)
+    const Component = GeneralRoute.component as React.ComponentType
+    await act(async () => {
+      render(<Component />)
+    })
+
+    const exportButton = screen
+      .getAllByTestId('button')
+      .find((button) => button.textContent?.includes('exportLogs'))!
+    await act(async () => {
+      fireEvent.click(exportButton)
+    })
+
+    expect(mockExportLogs).toHaveBeenCalledTimes(1)
+    expect(toast.success).toHaveBeenCalledWith(
+      'logs:exported',
+      expect.objectContaining({
+        description: 'C:\\Users\\me\\Desktop\\atomic-chat-logs.log',
+      })
+    )
+    const options = vi.mocked(toast.success).mock.calls[0][1] as {
+      action: { onClick: () => void }
+    }
+    options.action.onClick()
+    expect(mockOpenPath).toHaveBeenCalledWith('C:\\Users\\me\\Desktop')
   })
 
   it('should show correct file explorer text for Windows', async () => {

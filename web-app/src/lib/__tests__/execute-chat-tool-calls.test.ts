@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from 'vitest'
 
 import {
   executeChatToolCalls,
+  hasUnresolvedToolCallParts,
   shouldSendToolFollowUp,
   type ChatToolCall,
   type ChatToolOutput,
@@ -116,6 +117,100 @@ describe('executeChatToolCalls', () => {
   })
 })
 
+describe('executeChatToolCalls with commands', () => {
+  const runCall: ChatToolCall = {
+    toolCallId: 'call-run',
+    toolName: 'run_command',
+    input: { command: 'ls' },
+  }
+
+  it('runs an approved command itself, even when an MCP tool has the same name', async () => {
+    const controller = new AbortController()
+    const callMcpTool = vi.fn()
+    const callExecTool = vi.fn().mockResolvedValue({
+      output: { kind: 'chat-exec', text: 'Exit code: 0' },
+    })
+    const outputs: ChatToolOutput[] = []
+
+    await executeChatToolCalls({
+      ...baseOptions(),
+      mcpToolNames: new Set(['run_command']),
+      execToolNames: new Set(['run_command', 'run_script']),
+      toolCalls: [runCall],
+      signal: controller.signal,
+      callMcpTool,
+      callExecTool,
+      addToolOutput: (output) => outputs.push(output),
+    })
+
+    expect(callMcpTool).not.toHaveBeenCalled()
+    expect(callExecTool).toHaveBeenCalledWith({
+      toolCallId: 'call-run',
+      toolName: 'run_command',
+      input: { command: 'ls' },
+      threadId: 'thread-1',
+      signal: controller.signal,
+    })
+    expect(outputs).toEqual([
+      {
+        tool: 'run_command',
+        toolCallId: 'call-run',
+        output: { kind: 'chat-exec', text: 'Exit code: 0' },
+      },
+    ])
+  })
+
+  it('reports a command the backend refused as a tool error', async () => {
+    const outputs: ChatToolOutput[] = []
+
+    await executeChatToolCalls({
+      ...baseOptions(),
+      execToolNames: new Set(['run_command']),
+      toolCalls: [runCall],
+      signal: new AbortController().signal,
+      callMcpTool: vi.fn(),
+      callExecTool: vi.fn().mockResolvedValue({ error: 'Nothing to run' }),
+      addToolOutput: (output) => outputs.push(output),
+    })
+
+    expect(outputs).toEqual([
+      {
+        state: 'output-error',
+        tool: 'run_command',
+        toolCallId: 'call-run',
+        errorText: 'Error: Nothing to run',
+      },
+    ])
+  })
+
+  it('never runs a denied command', async () => {
+    const options = baseOptions()
+    options.approve.mockResolvedValue(false)
+    const callExecTool = vi.fn()
+    const outputs: ChatToolOutput[] = []
+
+    await executeChatToolCalls({
+      ...options,
+      execToolNames: new Set(['run_command']),
+      toolCalls: [runCall],
+      signal: new AbortController().signal,
+      callMcpTool: vi.fn(),
+      callExecTool,
+      addToolOutput: (output) => outputs.push(output),
+    })
+
+    expect(callExecTool).not.toHaveBeenCalled()
+    expect(outputs).toEqual([
+      {
+        state: 'output-error',
+        tool: 'run_command',
+        toolCallId: 'call-run',
+        errorText: 'Tool execution denied by user',
+      },
+    ])
+  })
+})
+
 describe('shouldSendToolFollowUp', () => {
   const completedToolMessage = {
     id: 'assistant-1',
@@ -145,5 +240,69 @@ describe('shouldSendToolFollowUp', () => {
       false
     )
     expect(shouldSendToolFollowUp([completedToolMessage], null)).toBe(false)
+  })
+})
+
+// The thread page's terminal check (PR #335, ATO-538): the finished message is
+// the judge, not a tool queue that can keep entries from an earlier step.
+describe('hasUnresolvedToolCallParts', () => {
+  const messageWithParts = (parts: UIMessage['parts']) =>
+    ({ id: 'assistant-1', role: 'assistant', parts }) as UIMessage
+
+  it('flags a tool call that is still waiting on its output', () => {
+    expect(
+      hasUnresolvedToolCallParts(
+        messageWithParts([
+          { type: 'text', text: 'Working on it' },
+          {
+            type: 'tool-search',
+            toolCallId: 'call-1',
+            state: 'input-available',
+            input: { query: 'alpha' },
+          },
+        ])
+      )
+    ).toBe(true)
+  })
+
+  it('counts a failed tool call as resolved — the error output is delivered', () => {
+    expect(
+      hasUnresolvedToolCallParts(
+        messageWithParts([
+          {
+            type: 'tool-search',
+            toolCallId: 'call-1',
+            state: 'output-error',
+            input: { query: 'alpha' },
+            errorText: 'boom',
+          },
+        ])
+      )
+    ).toBe(false)
+  })
+
+  it('treats answered tool calls plus a final text as terminal', () => {
+    expect(
+      hasUnresolvedToolCallParts(
+        messageWithParts([
+          {
+            type: 'tool-search',
+            toolCallId: 'call-1',
+            state: 'output-available',
+            input: { query: 'alpha' },
+            output: { ok: true },
+          },
+          { type: 'text', text: 'All done' },
+        ])
+      )
+    ).toBe(false)
+  })
+
+  it('treats a plain answer with no tool parts as terminal', () => {
+    expect(
+      hasUnresolvedToolCallParts(
+        messageWithParts([{ type: 'text', text: 'EDIT_OK' }])
+      )
+    ).toBe(false)
   })
 })

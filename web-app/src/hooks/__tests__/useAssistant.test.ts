@@ -1,15 +1,18 @@
-import { describe, it, expect, beforeEach, vi } from 'vitest'
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
 import { act, renderHook } from '@testing-library/react'
 import { useAssistant, defaultAssistant } from '../useAssistant'
 import type { AssistantsService } from '@/services/assistants/types'
 import { seedServiceHub } from '@/test/service-hub'
 
 describe('useAssistant', () => {
+  let createAssistant: ReturnType<typeof vi.fn>
+
   beforeEach(() => {
     vi.clearAllMocks()
+    createAssistant = vi.fn().mockResolvedValue(undefined)
     seedServiceHub({
       assistants: {
-        createAssistant: vi.fn().mockResolvedValue(undefined),
+        createAssistant,
         deleteAssistant: vi.fn().mockResolvedValue(undefined),
       } as unknown as AssistantsService,
     })
@@ -18,6 +21,7 @@ describe('useAssistant', () => {
       useAssistant.setState({
         assistants: [defaultAssistant],
         currentAssistant: defaultAssistant,
+        pendingAssistant: undefined,
       })
     })
   })
@@ -154,7 +158,9 @@ describe('useAssistant', () => {
     expect(result.current.currentAssistant.avatar).toBe(
       '/images/transparent-logo.png'
     )
-    expect(result.current.currentAssistant.instructions).toBe('')
+    expect(result.current.currentAssistant.instructions).toBe(
+      'You are Atomic Chat, a helpful AI assistant.\n\nCurrent date: {{current_date}}'
+    )
     expect(typeof result.current.currentAssistant.created_at).toBe('number')
     expect(typeof result.current.currentAssistant.parameters).toBe('object')
   })
@@ -184,5 +190,148 @@ describe('useAssistant', () => {
     expect(result.current.currentAssistant.name).toBe(
       'Updated Atomic Chat Name'
     )
+  })
+
+  describe('updateAssistantParam', () => {
+    const otherAssistant: Assistant = {
+      id: 'assistant-2',
+      name: 'Assistant 2',
+      instructions: 'Help the user',
+      created_at: 1,
+      parameters: { temperature: 0.2 },
+    }
+
+    beforeEach(() => {
+      vi.useFakeTimers()
+      act(() => {
+        useAssistant.setState({
+          assistants: [defaultAssistant, otherAssistant],
+          currentAssistant: defaultAssistant,
+        })
+      })
+    })
+
+    afterEach(() => {
+      vi.useRealTimers()
+    })
+
+    it('updates only the targeted assistant and marks it overridden', () => {
+      const { result } = renderHook(() => useAssistant())
+
+      act(() => {
+        result.current.updateAssistantParam('assistant-2', 'temperature', 0.9)
+      })
+
+      const [first, second] = result.current.assistants
+      expect(second.parameters.temperature).toBe(0.9)
+      expect(second.sampling_overridden).toBe(true)
+      expect(first.parameters).toEqual(defaultAssistant.parameters)
+      expect(first.sampling_overridden).toBeUndefined()
+    })
+
+    it('refreshes the pending assistant copy so it is not stale', () => {
+      const { result } = renderHook(() => useAssistant())
+
+      act(() => {
+        result.current.setPendingAssistant(otherAssistant)
+        result.current.updateAssistantParam('assistant-2', 'top_k', 40)
+      })
+
+      expect(result.current.pendingAssistant?.parameters.top_k).toBe(40)
+    })
+
+    it('persists once after the debounce, with the latest value', () => {
+      const { result } = renderHook(() => useAssistant())
+
+      act(() => {
+        result.current.updateAssistantParam('assistant-2', 'top_p', 0.5)
+        result.current.updateAssistantParam('assistant-2', 'top_p', 0.6)
+        result.current.updateAssistantParam('assistant-2', 'top_p', 0.7)
+      })
+      expect(createAssistant).not.toHaveBeenCalled()
+
+      act(() => {
+        vi.runAllTimers()
+      })
+
+      expect(createAssistant).toHaveBeenCalledTimes(1)
+      expect(createAssistant.mock.calls[0][0]).toMatchObject({
+        id: 'assistant-2',
+        parameters: { temperature: 0.2, top_p: 0.7 },
+        sampling_overridden: true,
+      })
+    })
+
+    it('ignores an unknown assistant id', () => {
+      const { result } = renderHook(() => useAssistant())
+
+      act(() => {
+        result.current.updateAssistantParam('missing', 'temperature', 0.9)
+        vi.runAllTimers()
+      })
+
+      expect(createAssistant).not.toHaveBeenCalled()
+      expect(result.current.assistants).toHaveLength(2)
+    })
+  })
+
+  describe('updateAssistantInstructions', () => {
+    const otherAssistant: Assistant = {
+      id: 'assistant-2',
+      name: 'Assistant 2',
+      instructions: 'Help the user',
+      created_at: 1,
+      parameters: { temperature: 0.2 },
+    }
+
+    beforeEach(() => {
+      vi.useFakeTimers()
+      act(() => {
+        useAssistant.setState({
+          assistants: [defaultAssistant, otherAssistant],
+          currentAssistant: defaultAssistant,
+        })
+      })
+    })
+
+    afterEach(() => {
+      vi.useRealTimers()
+    })
+
+    it('rewrites only the targeted system prompt, leaving sampling alone', () => {
+      const { result } = renderHook(() => useAssistant())
+
+      act(() => {
+        result.current.setPendingAssistant(otherAssistant)
+        result.current.updateAssistantInstructions('assistant-2', 'Be terse')
+      })
+
+      const [first, second] = result.current.assistants
+      expect(second.instructions).toBe('Be terse')
+      expect(second.sampling_overridden).toBeUndefined()
+      expect(first.instructions).toBe(defaultAssistant.instructions)
+      expect(result.current.pendingAssistant?.instructions).toBe('Be terse')
+    })
+
+    it('persists once after the debounce, with the latest text', () => {
+      const { result } = renderHook(() => useAssistant())
+
+      act(() => {
+        result.current.updateAssistantInstructions('assistant-2', 'B')
+        result.current.updateAssistantInstructions('assistant-2', 'Be')
+        result.current.updateAssistantInstructions('assistant-2', 'Be terse')
+      })
+      expect(createAssistant).not.toHaveBeenCalled()
+
+      act(() => {
+        vi.runAllTimers()
+      })
+
+      expect(createAssistant).toHaveBeenCalledTimes(1)
+      expect(createAssistant.mock.calls[0][0]).toMatchObject({
+        id: 'assistant-2',
+        instructions: 'Be terse',
+      })
+    })
   })
 })

@@ -87,7 +87,7 @@ Bound to `127.0.0.1` by default; set `host: 0.0.0.0` to expose it on your LAN. W
 
 **Tools & integrations**
 
-- One-click agent launch — launch coding agents like Claude Code, Codex CLI, Cline, OpenCode, Droid, Goose, OpenHands, Copilot CLI, Kilo Code and Zed in one click from the Integrations tab
+- One-click agent launch — launch agents like Atomic Agent, Claude Code, Codex CLI, Cline, OpenCode, Droid, Goose, OpenHands, Copilot CLI, Kilo Code, Zed and ZCode in one click from the Integrations tab
 - Artifacts — live preview panel for HTML/CSS/JS code with copy, download and print
 - Connect multiple [MCP](https://modelcontextprotocol.io/) servers — bring your own tools, file access, web search
 - Custom assistants with per-assistant system prompts
@@ -121,6 +121,8 @@ Speculative-decoding features available across backends:
 - **Flash Attention** — Settings → `on` / `off` / `auto`.
 
 Tools talking to `http://localhost:1337/v1` don't need to know which backend is running underneath — switch engines without reconfiguring clients.
+
+The engines are driven by **[atomic-chat-core](https://github.com/AtomicBot-ai/atomic-chat-core)** — the core of Atomic Chat, in its own repository. It doesn't do inference itself; it manages the engines: downloads and launches backends, manages models, routes requests between local engines and cloud providers, and serves the OpenAI-compatible API on `:1337`. The desktop app ships a pinned core release; the core also runs on its own as a CLI (`atomic-chat-core serve …`) or as a library.
 
 ---
 
@@ -219,7 +221,12 @@ If something isn't working:
 
 ### 👥 Contributors
 
-Atomic Chat is built by a small core team and **140+ contributors** — including everyone who shaped the project from its earliest days. Pull requests welcome — see [CONTRIBUTING.md](CONTRIBUTING.md) for how to get started.
+Atomic Chat is built by a small core team and **140+ contributors** — including everyone who shaped the project from its earliest days. Pull requests are welcome in both repositories:
+
+- **[Atomic-Chat](https://github.com/AtomicBot-ai/Atomic-Chat)** (this repo) — the desktop and mobile app: UI, chats, assistants, projects, MCP, integrations, settings. See [CONTRIBUTING.md](CONTRIBUTING.md) to get started.
+- **[atomic-chat-core](https://github.com/AtomicBot-ai/atomic-chat-core)** — the core that manages the engines (llama.cpp, MLX, Foundation Models): backend and model management, cloud providers, the router and the OpenAI-compatible server. See its [AGENTS.md](https://github.com/AtomicBot-ai/atomic-chat-core/blob/main/AGENTS.md) to get started.
+
+Not sure where a change belongs? Open an issue in either repo and we'll point you the right way.
 
 <a href="https://github.com/Vect0rM"><img src="https://images.weserv.nl/?url=https://github.com/Vect0rM.png&w=110&h=110&fit=cover&mask=circle" width="48" height="48" alt="Vect0rM" /></a>
 <a href="https://github.com/dtorey-d"><img src="https://images.weserv.nl/?url=https://github.com/dtorey-d.png&w=110&h=110&fit=cover&mask=circle" width="48" height="48" alt="dtorey-d" /></a>

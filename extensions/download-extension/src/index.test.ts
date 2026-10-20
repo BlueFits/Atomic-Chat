@@ -1,6 +1,12 @@
-import { describe, expect, it } from 'vitest'
+import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { invoke } from '@tauri-apps/api/core'
 
-import { buildAuthHeaders, isHuggingFaceUrl } from './index'
+vi.mock('@tauri-apps/api/core', () => ({ invoke: vi.fn() }))
+vi.mock('@tauri-apps/api/event', () => ({ listen: vi.fn(async () => () => {}) }))
+
+import DownloadManager, { buildAuthHeaders, isHuggingFaceUrl } from './index'
+
+beforeEach(() => vi.clearAllMocks())
 
 describe('isHuggingFaceUrl', () => {
   it.each([
@@ -66,5 +72,79 @@ describe('buildAuthHeaders', () => {
     expect(
       buildAuthHeaders([{ url: HF_URL }, { url: 'not a url' }], 'hf_secret')
     ).toEqual({})
+  })
+})
+
+describe('cancelDownload', () => {
+  const manager = Object.create(DownloadManager.prototype) as DownloadManager
+
+  it('cancels a backend install through the core control route', async () => {
+    vi.mocked(invoke).mockResolvedValue({ cancelled: true })
+    await expect(manager.cancelDownload('llamacpp-backend-b1/macos-arm64')).resolves.toBeUndefined()
+    expect(invoke).toHaveBeenCalledWith('atomic_core_call', {
+      method: 'POST', path: '/downloads/llamacpp-backend-b1/macos-arm64/cancel', body: null,
+    })
+    expect(invoke).not.toHaveBeenCalledWith('cancel_download_task', expect.anything())
+  })
+
+  it('cancels a TurboQuant backend install through the core too', async () => {
+    vi.mocked(invoke).mockResolvedValue({ cancelled: true })
+    await expect(manager.cancelDownload('llamacpp-backend-b10018-1_3_0/linux-x64-rocm')).resolves.toBeUndefined()
+    expect(invoke).toHaveBeenCalledWith('atomic_core_call', {
+      method: 'POST', path: '/downloads/llamacpp-backend-b10018-1_3_0/linux-x64-rocm/cancel', body: null,
+    })
+  })
+
+  it('cancels a task this extension started through Rust, whatever its id', async () => {
+    manager['ownTasks'] = new Set(['llamacpp-backend-b1/macos-arm64'])
+    vi.mocked(invoke).mockResolvedValue(undefined)
+    await expect(manager.cancelDownload('llamacpp-backend-b1/macos-arm64')).resolves.toBeUndefined()
+    expect(invoke).toHaveBeenCalledWith('cancel_download_task', { taskId: 'llamacpp-backend-b1/macos-arm64' })
+    expect(invoke).not.toHaveBeenCalledWith('atomic_core_call', expect.anything())
+    manager['ownTasks'].clear()
+  })
+
+  it('cancels a model download through Rust', async () => {
+    vi.mocked(invoke).mockResolvedValue(undefined)
+    await expect(manager.cancelDownload('qwen3-4b')).resolves.toBeUndefined()
+    expect(invoke).toHaveBeenCalledWith('cancel_download_task', { taskId: 'qwen3-4b' })
+    expect(invoke).not.toHaveBeenCalledWith('atomic_core_call', expect.anything())
+  })
+})
+
+describe('DownloadManager.downloadFiles', () => {
+  it('hands each item to the Rust downloader with its resume_key', async () => {
+    const manager = Object.create(DownloadManager.prototype) as DownloadManager
+    vi.mocked(invoke).mockResolvedValue(undefined)
+    await manager.downloadFiles(
+      [
+        {
+          url: 'https://acct.blob.core.windows.net/c/v5/model.onnx?sig=fresh',
+          save_path: '/data/foundry-local/models/v/model.onnx',
+          size: 6,
+          model_id: 'foundry-local-v',
+          resume_key: 'foundry-local/v/model.onnx',
+        },
+      ],
+      'foundry-local-v',
+      undefined,
+      true
+    )
+    // What the Rust command receives: the item exactly as given, key included.
+    const sent = vi.mocked(invoke).mock.calls.find(([command]) => command === 'download_files')?.[1]
+    expect(sent).toEqual({
+      items: [
+        {
+          url: 'https://acct.blob.core.windows.net/c/v5/model.onnx?sig=fresh',
+          save_path: '/data/foundry-local/models/v/model.onnx',
+          size: 6,
+          model_id: 'foundry-local-v',
+          resume_key: 'foundry-local/v/model.onnx',
+        },
+      ],
+      taskId: 'foundry-local-v',
+      headers: {},
+      resume: true,
+    })
   })
 })

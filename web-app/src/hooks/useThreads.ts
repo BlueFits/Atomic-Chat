@@ -6,8 +6,10 @@ import { TEMPORARY_CHAT_ID } from '@/constants/chat'
 import { useAgentMode } from '@/hooks/useAgentMode'
 import { ExtensionManager } from '@/lib/extension'
 import { ExtensionTypeEnum, VectorDBExtension } from '@janhq/core'
-import posthog from 'posthog-js'
 import { useThreadReadStatus } from '@/stores/thread-read-store'
+import { LOCAL_LLAMACPP_PROVIDER } from '@/lib/utils'
+import { normalizeModelId } from '@/lib/telemetry'
+import { queuedCapture } from '@/lib/telemetry-queue'
 
 type ThreadState = {
   threads: Record<string, Thread>
@@ -46,6 +48,30 @@ type ThreadState = {
 // outside the store to avoid forcing re-renders when a promise lands.
 const pendingThreadPersistence = new Map<string, Promise<void>>()
 
+/**
+ * Persist a thread without letting the write's failure escape.
+ *
+ * Every caller below runs inside a zustand reducer and cannot await this, so a
+ * rejection used to surface as an unhandled rejection and get reported as a
+ * crash. The common cause is benign: the thread's directory is already gone
+ * because it was deleted while an update was in flight, which the backend
+ * reports as "Thread directory does not exist". Anything else is worth a
+ * console warning, but never worth failing the local state update that already
+ * happened.
+ */
+const THREAD_GONE = 'Thread directory does not exist'
+
+const persistThread = (thread: Thread): void => {
+  void getServiceHub()
+    .threads()
+    .updateThread(thread)
+    ?.catch?.((error: unknown) => {
+      const message = error instanceof Error ? error.message : String(error)
+      if (message.includes(THREAD_GONE)) return
+      console.warn('Failed to persist thread', thread.id, error)
+    })
+}
+
 const buildSearchIndex = (threads: Record<string, Thread>): Fzf<Thread[]> =>
   new Fzf<Thread[]>(
     Object.values(threads).filter((t) => t.id !== TEMPORARY_CHAT_ID && t.title),
@@ -59,7 +85,9 @@ const cleanupVectorDB = async (threadId: string) => {
       ExtensionTypeEnum.VectorDB
     )
     if (vec?.deleteCollection) {
-      await vec.deleteCollection(`attachments_${threadId}`)
+      // The extension prefixes `attachments_` itself; passing a pre-prefixed
+      // name used to double it up and the real collection never got deleted.
+      await vec.deleteCollection(threadId)
     }
   } catch (e) {
     console.warn(
@@ -79,9 +107,13 @@ export const useThreads = create<ThreadState>()((set, get) => ({
           ...thread,
           model: thread.model
             ? {
+                // A thread with no provider recorded binds to the default
+                // local engine (upstream), not the TurboQuant fork. The
+                // `llama.cpp` → `llamacpp` rewrite stays: it only fires for
+                // pre-fork cortex threads, which belong to existing users.
                 provider:
                   thread.model?.provider?.replace('llama.cpp', 'llamacpp') ??
-                  'llamacpp',
+                  LOCAL_LLAMACPP_PROVIDER,
                 // Cortex migration: take first two parts of the ID (the last is file name which is not needed)
                 id:
                   thread.model?.provider === 'llama.cpp' ||
@@ -199,6 +231,7 @@ export const useThreads = create<ThreadState>()((set, get) => ({
 
       // Delete threads and clean up their vector DB collections
       threadsToDeleteIds.forEach((threadId) => {
+        useAgentMode.getState().removeThread(threadId)
         useThreadReadStatus.getState().removeThread(threadId)
         cleanupVectorDB(threadId)
         getServiceHub().threads().deleteThread(threadId)
@@ -252,6 +285,7 @@ export const useThreads = create<ThreadState>()((set, get) => ({
 
       // Delete threads and clean up their vector DB collections
       toDeleteSet.forEach((threadId) => {
+        useAgentMode.getState().removeThread(threadId)
         useThreadReadStatus.getState().removeThread(threadId)
         cleanupVectorDB(threadId)
         getServiceHub().threads().deleteThread(threadId)
@@ -345,9 +379,9 @@ export const useThreads = create<ThreadState>()((set, get) => ({
       .threads()
       .createThread(newThread)
       .then((createdThread) => {
-        posthog.capture('thread_created', {
+        queuedCapture('thread_created', {
           thread_id: createdThread.id,
-          model_id: model.id,
+          model_id: normalizeModelId(model.id),
           provider: model.provider,
           has_assistant: Boolean(assistant),
           has_project: Boolean(projectMetadata),
@@ -433,10 +467,7 @@ export const useThreads = create<ThreadState>()((set, get) => ({
     set((state) => {
       if (!state.currentThreadId) return { ...state }
       const currentThread = state.getCurrentThread()
-      if (currentThread)
-        getServiceHub()
-          .threads()
-          .updateThread({ ...currentThread, model })
+      if (currentThread) persistThread({ ...currentThread, model })
       return {
         threads: {
           ...state.threads,
@@ -457,7 +488,7 @@ export const useThreads = create<ThreadState>()((set, get) => ({
         title: newTitle,
         updated: Date.now() / 1000,
       }
-      getServiceHub().threads().updateThread(updatedThread) // External call, order is fine
+      persistThread(updatedThread) // External call, order is fine
       const newThreads = { ...state.threads, [threadId]: updatedThread }
       return {
         threads: newThreads,
@@ -485,7 +516,7 @@ export const useThreads = create<ThreadState>()((set, get) => ({
       updatedThreads[threadId] = updatedThread
 
       // Update the backend for the main thread
-      getServiceHub().threads().updateThread(updatedThread)
+      persistThread(updatedThread)
 
       return {
         threads: updatedThreads,
@@ -501,6 +532,11 @@ export const useThreads = create<ThreadState>()((set, get) => ({
       const updatedThread = {
         ...thread,
         ...updates,
+        // Deep-merge metadata: a partial update like { hasDocuments: true }
+        // must not clobber sibling keys (project membership among them).
+        ...(updates.metadata !== undefined
+          ? { metadata: { ...thread.metadata, ...updates.metadata } }
+          : {}),
         updated: Date.now() / 1000,
       }
 
@@ -510,7 +546,7 @@ export const useThreads = create<ThreadState>()((set, get) => ({
       // threads this branch is skipped and the write happens immediately.
       const pendingPersist = pendingThreadPersistence.get(threadId)
       const writeBackend = () => {
-        getServiceHub().threads().updateThread(updatedThread)
+        persistThread(updatedThread)
       }
       if (pendingPersist) {
         pendingPersist.then(writeBackend, writeBackend)

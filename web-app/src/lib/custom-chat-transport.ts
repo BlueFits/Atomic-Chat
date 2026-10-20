@@ -1,3 +1,5 @@
+import { useMCPServers } from '@/hooks/useMCPServers'
+import { isWebSearchServer } from '@/lib/web-search'
 import { type UIMessage } from '@ai-sdk/react'
 import {
   convertToModelMessages,
@@ -6,6 +8,7 @@ import {
   type ChatRequestOptions,
   type ChatTransport,
   type LanguageModel,
+  type ModelMessage,
   type UIMessageChunk,
   type Tool,
   type LanguageModelUsage,
@@ -14,9 +17,12 @@ import {
 import { repairToolCallArguments } from './repairToolCall'
 import { prepareToolResultImagesForModel } from './toolResultImages'
 import {
+  ATTACHED_DOCUMENTS_HINT,
   buildToolsRecord,
   splitAnthropicSerialToolUse,
+  withGrammarSafeToolSchemas,
 } from './custom-chat-transport-helpers'
+import { resolveSupportsVision } from './session-vision'
 import type { MCPTool } from '@/types/completion'
 
 /// Hugging Face special-token convention (`<|im_end|>`, `<|eot_id|>`,
@@ -50,10 +56,20 @@ const stripSpecialTokensTransform = () =>
   })
 import { useServiceStore } from '@/hooks/useServiceHub'
 import { useToolAvailable } from '@/hooks/useToolAvailable'
+import { SYSTEM_SERVER_KEYS } from '@/constants/mcp-connectors'
 import { ModelFactory } from './model-factory'
 import { useModelProvider } from '@/hooks/useModelProvider'
-import { useSamplingSettings } from '@/hooks/useSamplingSettings'
+import { getSamplingParamsForThread } from '@/lib/samplingParams'
 import { withRecommendedSampling } from '@/lib/predefinedParams'
+import {
+  buildReasoningRequestFields,
+  canDisableReasoning,
+  buildCloudReasoningRequestFields,
+  isCloudReasoningProvider,
+  reasoningLevelsForModel,
+  buildRemoteReasoningRequestFields,
+  usesTemplateReasoningKwargs,
+} from '@/lib/reasoning-effort'
 import { useGeneralSetting } from '@/hooks/useGeneralSetting'
 import { useThreads } from '@/hooks/useThreads'
 import { useAttachments } from '@/hooks/useAttachments'
@@ -61,13 +77,51 @@ import { useAppState } from '@/hooks/useAppState'
 import { ExtensionManager } from '@/lib/extension'
 import { ExtensionTypeEnum, VectorDBExtension } from '@janhq/core'
 import { ttftMark } from '@/lib/ttft-timing'
+import { settleMcpActivationsBeforeSend } from '@/lib/mcp-activation'
+import {
+  chatExecOutputsForModel,
+  chatExecTools,
+  isChatExecOffered,
+  isChatExecTool,
+} from '@/lib/chat-exec-tools'
+import { ensureChatExecStatus } from '@/hooks/useChatExecStatus'
+import type { ChatExecStatus } from '@/services/chat-exec/types'
+import {
+  growModelContext,
+  readAutoIncreaseCtx,
+  readModelCtxLen,
+} from '@/lib/context-size'
+import {
+  DEFAULT_OUTPUT_RESERVE_TOKENS,
+  PREFLIGHT_CTX_THRESHOLD,
+  estimatePromptTokensHeuristic,
+  estimateToolsTokens,
+  toOpenAiMessages,
+  toOpenAiTools,
+} from '@/lib/prompt-size'
+import { OUT_OF_CONTEXT_SIZE } from '@/utils/error'
+import { canGrowContext } from '@/lib/managed-engine/chat'
+import { isManagedProvider } from '@/lib/managed-engines'
+import { summarizeToolCost } from '@/lib/tool-cost'
 import { extractModelErrorMessage } from '@/lib/modelErrorMessage'
+import {
+  collectSkillNamesFromMessages,
+  composeSystemMessage,
+  loadChatSkillDetails,
+  renderChatSkillsBlock,
+} from '@/lib/chat-skill-injection'
+import { agentSkillRevision } from '@/lib/agent-skill-revision'
+import type { AgentSkillDetail } from '@/services/agent/skills'
 import type { ServiceHub } from '@/services'
 import { ensureRemoteProviderReady } from '@/utils/ensureRemoteProviderReady'
-import { isLocalProvider as isLocalProviderName } from '@/utils/registerRemoteProvider'
+import {
+  isLocalProvider as isLocalProviderName,
+  isSubscriptionProvider,
+} from '@/utils/registerRemoteProvider'
 
-/// Local inference backends (mlx, llamacpp, llamacpp-upstream,
-/// foundation-models) get special handling at the `streamText` boundary:
+/// Local inference backends (mlx, llamacpp, llamacpp-upstream, atomic-prism,
+/// foundation-models, and every managed engine — `isManagedProvider`) get special handling at the
+/// `streamText` boundary:
 ///   * when tools are also active, the assistant system prompt is not passed
 ///     as a `system` message — gemma-4 and similar local models reliably
 ///     auto-emit a chain-of-thought block whenever the rendered prompt
@@ -84,7 +138,23 @@ const LOCAL_INFERENCE_PROVIDERS = new Set<string>([
   'mlx',
   'llamacpp',
   'llamacpp-upstream',
+  'atomic-prism',
   'foundation-models',
+  'foundry-local',
+])
+
+const isLocalInferenceProvider = (provider: string): boolean =>
+  LOCAL_INFERENCE_PROVIDERS.has(provider) || isManagedProvider(provider)
+
+/// Engines that constrain sampling with a GBNF grammar compiled from the tool
+/// schemas — the ones that need `withGrammarSafeToolSchemas`. `llamacpp-server`
+/// is a self-hosted llama.cpp behind an OpenAI-compatible URL, so it builds the
+/// same grammar as the bundled engines and hits the same limits.
+const GRAMMAR_CONSTRAINED_PROVIDERS = new Set<string>([
+  'llamacpp',
+  'llamacpp-upstream',
+  'atomic-prism',
+  'llamacpp-server',
 ])
 
 /// Map an audio MIME type to the `format` string expected by the OpenAI-style
@@ -131,41 +201,41 @@ export function extractAudioInputParts(
   return []
 }
 
-/// Return a copy of `messages` with audio `file` parts removed. The audio is
-/// delivered out-of-band (see extractAudioInputParts), and leaving the parts in
-/// place would make the OpenAI-compatible converter throw. Non-audio parts and
-/// untouched messages are preserved by reference.
-function stripAudioFileParts(messages: UIMessage[]): UIMessage[] {
+/// Whether a part may travel to the model as-is.
+///
+/// `image/*` is the only file part any converter we route to accepts:
+/// `@ai-sdk/openai-compatible` (and `@ai-sdk/xai`) throw
+/// `UnsupportedFunctionalityError` on everything else, and Anthropic — which
+/// does understand `application/pdf` — would receive our `url`, a local
+/// filesystem path the SDK cannot resolve, as the document body. Every other
+/// attachment kind reaches the model through its own channel: audio as
+/// `input_audio` at the MLX fetch layer (see `extractAudioInputParts`),
+/// documents as text folded in by `mapUserInlineAttachments` or retrieved by
+/// the RAG tools. So a non-image file part is never information — only a way
+/// to break the request.
+function isModelSupportedPart(part: unknown): boolean {
+  const candidate = part as { type?: unknown; mediaType?: unknown }
+  if (candidate.type !== 'file') return true
+  return (
+    typeof candidate.mediaType === 'string' &&
+    candidate.mediaType.startsWith('image/')
+  )
+}
+
+/// Return a copy of `messages` with every non-image `file` part removed.
+/// Untouched messages are preserved by reference.
+export function stripUnsupportedFileParts(messages: UIMessage[]): UIMessage[] {
   return messages.map((message) => {
     const parts = Array.isArray(message.parts) ? message.parts : []
-    const hasAudio = parts.some(
-      (p) =>
-        (p as Record<string, unknown>).type === 'file' &&
-        typeof (p as Record<string, unknown>).mediaType === 'string' &&
-        ((p as Record<string, unknown>).mediaType as string).startsWith(
-          'audio/'
-        )
-    )
-    if (!hasAudio) return message
+    if (parts.every(isModelSupportedPart)) return message
     return {
       ...message,
-      parts: parts.filter(
-        (p) =>
-          !(
-            (p as Record<string, unknown>).type === 'file' &&
-            typeof (p as Record<string, unknown>).mediaType === 'string' &&
-            ((p as Record<string, unknown>).mediaType as string).startsWith(
-              'audio/'
-            )
-          )
-      ),
+      parts: parts.filter(isModelSupportedPart),
     } as UIMessage
   })
 }
 
 type ImageInferenceMetadata = {
-  generationMode?: string
-  artifactKind?: string
   includeInInference?: boolean
 }
 
@@ -173,8 +243,9 @@ type ImageInferenceMetadata = {
  * Project display history into model-facing history.
  *
  * Images remain in persisted/UI messages, but a text-only model must never
- * receive image file parts. Generated assistant artifacts are also excluded
- * from vision-model context unless the user explicitly opts them in.
+ * receive image file parts. Assistant image artifacts (Create Image, and
+ * legacy assistant image parts without metadata) stay out of vision context
+ * unless the user explicitly opts them in via `includeInInference`.
  */
 export function projectImagesForInference(
   messages: UIMessage[],
@@ -182,12 +253,9 @@ export function projectImagesForInference(
 ): UIMessage[] {
   return messages.flatMap((message) => {
     const metadata = (message.metadata ?? {}) as ImageInferenceMetadata
-    const generatedAssistantImage =
-      message.role === 'assistant' &&
-      (metadata.generationMode === 'image' ||
-        metadata.artifactKind === 'generated_image')
-    const includeGeneratedImage =
-      generatedAssistantImage && metadata.includeInInference === true
+    const assistantImageMessage = message.role === 'assistant'
+    const includeAssistantImage =
+      assistantImageMessage && metadata.includeInInference === true
 
     const parts = message.parts.filter((part) => {
       if (
@@ -198,7 +266,7 @@ export function projectImagesForInference(
         return true
       }
       if (!supportsVision) return false
-      if (generatedAssistantImage) return includeGeneratedImage
+      if (assistantImageMessage) return includeAssistantImage
       return true
     })
 
@@ -237,6 +305,28 @@ export function foldSystemIntoFirstUserMessage<
   const copy = [...messages]
   copy[idx] = { ...target, content: newContent } as T
   return copy
+}
+
+/**
+ * Drop the `tool-*` parts of assistant messages produced by the agent engine
+ * (`metadata.agent_run`). Their tool names exist only in the Rust loop and
+ * their states include values (`output-denied`) the AI-SDK converters do not
+ * accept, so on a mixed-engine thread a fallback turn would otherwise send
+ * unknown `tool_use` blocks to the provider. The text and reasoning survive —
+ * that is the part of the exchange the next turn needs.
+ */
+export function stripAgentRunToolParts<T extends UIMessage>(
+  messages: T[]
+): T[] {
+  return messages.map((message) => {
+    const metadata = message.metadata as Record<string, unknown> | undefined
+    if (!metadata?.agent_run) return message
+    const parts = message.parts?.filter(
+      (part) => !part.type.startsWith('tool-') && part.type !== 'dynamic-tool'
+    )
+    if (!parts || parts.length === (message.parts?.length ?? 0)) return message
+    return { ...message, parts }
+  })
 }
 
 export function shouldSuppressToolsForUpstreamDflash(
@@ -290,7 +380,7 @@ export function withUpstreamDflashReasoningOverride(
       ...existingTemplateKwargs,
       enable_thinking: false,
     },
-    reasoning_budget: 0,
+    reasoning_budget_tokens: 0,
   }
 }
 
@@ -302,6 +392,35 @@ export type StreamingTokenSpeedCallback = (
   tokenCount: number,
   elapsedMs: number
 ) => void
+
+export function resolveTokenSpeed({
+  providerId,
+  providerReportedSpeed,
+  outputTokens,
+  durationSec,
+}: {
+  providerId: string
+  providerReportedSpeed: number
+  outputTokens: number
+  durationSec: number
+}): number {
+  if (providerReportedSpeed > 0) return providerReportedSpeed
+
+  // The ChatGPT subscription bridge receives Responses API `output_tokens`,
+  // which may include hidden reasoning, but it can time only visible text or
+  // reasoning-summary deltas. Dividing those unlike values produced impossible
+  // rates for short or reasoning-heavy turns. The subscription endpoint does
+  // not expose decode timing, so leave TPS unavailable instead of fabricating
+  // a wall-clock estimate.
+  if (isSubscriptionProvider(providerId)) return 0
+
+  if (durationSec > 0 && outputTokens > 0) {
+    return outputTokens / durationSec
+  }
+
+  return 0
+}
+
 export type OnFinishCallback = (params: {
   message: UIMessage
   isAbort?: boolean
@@ -366,6 +485,14 @@ export class CustomChatTransport implements ChatTransport<UIMessage> {
   private continueFromContent: string | null = null
   private toolsCacheKey = ''
   private toolsCacheValid = false
+  // Invoked-skill bodies, memoized for the transport's (per-thread) lifetime;
+  // null marks a skill that could not be fetched (deleted, or a failed IPC).
+  // Usability is NOT cached — see `loadChatSkillDetails`.
+  private skillDetailCache = new Map<string, AgentSkillDetail | null>()
+  // Skill revision the cache above was filled at. The transport outlives every
+  // edit the user makes on the Skills page, so without this an edited SKILL.md
+  // only reached the model after an app restart.
+  private skillCacheRevision = agentSkillRevision()
 
   constructor(systemMessage?: string, threadId?: string) {
     this.systemMessage = systemMessage
@@ -416,23 +543,57 @@ export class CustomChatTransport implements ChatTransport<UIMessage> {
     this.toolsCacheValid = false
   }
 
+  /**
+   * Drop memoized skill bodies so the next send re-reads them from disk.
+   * Called automatically when the skill revision moves (any create / import /
+   * update / enable / delete), which is what makes an edit visible inside an
+   * already-open thread.
+   */
+  invalidateSkillCache() {
+    this.skillDetailCache.clear()
+    this.skillCacheRevision = agentSkillRevision()
+  }
+
   private buildToolsCacheKey(
     disabledToolKeys: string[],
     hasDocuments: boolean,
     ragFeatureAvailable: boolean,
-    modelSupportsTools: boolean
+    modelSupportsTools: boolean,
+    chatExec: ChatExecStatus | null
   ): string {
     const mcp = [...useAppState.getState().mcpToolNames].sort().join(',')
     const rag = [...useAppState.getState().ragToolNames].sort().join(',')
+    const muted = [...this.mutedServersForThread()].sort().join(',')
+    // The cost report is measured against the selected model's window, so
+    // a context change must rebuild it even when the tool set is unchanged.
+    const ctxLen = readModelCtxLen(useModelProvider.getState().selectedModel)
     return [
       this.threadId ?? '',
       hasDocuments,
       ragFeatureAvailable,
       modelSupportsTools,
       disabledToolKeys.join(','),
+      muted,
+      Object.entries(useMCPServers.getState().mcpServers)
+        .filter(([key, config]) => isWebSearchServer(key, config))
+        .map(([key, config]) => `${key}:${Boolean(config.active)}`)
+        .sort()
+        .join(','),
+      ctxLen ?? '',
       mcp,
       rag,
+      // The run_command / run_script descriptions name the shell, the
+      // languages and whether a sandbox is in use.
+      chatExec ? JSON.stringify(chatExec) : '',
     ].join('|')
+  }
+
+  /** Connectors the user switched off for this chat (see `useToolAvailable`). */
+  private mutedServersForThread(): string[] {
+    const store = useToolAvailable.getState()
+    return this.threadId
+      ? store.getMutedServersForThread(this.threadId)
+      : store.getDefaultMutedServers()
   }
 
   async refreshTools(force = false) {
@@ -463,11 +624,22 @@ export class CustomChatTransport implements ChatTransport<UIMessage> {
       ragFeatureAvailable = Boolean(useAttachments.getState().enabled)
     }
 
+    // Commands and scripts (`run_command` / `run_script`) when the composer's
+    // "Run commands" item is on and this machine can run them. The status is
+    // probed once per session; useTools starts that early.
+    const chatExecStatus =
+      modelSupportsTools && useGeneralSetting.getState().chatExecEnabled
+        ? await ensureChatExecStatus().then((status) =>
+            isChatExecOffered(status) ? status : null
+          )
+        : null
+
     const cacheKey = this.buildToolsCacheKey(
       disabledToolKeys,
       hasDocuments,
       ragFeatureAvailable,
-      modelSupportsTools
+      modelSupportsTools,
+      chatExecStatus
     )
     if (!force && this.toolsCacheValid && cacheKey === this.toolsCacheKey) {
       return
@@ -531,9 +703,55 @@ export class CustomChatTransport implements ChatTransport<UIMessage> {
       }
     }
 
-    this.tools = buildToolsRecord(ragTools, mcpTools, disabledToolKeys)
+    // System servers (filesystem, fetch, …) are agent-mode tooling: the
+    // agent engine reads them from its own catalog, a chat never sends them.
+    const muted = new Set([
+      ...this.mutedServersForThread(),
+      ...SYSTEM_SERVER_KEYS,
+    ])
+    const searchConfigs = useMCPServers.getState().mcpServers
+    const audibleMcpTools = mcpTools.filter((tool) => {
+      if (muted.has(tool.server)) return false
+      const config = searchConfigs[tool.server]
+      // Turning the globe off takes effect before asynchronous discovery catches up.
+      return (
+        !config ||
+        !isWebSearchServer(tool.server, config) ||
+        Boolean(config.active)
+      )
+    })
+
+    // Built-in tools win a name clash: a call is routed by name.
+    const execTools = chatExecStatus ? chatExecTools(chatExecStatus) : []
+    this.tools = buildToolsRecord(
+      ragTools,
+      [
+        ...audibleMcpTools.filter(
+          (tool) => !(execTools.length > 0 && isChatExecTool(tool.name))
+        ),
+        ...execTools,
+      ],
+      disabledToolKeys
+    )
     this.toolsCacheKey = cacheKey
     this.toolsCacheValid = true
+
+    // What the tool block costs, per connector, for the plugins menu and the
+    // composer hint. Measured on what is actually sent (muted/disabled tools
+    // excluded), against the selected model's context window.
+    const disabled = new Set(disabledToolKeys)
+    const sentTools = audibleMcpTools.filter(
+      (tool) => !disabled.has(`${tool.server || 'unknown'}::${tool.name}`)
+    )
+    useAppState
+      .getState()
+      .setToolCostReport(
+        this.threadId ?? '',
+        summarizeToolCost(
+          modelSupportsTools ? sentTools : [],
+          readModelCtxLen(selectedModel)
+        )
+      )
   }
 
   /**
@@ -551,6 +769,117 @@ export class CustomChatTransport implements ChatTransport<UIMessage> {
     this.continueFromContent = content
   }
 
+  /** `chat_template_kwargs` of the last created model (reasoning on/off). */
+  private lastChatTemplateKwargs: Record<string, unknown> | undefined
+
+  /** Size of the last prepared prompt, for diagnostics / telemetry. */
+  lastPromptSize:
+    | {
+        promptTokens: number
+        toolTokens: number
+        ctxLen: number
+        measured: boolean
+      }
+    | undefined
+
+  /**
+   * Estimate (or, for llama.cpp, measure) the prompt and grow the model's
+   * context window once when it would not fit. Returns silently on any
+   * failure — the reactive error path in the thread route remains the
+   * safety net. Throws a context-limit error when the ladder is already at
+   * the model's maximum so the request is not sent into a window it cannot
+   * fit.
+   */
+  private async ensureContextFits(args: {
+    providerId: string
+    modelId: string
+    provider: ProviderObject | undefined
+    system: string | undefined
+    messages: ModelMessage[]
+    tools: Record<string, Tool> | undefined
+    maxOutputTokens: number | undefined
+    recreateModel: () => Promise<void>
+    abortSignal: AbortSignal | undefined
+  }): Promise<void> {
+    const selectedModel = useModelProvider.getState().selectedModel
+    if (!selectedModel || selectedModel.id !== args.modelId) return
+    if (!readAutoIncreaseCtx(selectedModel)) return
+    const ctxLen = readModelCtxLen(selectedModel)
+    if (!ctxLen || !this.serviceHub) return
+
+    const heuristic = estimatePromptTokensHeuristic({
+      system: args.system,
+      messages: args.messages,
+      tools: args.tools,
+    })
+    let promptTokens = heuristic
+    let measured = false
+    if (
+      args.providerId === 'llamacpp' ||
+      args.providerId === 'llamacpp-upstream' ||
+      args.providerId === 'atomic-prism'
+    ) {
+      const exact = await ModelFactory.countLocalPromptTokens(
+        args.providerId,
+        args.modelId,
+        args.provider,
+        {
+          messages: toOpenAiMessages({
+            system: args.system,
+            messages: args.messages,
+          }),
+          tools: toOpenAiTools(args.tools),
+          ...(this.lastChatTemplateKwargs
+            ? { chat_template_kwargs: this.lastChatTemplateKwargs }
+            : {}),
+        }
+      )
+      if (exact !== null) {
+        promptTokens = exact
+        measured = true
+      }
+    }
+    if (args.abortSignal?.aborted) return
+
+    const needed =
+      promptTokens + (args.maxOutputTokens ?? DEFAULT_OUTPUT_RESERVE_TOKENS)
+    const limit = ctxLen * PREFLIGHT_CTX_THRESHOLD
+    this.lastPromptSize = {
+      promptTokens,
+      toolTokens: estimateToolsTokens(args.tools),
+      ctxLen,
+      measured,
+    }
+    if (needed <= limit) return
+
+    const minCtxLen = Math.ceil(needed / PREFLIGHT_CTX_THRESHOLD)
+    console.info(
+      `[chat] prompt ${promptTokens} tokens (${measured ? 'measured' : 'estimated'}) + ${needed - promptTokens} reserved does not fit ctx ${ctxLen}; growing to >= ${minCtxLen}`
+    )
+    const result = await growModelContext({
+      providerId: args.providerId,
+      modelId: args.modelId,
+      serviceHub: this.serviceHub,
+      minCtxLen,
+    })
+    if (!result.ok) {
+      if (result.reason === 'at_max') {
+        throw new Error(
+          `${OUT_OF_CONTEXT_SIZE} The prompt needs about ${needed} tokens (${this.lastPromptSize.toolTokens} of them are tool definitions) but the model's maximum context is ${result.max ?? result.from}. Disable some connectors for this chat or shorten the conversation.`
+        )
+      }
+      if (result.reason === 'fit') {
+        throw new Error(
+          `${OUT_OF_CONTEXT_SIZE} The prompt needs about ${needed} tokens (${this.lastPromptSize.toolTokens} of them are tool definitions) but the context this device has room for is ${result.from}. Disable some connectors for this chat, shorten the conversation, or turn off "Fit to device memory" in the model settings to set the context by hand.`
+        )
+      }
+      return
+    }
+    if (args.abortSignal?.aborted) return
+    await args.recreateModel()
+    this.lastPromptSize = { ...this.lastPromptSize, ctxLen: result.to }
+  }
+
   async sendMessages(
     options: {
       chatId: string
@@ -563,6 +892,9 @@ export class CustomChatTransport implements ChatTransport<UIMessage> {
   ): Promise<ReadableStream<UIMessageChunk>> {
     const requestStartedAt = Date.now()
     ttftMark('gammaStart')
+    // A send right after switching on web search would otherwise go out
+    // without its tools.
+    await settleMcpActivationsBeforeSend(options.abortSignal)
     await this.refreshTools()
     ttftMark('gammaEnd')
 
@@ -573,27 +905,26 @@ export class CustomChatTransport implements ChatTransport<UIMessage> {
     const providerId = useModelProvider.getState().selectedProvider
     const effectiveProviderName = providerId
     const provider = useModelProvider.getState().getProviderByName(providerId)
+    // Re-creates `this.model` against the provider store's current settings
+    // (used after a pre-flight context growth reloads the local session).
+    let recreateModel: (() => Promise<void>) | undefined
     if (this.serviceHub && modelId && provider) {
       try {
         const updatedProvider = useModelProvider
           .getState()
           .getProviderByName(providerId)
 
-        // Global sampling parameters (no longer per-assistant). Injected
+        // Sampling parameters of the assistant this chat is bound to, injected
         // verbatim into local-backend request bodies by ModelFactory. For
         // Gemma 4 QAT, Google's recommended sampler (temp 1.0 / top_p 0.95 /
         // top_k 64) is layered on at request time unless the user has tuned
-        // sampling themselves — non-destructive, follows the active model.
-        const samplingState = useSamplingSettings.getState()
+        // that assistant's sampling — non-destructive, follows the active model.
+        const sampling = getSamplingParamsForThread(this.threadId)
         const providerSettings = updatedProvider?.settings ?? provider.settings
         const inferenceParams = withUpstreamDflashSampling(
           providerId,
           providerSettings,
-          withRecommendedSampling(
-            modelId,
-            samplingState.getParams(),
-            samplingState.userOverridden
-          )
+          withRecommendedSampling(modelId, sampling.params, sampling.overridden)
         )
 
         // Global "Disable reasoning" setting — best-effort: dispatch the
@@ -607,41 +938,72 @@ export class CustomChatTransport implements ChatTransport<UIMessage> {
         const { disableReasoning, reasoningBudget } =
           useGeneralSetting.getState()
         const reasoningOverride: Record<string, unknown> = {}
-        const reasoningBudgetTokens: Record<
-          typeof reasoningBudget,
-          number | undefined
-        > = {
-          off: 0,
-          low: 256,
-          medium: 1024,
-          high: 4096,
-          unlimited: undefined,
-        }
-        if (disableReasoning || reasoningBudget === 'off') {
+        const reasoningControls =
+          useModelProvider.getState().selectedModel?.reasoning
+        const allowReasoningDisable = canDisableReasoning(
+          effectiveProviderName,
+          reasoningControls
+        )
+        const resolvedReasoningLevels = reasoningLevelsForModel(
+          effectiveProviderName,
+          reasoningControls
+        )
+        const firstReasoningLevel = resolvedReasoningLevels[0] ?? 'low'
+        const activeReasoningBudget =
+          !allowReasoningDisable &&
+          (disableReasoning || reasoningBudget === 'off')
+            ? firstReasoningLevel
+            : reasoningBudget === 'off'
+              ? 'low'
+              : reasoningBudget
+        if (
+          allowReasoningDisable &&
+          (disableReasoning || reasoningBudget === 'off')
+        ) {
           switch (effectiveProviderName) {
             case 'llamacpp':
             case 'llamacpp-upstream':
-            case 'mlx':
+            case 'atomic-prism':
+            case 'mlx': {
+              // Some templates (e.g. Hunyuan 3) have no `enable_thinking` and
+              // skip thinking only through their own effort value.
+              const offValue = reasoningControls?.offValue
               reasoningOverride.chat_template_kwargs = {
                 enable_thinking: false,
+                ...(offValue ? { reasoning_effort: offValue } : {}),
               }
-              reasoningOverride.reasoning_budget = 0
+              if (offValue && effectiveProviderName === 'mlx') {
+                // mlx-vlm forwards only a top-level `reasoning_effort` to the
+                // template; its `chat_template_kwargs` reader ignores the key.
+                reasoningOverride.reasoning_effort = offValue
+              }
               break
+            }
             case 'anthropic':
               reasoningOverride.thinking = { type: 'disabled' }
               break
             case 'openai':
               reasoningOverride.reasoning_effort = 'minimal'
               break
+            case 'chatgpt': {
+              const offValue = reasoningControls?.offValue
+              if (offValue) reasoningOverride.reasoning_effort = offValue
+              break
+            }
             case 'xai':
               reasoningOverride.reasoning_effort = 'low'
               break
             case 'google':
             case 'gemini':
-              reasoningOverride.reasoning_effort = 'minimal'
-              reasoningOverride.extra_body = {
-                google: { thinking_config: { thinking_budget: 0 } },
-              }
+              // One field only: Gemini 400s on `reasoning_effort` plus a
+              // `thinking_config`. `none` is accepted by 2.5 Flash / Flash-Lite
+              // alone; 2.5 Pro and Gemini 3 cannot stop thinking, and
+              // `minimal` is their lowest level.
+              reasoningOverride.reasoning_effort = /^gemini-2\.5-flash/.test(
+                modelId
+              )
+                ? 'none'
+                : 'minimal'
               break
             case 'moonshot':
               // Moonshot (Kimi) accepts only high|low|medium|max|xhigh; rejects
@@ -659,13 +1021,43 @@ export class CustomChatTransport implements ChatTransport<UIMessage> {
               }
           }
         } else if (
-          (effectiveProviderName === 'llamacpp' ||
-            effectiveProviderName === 'llamacpp-upstream' ||
-            effectiveProviderName === 'mlx') &&
-          reasoningBudgetTokens[reasoningBudget] !== undefined
+          effectiveProviderName === 'llamacpp' ||
+          effectiveProviderName === 'llamacpp-upstream' ||
+          effectiveProviderName === 'atomic-prism' ||
+          effectiveProviderName === 'mlx' ||
+          (effectiveProviderName === 'chatgpt' &&
+            reasoningControls?.supportsThinking)
         ) {
-          reasoningOverride.reasoning_budget =
-            reasoningBudgetTokens[reasoningBudget]
+          Object.assign(
+            reasoningOverride,
+            buildReasoningRequestFields(
+              activeReasoningBudget,
+              effectiveProviderName,
+              reasoningControls
+            )
+          )
+        } else if (
+          isCloudReasoningProvider(effectiveProviderName) &&
+          resolvedReasoningLevels.length > 0
+        ) {
+          Object.assign(
+            reasoningOverride,
+            buildCloudReasoningRequestFields(
+              activeReasoningBudget,
+              effectiveProviderName
+            )
+          )
+        } else if (usesTemplateReasoningKwargs(effectiveProviderName)) {
+          // Self-hosted and user-added OpenAI-compatible providers (ATO-527).
+          // The "off" path above has always sent these `enable_thinking:
+          // false`, and reasoning ships off by default — so a remote llama.cpp
+          // server was told to skip thinking on every request, with no control
+          // in the composer to say otherwise and no trace to expand. This is
+          // that branch's missing other half.
+          Object.assign(
+            reasoningOverride,
+            buildRemoteReasoningRequestFields(activeReasoningBudget)
+          )
         }
         const effectiveReasoningOverride = withUpstreamDflashReasoningOverride(
           providerId,
@@ -696,6 +1088,22 @@ export class CustomChatTransport implements ChatTransport<UIMessage> {
           audioInputParts.length > 0 ? audioInputParts : undefined
         )
         ttftMark('deltaEnd')
+        recreateModel = async () => {
+          const fresh =
+            useModelProvider.getState().getProviderByName(providerId) ??
+            effectiveProvider
+          this.model = await ModelFactory.createModel(
+            modelId,
+            fresh,
+            inferenceParams ?? {},
+            hasOverride ? effectiveReasoningOverride : undefined,
+            audioInputParts.length > 0 ? audioInputParts : undefined
+          )
+        }
+        this.lastChatTemplateKwargs =
+          effectiveReasoningOverride.chat_template_kwargs as
+            | Record<string, unknown>
+            | undefined
       } catch (error) {
         console.error('Failed to create model:', error)
         throw new Error(
@@ -711,21 +1119,26 @@ export class CustomChatTransport implements ChatTransport<UIMessage> {
     // split it into separate messages so convertToModelMessages produces the
     // tool_use / tool_result pairing that the Claude API requires.
     // See: https://platform.claude.com/docs/en/agents-and-tools/tool-use/implement-tool-use#parallel-tool-use
+    // Mixed-engine hygiene: agent-run tool parts never reach a chat request.
+    const sanitizedMessages = stripAgentRunToolParts(options.messages)
     const messagesToConvert =
       effectiveProviderName === 'anthropic'
-        ? splitAnthropicSerialToolUse(options.messages)
-        : options.messages
+        ? splitAnthropicSerialToolUse(sanitizedMessages)
+        : sanitizedMessages
 
     // Convert UI messages to model messages. Audio file parts are stripped
     // first: they are delivered out-of-band as `input_audio` (see
     // extractAudioInputParts), and the OpenAI-compatible converter throws on
-    // any non-image file part.
-    const supportsVision =
-      useModelProvider
-        .getState()
-        .selectedModel?.capabilities?.includes('vision') ?? false
+    // any non-image file part. Vision is session-scoped for llama.cpp: a
+    // catalog `vision` capability is not enough after text-only mmproj fallback.
+    const selectedModel = useModelProvider.getState().selectedModel
+    const supportsVision = await resolveSupportsVision({
+      providerName: effectiveProviderName,
+      modelId: selectedModel?.id ?? modelId,
+      capabilities: selectedModel?.capabilities,
+    })
     let preparedMessages = projectImagesForInference(
-      stripAudioFileParts(this.mapUserInlineAttachments(messagesToConvert)),
+      stripUnsupportedFileParts(this.mapUserInlineAttachments(messagesToConvert)),
       supportsVision
     )
     // Local backends serialize tool results to a `role: "tool"` text message
@@ -735,12 +1148,14 @@ export class CustomChatTransport implements ChatTransport<UIMessage> {
     // the model payload (placeholder) and, for vision models, re-attach the
     // image as a proper multimodal user message. Cloud providers are left
     // untouched (they have large contexts and handle this differently).
-    if (LOCAL_INFERENCE_PROVIDERS.has(effectiveProviderName)) {
+    if (isLocalInferenceProvider(effectiveProviderName)) {
       preparedMessages = prepareToolResultImagesForModel(preparedMessages, {
         supportsVision,
       })
     }
-    const baseMessages = convertToModelMessages(preparedMessages)
+    const baseMessages = convertToModelMessages(
+      chatExecOutputsForModel(preparedMessages)
+    )
 
     // If continuing a truncated response, append the partial assistant content as a
     // prefill so the model resumes from where it left off rather than regenerating.
@@ -763,10 +1178,9 @@ export class CustomChatTransport implements ChatTransport<UIMessage> {
     // See LOCAL_INFERENCE_PROVIDERS for rationale. Tool inclusion is
     // independent of the reasoning toggle and governed solely by the tools
     // on/off setting (via refreshTools -> useToolAvailable).
-    const isLocalProvider = LOCAL_INFERENCE_PROVIDERS.has(effectiveProviderName)
+    const isLocalProvider = isLocalInferenceProvider(effectiveProviderName)
 
     const hasTools = Object.keys(this.tools).length > 0
-    const selectedModel = useModelProvider.getState().selectedModel
     const modelSupportsTools =
       selectedModel?.capabilities?.includes('tools') ?? this.modelSupportsTools
     const suppressToolsForDflash = shouldSuppressToolsForUpstreamDflash(
@@ -775,19 +1189,44 @@ export class CustomChatTransport implements ChatTransport<UIMessage> {
     )
     const shouldEnableTools =
       hasTools && modelSupportsTools && !suppressToolsForDflash
+    const activeTools = !shouldEnableTools
+      ? undefined
+      : GRAMMAR_CONSTRAINED_PROVIDERS.has(effectiveProviderName)
+        ? withGrammarSafeToolSchemas(this.tools)
+        : this.tools
+
+    // Skills invoked on this thread (via the composer's "/" menu, stamped on
+    // user-message metadata) ride the system prompt — the chat counterpart of
+    // the agent's `skill.view` loading. Reading them off `options.messages`
+    // makes send, regenerate, edit and app-restart replay uniform.
+    const invokedSkillNames = collectSkillNamesFromMessages(options.messages)
+    if (this.skillCacheRevision !== agentSkillRevision()) {
+      this.invalidateSkillCache()
+    }
+    const skillsBlock = renderChatSkillsBlock(
+      await loadChatSkillDetails(invokedSkillNames, this.skillDetailCache)
+    )
+    const documentsHint =
+      activeTools && 'retrieve' in activeTools
+        ? ATTACHED_DOCUMENTS_HINT
+        : undefined
+    const systemWithSkills = composeSystemMessage(
+      composeSystemMessage(this.systemMessage, skillsBlock),
+      documentsHint
+    )
 
     const dropSystemForTools =
-      isLocalProvider && shouldEnableTools && !!this.systemMessage
+      isLocalProvider && shouldEnableTools && !!systemWithSkills
     const effectiveSystemMessage = dropSystemForTools
       ? undefined
-      : this.systemMessage
+      : systemWithSkills
 
     // When we drop the `system` field for the gemma+tools CoT workaround, fold
     // the instructions into the first user message so they still reach the
     // model instead of being silently lost.
     const finalModelMessages =
-      dropSystemForTools && this.systemMessage
-        ? foldSystemIntoFirstUserMessage(modelMessages, this.systemMessage)
+      dropSystemForTools && systemWithSkills
+        ? foldSystemIntoFirstUserMessage(modelMessages, systemWithSkills)
         : modelMessages
 
     // Track stream timing and token count for token speed calculation.
@@ -798,17 +1237,42 @@ export class CustomChatTransport implements ChatTransport<UIMessage> {
     // displayed tokens/sec.
     let streamStartTime: number | undefined
 
-    const maxOutputTokens = useSamplingSettings.getState().getParams()
+    const maxOutputTokens = getSamplingParamsForThread(this.threadId).params
       ?.max_output_tokens as number | undefined
+
+    // Pre-flight (local engines only): measure the rendered prompt — tool
+    // schemas included — and grow the context window BEFORE the request
+    // when it would not fit. Without this a long tool catalogue fails with
+    // "exceeds the available context size", the model is reloaded, and the
+    // whole prompt is regenerated; with it there is one reload and no error.
+    // TensorRT-LLM is left out: its context is fixed when the container starts (design D9) and its
+    // gateway has no `/tokenize` to measure with.
+    if (isLocalProvider && modelId && canGrowContext(effectiveProviderName)) {
+      await this.ensureContextFits({
+        providerId: effectiveProviderName,
+        modelId,
+        provider,
+        system: effectiveSystemMessage,
+        messages: finalModelMessages,
+        tools: activeTools,
+        maxOutputTokens,
+        recreateModel,
+        abortSignal: options.abortSignal,
+      })
+    }
 
     const result = streamText({
       model: this.model,
       messages: finalModelMessages,
       abortSignal: options.abortSignal,
-      tools: shouldEnableTools ? this.tools : undefined,
+      tools: activeTools,
       toolChoice: shouldEnableTools ? 'auto' : undefined,
       system: effectiveSystemMessage,
       maxOutputTokens,
+      // Local engines answer a prompt that does not fit with a fast,
+      // deterministic error; retrying it (the SDK default for 5xx) only
+      // delays the context-growth path. Cloud providers keep the default.
+      maxRetries: isLocalProvider ? 0 : undefined,
       experimental_transform: stripSpecialTokensTransform,
       experimental_repairToolCall: async ({ toolCall, error }) => {
         if (NoSuchToolError.isInstance(error)) return null
@@ -864,39 +1328,48 @@ export class CustomChatTransport implements ChatTransport<UIMessage> {
           // the timer ever started AND we actually produced tokens (e.g. a
           // pure tool-call response yields 0 tokens and no delta, so the
           // fallback would otherwise divide by zero).
-          let tokenSpeed: number
-          if (tokensPerSecond > 0) {
-            tokenSpeed = tokensPerSecond
-          } else if (
-            streamStartTime !== undefined &&
-            durationSec > 0 &&
-            outputTokens > 0
-          ) {
-            tokenSpeed = outputTokens / durationSec
-          } else {
-            tokenSpeed = 0
-          }
+          const tokenSpeed = resolveTokenSpeed({
+            providerId,
+            providerReportedSpeed: tokensPerSecond,
+            outputTokens,
+            durationSec: streamStartTime === undefined ? 0 : durationSec,
+          })
 
           return {
             finishReason: finishPart.finishReason,
             activityDurationMs: Math.max(0, Date.now() - requestStartedAt),
+            // Provider-agnostic time to first token: `streamStartTime` is the
+            // first generated delta, set above. The α→θ stage breakdown in
+            // `ttft-timing` only spans the Tauri/proxy path, so this is the
+            // value that is comparable across local and cloud providers.
+            ttftMs: streamStartTime
+              ? Math.max(0, streamStartTime - requestStartedAt)
+              : null,
+            // The model/provider a message was produced by was previously not
+            // recorded anywhere, so a finished turn could not be attributed.
+            modelId,
+            providerId,
             usage: {
               inputTokens: inputTokens,
               outputTokens: outputTokens,
               totalTokens:
                 usage?.totalTokens ?? (inputTokens ?? 0) + outputTokens,
             },
-            tokenSpeed: {
-              tokenSpeed: Math.round(tokenSpeed * 10) / 10, // Round to 1 decimal
-              tokenCount: outputTokens,
-              durationMs,
-              ...(draftTokensTotal != null && draftTokensTotal > 0
-                ? {
-                    draftTokensTotal,
-                    draftTokensAccepted: draftTokensAccepted ?? 0,
-                  }
-                : {}),
-            },
+            ...(tokenSpeed > 0
+              ? {
+                  tokenSpeed: {
+                    tokenSpeed: Math.round(tokenSpeed * 10) / 10, // Round to 1 decimal
+                    tokenCount: outputTokens,
+                    durationMs,
+                    ...(draftTokensTotal != null && draftTokensTotal > 0
+                      ? {
+                          draftTokensTotal,
+                          draftTokensAccepted: draftTokensAccepted ?? 0,
+                        }
+                      : {}),
+                  },
+                }
+              : {}),
           }
         }
 

@@ -16,8 +16,10 @@ use tauri::{
 use tauri_plugin_store::Store;
 
 use crate::core::app::commands::get_jan_data_folder_path;
-use crate::core::mcp::constants::default_mcp_config;
-use crate::core::mcp::helpers::add_server_config;
+use crate::core::mcp::constants::MCP_CONFIG_VERSION;
+use crate::core::mcp::helpers::{
+    add_server_config, drop_retired_serper_default_from_config, ensure_mcp_config_exists,
+};
 
 use super::{
     extensions::commands::get_jan_extensions_path, mcp::helpers::run_mcp_commands, state::AppState,
@@ -162,6 +164,12 @@ pub fn migrate_mcp_servers(
         .get("mcp_version")
         .and_then(|v| v.as_i64())
         .unwrap_or(0);
+
+    // On a clean install the config file does not exist yet — `setup_mcp` only
+    // creates it later, asynchronously. Without this the migrations below fail
+    // with "os error 2" on every first launch.
+    ensure_mcp_config_exists(app_handle.clone())?;
+
     if mcp_version < 1 {
         log::info!("Migrating MCP schema version 1");
         let result = add_server_config(
@@ -200,11 +208,19 @@ pub fn migrate_mcp_servers(
     }
     if mcp_version < 3 {
         log::info!("Migrating MCP schema version 3: Updating Exa to streamable HTTP");
-        if let Err(e) = migrate_exa_to_http(app_handle) {
+        if let Err(e) = migrate_exa_to_http(app_handle.clone()) {
             log::error!("Failed to migrate Exa to HTTP: {e}");
         }
     }
-    store.set("mcp_version", 3);
+    if mcp_version < 4 {
+        log::info!("Migrating MCP schema version 4: Dropping the retired serper default");
+        match drop_retired_serper_default_from_config(app_handle) {
+            Ok(true) => log::info!("Dropped the untouched serper default from mcp_config.json"),
+            Ok(false) => {}
+            Err(e) => log::error!("Failed to drop the serper default: {e}"),
+        }
+    }
+    store.set("mcp_version", MCP_CONFIG_VERSION);
     store.save().expect("Failed to save store");
     Ok(())
 }
@@ -272,46 +288,36 @@ pub fn extract_extension_manifest<R: Read>(
     Ok(None)
 }
 
-/// Install/update the bundled `jan` CLI binary.
+/// Refresh an `atomic-chat-cli` that is already on PATH after an app update, so it
+/// stays in sync with the bundled binary.
 ///
-/// - `version_changed`: pass `true` whenever the app version has changed (i.e. after an update).
-///   When `true` the binary is always overwritten so the CLI stays in sync with the new app.
-///   When `false` only installs if the binary is not yet present on PATH.
+/// The CLI is hidden in the app, so a launch never installs it on its own: when the
+/// version is unchanged, or the command is not on PATH, this does nothing.
 ///
 /// Runs in a background task — never blocks startup.
 /// Errors are logged as warnings and never prevent the app from starting.
 pub fn setup_jan_cli<R: Runtime>(app_handle: tauri::AppHandle<R>, version_changed: bool) {
+    if !version_changed {
+        return;
+    }
     tauri::async_runtime::spawn(async move {
-        // On a normal launch where the version hasn't changed, skip reinstall if already on PATH.
-        if !version_changed {
-            let which_cmd = if cfg!(windows) { "where" } else { "which" };
-            let mut cmd = std::process::Command::new(which_cmd);
-            cmd.arg("jan");
-            #[cfg(windows)]
-            {
-                use std::os::windows::process::CommandExt;
-                cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
-            }
-            if cmd.output().map(|o| o.status.success()).unwrap_or(false) {
-                log::debug!("jan CLI already on PATH — skipping reinstall");
-                return;
-            }
+        if !crate::core::system::commands::check_jan_cli_installed()
+            .await
+            .installed
+        {
+            log::debug!("Atomic Chat CLI not on PATH — leaving it uninstalled");
+            return;
         }
 
         match crate::core::system::commands::install_jan_cli_sync(&app_handle) {
             Ok(status) => {
                 log::info!(
-                    "jan CLI {} to {}",
-                    if version_changed {
-                        "updated"
-                    } else {
-                        "installed"
-                    },
+                    "Atomic Chat CLI updated at {}",
                     status.path.as_deref().unwrap_or("<unknown>")
                 );
             }
             Err(e) => {
-                log::warn!("jan CLI auto-install skipped: {e}");
+                log::warn!("Atomic Chat CLI update skipped: {e}");
             }
         }
     });
@@ -324,13 +330,8 @@ pub fn setup_mcp<R: Runtime>(app: &App<R>) {
     tauri::async_runtime::spawn(async move {
         use crate::core::mcp::lockfile::cleanup_all_stale_locks;
 
-        // Create default mcp_config.json if it doesn't exist
-        let config_path = get_jan_data_folder_path(app_handle.clone()).join("mcp_config.json");
-        if !config_path.exists() {
-            log::info!("mcp_config.json not found, creating default config");
-            if let Err(e) = fs::write(&config_path, default_mcp_config()) {
-                log::error!("Failed to create default MCP config: {e}");
-            }
+        if let Err(e) = ensure_mcp_config_exists(app_handle.clone()) {
+            log::error!("Failed to create default MCP config: {e}");
         }
 
         if let Err(e) = cleanup_all_stale_locks(&app_handle).await {
@@ -474,7 +475,7 @@ pub fn setup_tray(app: &App) -> tauri::Result<TrayIcon> {
         };
     }
 
-    //* Иконка в строке меню macOS: отдельный asset; icon_as_template(false) — показывать PNG как есть
+    //* macOS menu bar icon: separate asset; icon_as_template(false) — show the PNG as is
     //  Single-click opens the status menu (Pico-style). The right-click menu is the same.
     let mut tray_builder = TrayIconBuilder::with_id("tray")
         .menu(&menu)
@@ -482,7 +483,7 @@ pub fn setup_tray(app: &App) -> tauri::Result<TrayIcon> {
 
     #[cfg(target_os = "macos")]
     {
-        //* Template: система красит чёрный контур как батарею; PNG со скруглением и «пустой» звездой
+        //* Template: the system tints the black outline like the battery icon; PNG with rounded corners and a "hollow" star
         let menu_bar_icon = tauri::image::Image::from_bytes(include_bytes!(
             "../../../web-app/public/images/tray-macos-template.png"
         ))?;

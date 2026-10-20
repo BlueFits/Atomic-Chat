@@ -1,13 +1,18 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
-import { ModelFactory } from '../model-factory'
+import { ModelFactory, createLocalStreamingFetch } from '../model-factory'
 import type { ProviderObject } from '@janhq/core'
 import { invoke } from '@tauri-apps/api/core'
+import { fetch as httpFetch } from '@tauri-apps/plugin-http'
+import { createOpenAICompatible } from '@ai-sdk/openai-compatible'
 import type { ModelsService } from '@/services/models/types'
 import { seedServiceHub } from '@/test/service-hub'
 
 // Mock the Tauri invoke function
 vi.mock('@tauri-apps/api/core', () => ({
   invoke: vi.fn(),
+  Channel: class {
+    onmessage: ((message: unknown) => void) | null = null
+  },
 }))
 
 // Mock the Tauri HTTP plugin
@@ -146,6 +151,40 @@ describe('ModelFactory', () => {
       expect(model.type).toBe('openai-compatible')
     })
 
+    // A registry cloud has to be named in the factory's switch: the `default`
+    // branch is for user-added endpoints and forwards the local-only parameter
+    // bag (`top_k`, `repeat_penalty`, …), which strict upstreams reject.
+    it.each([
+      ['aimlapi', false],
+      ['openrouter', false],
+      ['edenai', false],
+      ['custom', true],
+    ])(
+      'forwards local-only parameters to %s: %s',
+      async (providerName, forwarded) => {
+        const provider: ProviderObject = {
+          provider: providerName,
+          api_key: 'test-api-key',
+          base_url: 'https://api.example.com/v1',
+          models: [],
+          settings: [],
+          active: true,
+        }
+
+        await ModelFactory.createModel('some/model', provider, { top_k: 40 })
+
+        const { fetch } = vi.mocked(createOpenAICompatible).mock.calls.at(-1)![0]
+        await fetch!('https://api.example.com/v1/chat/completions', {
+          method: 'POST',
+          body: JSON.stringify({ model: 'some/model' }),
+        })
+        const sent = JSON.parse(
+          vi.mocked(httpFetch).mock.calls.at(-1)![1]!.body as string
+        )
+        expect('top_k' in sent).toBe(forwarded)
+      }
+    )
+
     it('should handle custom headers for OpenAI-compatible providers', async () => {
       const provider: ProviderObject = {
         provider: 'custom',
@@ -172,7 +211,7 @@ describe('ModelFactory', () => {
     }
 
     it('should throw with notEligible message when device is not eligible', async () => {
-      mockedInvoke.mockResolvedValueOnce('notEligible')
+      mockedInvoke.mockResolvedValueOnce({ status: 'notEligible' })
 
       await expect(
         ModelFactory.createModel('apple/on-device', foundationModelsProvider)
@@ -180,14 +219,27 @@ describe('ModelFactory', () => {
         'Apple Intelligence is not supported on this device. An Apple Silicon Mac (M1 or later) with macOS 26+ is required.'
       )
 
-      expect(mockedInvoke).toHaveBeenCalledWith(
-        'plugin:foundation-models|check_foundation_models_availability',
-        {}
-      )
+      expect(mockedInvoke).toHaveBeenCalledWith('atomic_core_call', {
+        method: 'GET',
+        path: '/runtimes/foundation-models/availability',
+        body: null,
+      })
+    })
+
+    it('caches the availability answer across models', async () => {
+      mockedInvoke.mockResolvedValueOnce({ status: 'notEligible' })
+
+      await expect(
+        ModelFactory.createModel('apple/on-device', foundationModelsProvider)
+      ).rejects.toThrow('Apple Intelligence is not supported on this device.')
+      await expect(
+        ModelFactory.getFoundationModelsAvailability()
+      ).resolves.toBe('notEligible')
+      expect(mockedInvoke).toHaveBeenCalledTimes(1)
     })
 
     it('should throw when Apple Intelligence is not enabled', async () => {
-      mockedInvoke.mockResolvedValueOnce('appleIntelligenceNotEnabled')
+      mockedInvoke.mockResolvedValueOnce({ status: 'appleIntelligenceNotEnabled' })
 
       await expect(
         ModelFactory.createModel('apple/on-device', foundationModelsProvider)
@@ -197,7 +249,7 @@ describe('ModelFactory', () => {
     })
 
     it('should throw when the model is not ready', async () => {
-      mockedInvoke.mockResolvedValueOnce('modelNotReady')
+      mockedInvoke.mockResolvedValueOnce({ status: 'modelNotReady' })
 
       await expect(
         ModelFactory.createModel('apple/on-device', foundationModelsProvider)
@@ -207,7 +259,7 @@ describe('ModelFactory', () => {
     })
 
     it('should throw when the server binary is missing', async () => {
-      mockedInvoke.mockResolvedValueOnce('binaryNotFound')
+      mockedInvoke.mockResolvedValueOnce({ status: 'binaryNotFound' })
 
       await expect(
         ModelFactory.createModel('apple/on-device', foundationModelsProvider)
@@ -217,7 +269,7 @@ describe('ModelFactory', () => {
     })
 
     it('should throw with generic unavailable message for unknown status', async () => {
-      mockedInvoke.mockResolvedValueOnce('unavailable')
+      mockedInvoke.mockResolvedValueOnce({ status: 'unavailable' })
 
       await expect(
         ModelFactory.createModel('apple/on-device', foundationModelsProvider)
@@ -228,8 +280,8 @@ describe('ModelFactory', () => {
 
     it('should throw when available but no session is found after start', async () => {
       mockedInvoke
-        .mockResolvedValueOnce('available') // check_foundation_models_availability
-        .mockResolvedValueOnce(null) // find_foundation_models_session
+        .mockResolvedValueOnce({ status: 'available' }) // availability from the core
+        .mockResolvedValueOnce(null) // resolve_local_session
 
       await expect(
         ModelFactory.createModel('apple/on-device', foundationModelsProvider)
@@ -240,9 +292,9 @@ describe('ModelFactory', () => {
 
     it('should create a model when available and session exists', async () => {
       mockedInvoke
-        .mockResolvedValueOnce('available') // check_foundation_models_availability
+        .mockResolvedValueOnce({ status: 'available' }) // availability from the core
         .mockResolvedValueOnce({
-          // find_foundation_models_session
+          // resolve_local_session
           pid: 12345,
           port: 9876,
           model_id: 'apple/on-device',
@@ -255,14 +307,495 @@ describe('ModelFactory', () => {
       )
 
       expect(model).toBeDefined()
-      expect(mockedInvoke).toHaveBeenCalledWith(
-        'plugin:foundation-models|check_foundation_models_availability',
-        {}
+      expect(mockStartModel).toHaveBeenCalledWith(
+        foundationModelsProvider,
+        'apple/on-device'
       )
-      expect(mockedInvoke).toHaveBeenCalledWith(
-        'plugin:foundation-models|find_foundation_models_session',
-        {}
-      )
+      expect(mockedInvoke).toHaveBeenCalledTimes(2)
+      expect(mockedInvoke).toHaveBeenLastCalledWith('resolve_local_session', {
+        provider: 'foundation-models',
+        modelId: 'apple/on-device',
+      })
     })
+  })
+})
+
+describe('ModelFactory tensorrt-llm provider', () => {
+  const tensorrtProvider = {
+    provider: 'tensorrt-llm',
+    // Never used for a local engine: requests go to the session the core serves.
+    base_url: 'http://example.invalid/v1',
+    api_key: '',
+    settings: [],
+    models: [],
+    active: true,
+  } as unknown as ProviderObject
+
+  beforeEach(() => {
+    vi.clearAllMocks()
+    mockStartModel.mockResolvedValue(undefined)
+    seedServiceHub({
+      models: {
+        startModel: mockStartModel,
+      } as ModelsService,
+    })
+    ModelFactory.invalidateLocalSessionCache('tensorrt-llm')
+  })
+
+  it('starts the model through the core and talks to its session gateway with the session key', async () => {
+    mockedInvoke.mockResolvedValue({
+      // What the Rust resolver hands back for a container session (protocol 2).
+      pid: null,
+      port: 4001,
+      model_id: 'qwen3-8b',
+      api_key: 'gateway-key',
+      execution: 'container',
+      generation: 'g-1',
+    })
+    const { OpenAICompatibleChatLanguageModel } = await import(
+      '@ai-sdk/openai-compatible'
+    )
+
+    await ModelFactory.createModel('qwen3-8b', tensorrtProvider)
+
+    expect(mockStartModel).toHaveBeenCalledWith(tensorrtProvider, 'qwen3-8b')
+    expect(mockedInvoke).toHaveBeenCalledWith('resolve_local_session', {
+      provider: 'tensorrt-llm',
+      modelId: 'qwen3-8b',
+    })
+    const [modelId, config] = vi.mocked(OpenAICompatibleChatLanguageModel)
+      .mock.calls[0] as unknown as [
+      string,
+      {
+        provider: string
+        url: (options: { path: string }) => string
+        headers: () => Record<string, string>
+      },
+    ]
+    expect(modelId).toBe('qwen3-8b')
+    expect(config.provider).toBe('tensorrt-llm')
+    expect(config.url({ path: '/chat/completions' })).toBe(
+      'http://localhost:4001/v1/chat/completions'
+    )
+    expect(config.headers().Authorization).toBe('Bearer gateway-key')
+  })
+
+  /** Build the model with a llama.cpp parameter bag; return the fetch the AI SDK would call. */
+  async function tensorrtFetch(
+    route: (command: string, args: Record<string, unknown>) => unknown
+  ) {
+    mockedInvoke.mockImplementation(async (command, args) =>
+      route(command, (args ?? {}) as Record<string, unknown>)
+    )
+    const { OpenAICompatibleChatLanguageModel } = await import(
+      '@ai-sdk/openai-compatible'
+    )
+    await ModelFactory.createModel('Qwen/Qwen3-1.7B', tensorrtProvider, {
+      temperature: 0.6,
+      top_k: 20,
+      repeat_penalty: 1.1,
+      n_predict: -1,
+      cache_prompt: true,
+      ctx_len: 8192,
+      reasoning_format: 'deepseek',
+      timings_per_token: true,
+      parallel_tool_calls: false,
+    })
+    const [, config] = vi.mocked(OpenAICompatibleChatLanguageModel).mock
+      .calls[0] as unknown as [string, { fetch: typeof fetch }]
+    return config.fetch
+  }
+
+  const trtSession = {
+    pid: null,
+    port: 4001,
+    model_id: 'Qwen/Qwen3-1.7B',
+    api_key: 'gateway-key',
+    execution: 'container',
+    generation: 'g-1',
+  }
+
+  it('sends trtllm-serve only the fields it reads and shows its refusal message', async () => {
+    let sentBody = ''
+    const chatFetch = await tensorrtFetch((command, args) => {
+      if (command === 'resolve_local_session') return trtSession
+      if (command === 'stream_local_http') {
+        sentBody = args.body as string
+        return Promise.reject(
+          'HTTP 400: {"object":"error","message":"tool_choice requires tools","type":"BadRequestError","param":null,"code":400}'
+        )
+      }
+      return null
+    })
+
+    const response = await chatFetch(
+      'http://localhost:4001/v1/chat/completions',
+      {
+        method: 'POST',
+        body: JSON.stringify({
+          model: 'Qwen/Qwen3-1.7B',
+          messages: [{ role: 'user', content: 'hi' }],
+          stream: true,
+          stream_options: { include_usage: true },
+          tool_choice: 'auto',
+        }),
+      }
+    )
+
+    expect(JSON.parse(sentBody)).toEqual({
+      model: 'Qwen/Qwen3-1.7B',
+      messages: [{ role: 'user', content: 'hi' }],
+      stream: true,
+      stream_options: { include_usage: true },
+      temperature: 0.6,
+      top_k: 20,
+    })
+    expect(response.status).toBe(400)
+    expect(await response.json()).toEqual({
+      error: {
+        message: 'tool_choice requires tools',
+        type: 'BadRequestError',
+        code: 400,
+      },
+    })
+    // No response_format asked for: the core is not asked about structured output.
+    expect(mockedInvoke).not.toHaveBeenCalledWith(
+      'atomic_core_call',
+      expect.anything()
+    )
+  })
+
+  it('keeps response_format only when the core says the family has structured output', async () => {
+    const sent: string[] = []
+    let structured = true
+    const responseFormat = { type: 'json_object' }
+    const chatFetch = await tensorrtFetch((command, args) => {
+      if (command === 'resolve_local_session') return trtSession
+      if (command === 'atomic_core_call') {
+        expect(args.path).toBe('/models/tensorrt-llm/Qwen/Qwen3-1.7B/capabilities')
+        return { tools: true, structured_output: structured }
+      }
+      if (command === 'stream_local_http') {
+        sent.push(args.body as string)
+        return Promise.reject('HTTP 400: {"error":{"message":"stop here"}}')
+      }
+      return null
+    })
+    const send = () =>
+      chatFetch('http://localhost:4001/v1/chat/completions', {
+        method: 'POST',
+        body: JSON.stringify({ model: 'm', messages: [], response_format: responseFormat }),
+      })
+
+    await send()
+    expect(JSON.parse(sent[0]).response_format).toEqual(responseFormat)
+
+    // The answer is kept for the model object's life; a new model asks again.
+    structured = false
+    vi.mocked(
+      (await import('@ai-sdk/openai-compatible')).OpenAICompatibleChatLanguageModel
+    ).mockClear()
+    ModelFactory.invalidateLocalSessionCache('tensorrt-llm')
+    const plainFetch = await tensorrtFetch((command, args) => {
+      if (command === 'resolve_local_session') return trtSession
+      if (command === 'atomic_core_call') return { structured_output: structured }
+      if (command === 'stream_local_http') {
+        sent.push(args.body as string)
+        return Promise.reject('HTTP 400: {"error":{"message":"stop here"}}')
+      }
+      return null
+    })
+    await plainFetch('http://localhost:4001/v1/chat/completions', {
+      method: 'POST',
+      body: JSON.stringify({ model: 'm', messages: [], response_format: responseFormat }),
+    })
+    expect(JSON.parse(sent[1])).not.toHaveProperty('response_format')
+  })
+
+  it('fails with the provider named when the core serves no session after the start', async () => {
+    mockedInvoke.mockResolvedValue(null)
+
+    await expect(
+      ModelFactory.createModel('qwen3-8b', tensorrtProvider)
+    ).rejects.toThrow('No running TensorRT-LLM session found for model: qwen3-8b')
+  })
+})
+
+describe('ModelFactory foundry-local provider (change add-foundry-local)', () => {
+  const foundryProvider = {
+    provider: 'foundry-local',
+    base_url: 'http://example.invalid/v1',
+    api_key: '',
+    settings: [],
+    models: [],
+    active: true,
+  } as unknown as ProviderObject
+
+  const session = {
+    pid: 5151,
+    port: 4101,
+    model_id: 'qwen3-4b-generic-gpu',
+    api_key: 'foundry-key',
+  }
+
+  beforeEach(() => {
+    vi.clearAllMocks()
+    mockStartModel.mockResolvedValue(undefined)
+    seedServiceHub({
+      models: {
+        startModel: mockStartModel,
+      } as ModelsService,
+    })
+    ModelFactory.invalidateLocalSessionCache('foundry-local')
+  })
+
+  async function foundryModel(
+    route: (command: string, args: Record<string, unknown>) => unknown
+  ) {
+    mockedInvoke.mockImplementation(async (command, args) =>
+      route(command, (args ?? {}) as Record<string, unknown>)
+    )
+    const { OpenAICompatibleChatLanguageModel } = await import(
+      '@ai-sdk/openai-compatible'
+    )
+    await ModelFactory.createModel('qwen3-4b-generic-gpu', foundryProvider, {
+      temperature: 0.7,
+      top_k: 20,
+      repeat_penalty: 1.1,
+      n_predict: -1,
+      cache_prompt: true,
+      reasoning_format: 'deepseek',
+    })
+    const [modelId, config] = vi.mocked(OpenAICompatibleChatLanguageModel).mock
+      .calls[0] as unknown as [
+      string,
+      {
+        provider: string
+        url: (options: { path: string }) => string
+        headers: () => Record<string, string>
+        fetch: typeof fetch
+      },
+    ]
+    return { modelId, config }
+  }
+
+  it('starts the model through the core and talks to its session gateway with the session key', async () => {
+    const { modelId, config } = await foundryModel((command) =>
+      command === 'resolve_local_session' ? session : null
+    )
+
+    expect(mockStartModel).toHaveBeenCalledWith(foundryProvider, 'qwen3-4b-generic-gpu')
+    expect(modelId).toBe('qwen3-4b-generic-gpu')
+    expect(config.provider).toBe('foundry-local')
+    expect(config.url({ path: '/chat/completions' })).toBe(
+      'http://localhost:4101/v1/chat/completions'
+    )
+    expect(config.headers().Authorization).toBe('Bearer foundry-key')
+  })
+
+  it('sends the Foundry Local server only OpenAI fields: no llama.cpp knobs, no response_format', async () => {
+    let sentBody = ''
+    const { config } = await foundryModel((command, args) => {
+      if (command === 'resolve_local_session') return session
+      if (command === 'stream_local_http') {
+        sentBody = args.body as string
+        return Promise.reject('HTTP 400: {"error":{"message":"stop here"}}')
+      }
+      return null
+    })
+
+    await config.fetch('http://localhost:4101/v1/chat/completions', {
+      method: 'POST',
+      body: JSON.stringify({
+        model: 'qwen3-4b-generic-gpu',
+        messages: [{ role: 'user', content: 'hi' }],
+        stream: true,
+        stream_options: { include_usage: true },
+        response_format: { type: 'json_object' },
+        tools: [{ type: 'function', function: { name: 'f', parameters: {} } }],
+        tool_choice: 'auto',
+        chat_template_kwargs: { enable_thinking: false },
+      }),
+    })
+
+    expect(JSON.parse(sentBody)).toEqual({
+      model: 'qwen3-4b-generic-gpu',
+      messages: [{ role: 'user', content: 'hi' }],
+      stream: true,
+      stream_options: { include_usage: true },
+      tools: [{ type: 'function', function: { name: 'f', parameters: {} } }],
+      tool_choice: 'auto',
+      temperature: 0.7,
+    })
+  })
+
+  it('fails with the provider named when the core serves no session after the start', async () => {
+    mockedInvoke.mockResolvedValue(null)
+
+    await expect(
+      ModelFactory.createModel('qwen3-4b-generic-gpu', foundryProvider)
+    ).rejects.toThrow('No running Foundry Local session found for model: qwen3-4b-generic-gpu')
+  })
+})
+
+describe('countLocalPromptTokens', () => {
+  const session = { port: 4242, api_key: 'k', model_id: 'm' }
+
+  beforeEach(() => {
+    ModelFactory.invalidateLocalSessionCache('llamacpp-upstream', 'm')
+  })
+
+  it('renders the prompt through /apply-template WITH tools and tokenizes it', async () => {
+    mockedInvoke.mockImplementation(async (cmd, args) => {
+      if (cmd === 'resolve_local_session') return session
+      const { url } = args as { url: string; body: string }
+      if (url.endsWith('/apply-template')) {
+        const body = JSON.parse((args as { body: string }).body)
+        expect(body.tools).toHaveLength(1)
+        expect(body.messages[0]).toEqual({ role: 'user', content: 'yo' })
+        return JSON.stringify({ prompt: '<rendered prompt>' })
+      }
+      if (url.endsWith('/tokenize')) {
+        expect(JSON.parse((args as { body: string }).body)).toEqual({
+          content: '<rendered prompt>',
+        })
+        return JSON.stringify({ tokens: [1, 2, 3, 4, 5] })
+      }
+      throw new Error(`unexpected ${cmd} ${url}`)
+    })
+
+    const count = await ModelFactory.countLocalPromptTokens(
+      'llamacpp-upstream',
+      'm',
+      undefined,
+      {
+        messages: [{ role: 'user', content: 'yo' }],
+        tools: [{ type: 'function', function: { name: 't', parameters: {} } }],
+      }
+    )
+
+    expect(count).toBe(5)
+    expect(mockedInvoke).toHaveBeenCalledWith(
+      'post_local_http',
+      expect.objectContaining({
+        url: 'http://localhost:4242/apply-template',
+        timeoutSecs: 3,
+      })
+    )
+  })
+
+  it('returns null instead of throwing when the engine cannot answer', async () => {
+    mockedInvoke.mockImplementation(async (cmd) => {
+      if (cmd === 'resolve_local_session') return session
+      throw new Error('timeout')
+    })
+    expect(
+      await ModelFactory.countLocalPromptTokens('llamacpp-upstream', 'm', undefined, {
+        messages: [],
+      })
+    ).toBeNull()
+  })
+})
+
+describe('createLocalStreamingFetch error mapping', () => {
+  it('turns a context-overflow 500 into a non-retryable 400 with the same body', async () => {
+    const body = JSON.stringify({
+      error: {
+        code: 500,
+        message:
+          'the request exceeds the available context size. Try increasing context size or enable context shift',
+      },
+    })
+    mockedInvoke.mockRejectedValueOnce(`HTTP 500: ${body}`)
+    const localFetch = createLocalStreamingFetch(vi.fn(), {})
+
+    const response = await localFetch('http://localhost:4242/v1/chat/completions', {
+      method: 'POST',
+      body: JSON.stringify({ messages: [] }),
+    })
+
+    expect(response.status).toBe(400)
+    expect(await response.text()).toBe(body)
+  })
+
+  it('leaves other 5xx untouched', async () => {
+    mockedInvoke.mockRejectedValueOnce('HTTP 503: {"error":{"message":"loading"}}')
+    const localFetch = createLocalStreamingFetch(vi.fn(), {})
+    const response = await localFetch('http://localhost:4242/v1/chat/completions', {
+      method: 'POST',
+      body: '{}',
+    })
+    expect(response.status).toBe(503)
+  })
+})
+
+// ATO-550: Stop ended only the JS stream; Rust kept reading, the connection stayed open, and a
+// one-slot llama-server finished the abandoned answer while the next message waited behind it.
+describe('createLocalStreamingFetch cancellation', () => {
+  type ChunkChannel = { onmessage: (message: { data: string; done?: boolean }) => void }
+
+  /** A stream that has sent one chunk and stays open, and the cancels asked for. */
+  const openStream = () => {
+    const calls: { streamId?: string; cancelled: string[]; channel?: ChunkChannel } = {
+      cancelled: [],
+    }
+    mockedInvoke.mockImplementation((command, args) => {
+      const payload = args as { requestId: string; onChunk: ChunkChannel }
+      if (command === 'stream_local_http') {
+        calls.streamId = payload.requestId
+        calls.channel = payload.onChunk
+        queueMicrotask(() => payload.onChunk.onmessage({ data: 'data: {"x":1}\n\n' }))
+        return new Promise(() => {})
+      }
+      if (command === 'cancel_local_stream') {
+        calls.cancelled.push(payload.requestId)
+        return Promise.resolve()
+      }
+      return Promise.resolve(null)
+    })
+    return calls
+  }
+
+  const send = (signal?: AbortSignal) =>
+    createLocalStreamingFetch(vi.fn(), {})('http://localhost:4242/v1/chat/completions', {
+      method: 'POST',
+      body: '{}',
+      signal,
+    })
+
+  beforeEach(() => {
+    mockedInvoke.mockReset()
+  })
+
+  it('asks Rust to drop the connection of the request the signal aborts', async () => {
+    const calls = openStream()
+    const controller = new AbortController()
+    const response = await send(controller.signal)
+    expect(response.status).toBe(200)
+    expect(calls.streamId).toMatch(/^[0-9a-f-]{36}$/)
+
+    controller.abort()
+    controller.abort()
+
+    expect(calls.cancelled).toEqual([calls.streamId])
+  })
+
+  it('asks the same when the reader walks away', async () => {
+    const calls = openStream()
+    const response = await send()
+    await response.body?.cancel()
+    expect(calls.cancelled).toEqual([calls.streamId])
+  })
+
+  it('cancels nothing once the stream has ended', async () => {
+    const calls = openStream()
+    const controller = new AbortController()
+    const response = await send(controller.signal)
+    calls.channel?.onmessage({ data: '', done: true })
+    expect(await response.text()).toBe('data: {"x":1}\n\n')
+
+    controller.abort()
+
+    expect(calls.cancelled).toEqual([])
   })
 })

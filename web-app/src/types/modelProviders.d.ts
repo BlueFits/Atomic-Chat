@@ -33,6 +33,11 @@ type Model = {
   description?: string
   format?: string
   capabilities?: string[]
+  /**
+   * Reasoning knobs the model's chat template understands, detected from that
+   * template by the local backend extensions. Absent for remote providers.
+   */
+  reasoning?: import('@janhq/core').ReasoningControls
   settings?: Record<string, ProviderSetting>
   /** Whether this model is an embedding model (e.g., BERT-based) */
   embedding?: boolean
@@ -43,6 +48,10 @@ type Model = {
     | 'unsloth'
     | 'local'
     | 'huggingface-cache'
+    | 'gpt4all'
+    | 'jan'
+    | 'msty'
+    | 'llamacpp-cache'
   // Runtime-computed: weights file (or Ollama symlink target) is gone — a "broken link".
   missing?: boolean
   // Resolved absolute weights path; used to dedupe scan candidates vs imported models.
@@ -70,6 +79,33 @@ type ProviderObject = {
    * registry model list is shown. (ATO P2)
    */
   supports_model_listing?: boolean
+  /**
+   * The image and video models enabled for this provider, kept apart from
+   * `models` so chat never sees them. `undefined` until the provider is first
+   * set up (the catalog's defaults are seeded then); `[]` models is a user who
+   * removed them all. `image_api` / `video_api` name the core adapter for a
+   * custom server; a catalog provider leaves them out.
+   */
+  media?: ProviderMedia
+  /** A server that only generates media (Automatic1111 / Forge): no chat models card. */
+  media_only?: boolean
+}
+
+type ProviderMediaModel = {
+  id: string
+  kind: 'image' | 'video'
+  name?: string
+}
+
+type ProviderMedia = {
+  image_api?: import('@/services/media/types').MediaDialect | null
+  video_api?: import('@/services/media/types').MediaDialect | null
+  models: ProviderMediaModel[]
+  /**
+   * `kind:id` of every catalog model the app has put in `models`, so one the user removed is not
+   * put back and one conf adds later is. App-side only: registration sends `models`.
+   */
+  offered?: string[]
 }
 
 /**

@@ -1,10 +1,9 @@
 import { createFileRoute } from '@tanstack/react-router'
 import { useCallback, useEffect, useState, type ReactNode } from 'react'
 import { invoke } from '@tauri-apps/api/core'
-import { listen, type UnlistenFn } from '@tauri-apps/api/event'
+import { listen } from '@tauri-apps/api/event'
 import { type as osType } from '@tauri-apps/plugin-os'
 import { openUrl } from '@tauri-apps/plugin-opener'
-import posthog from 'posthog-js'
 import { toast } from 'sonner'
 import {
   IconChevronDown,
@@ -15,13 +14,15 @@ import {
   IconTerminal2,
 } from '@tabler/icons-react'
 import { route } from '@/constants/routes'
+import { queuedCapture } from '@/lib/telemetry-queue'
 import {
   INTEGRATION_AGENTS,
   type IntegrationAgent,
 } from '@/constants/integrations'
 import HeaderPage from '@/containers/HeaderPage'
 import { Card } from '@/containers/Card'
-import { LocalApiServerPanel } from '@/containers/LocalApiServerPanel'
+import { LocalApiServerStatusRow } from '@/containers/LocalApiServerStatusRow'
+import { startLocalApiServer } from '@/utils/localApiServerControl'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { useTranslation } from '@/i18n/react-i18next-compat'
@@ -33,6 +34,7 @@ import { useServiceHub } from '@/hooks/useServiceHub'
 import { useLaunchStore } from '@/stores/launch-store'
 import { useLaunchSettings } from '@/stores/launch-settings-store'
 import { cn } from '@/lib/utils'
+import { createSafeUnlisten } from '@/lib/tauriEvent'
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 export const Route = createFileRoute(route.launch.index as any)({
@@ -43,6 +45,23 @@ export const Route = createFileRoute(route.launch.index as any)({
 // than this; near-instant config writes finish first and never flash it.
 const SPINNER_DELAY_MS = 350
 
+// The token that starts an agent in the terminal we open.
+//
+// Normally the bare binary name: short to read, and it resolves against the
+// login-shell PATH that terminal inherits. When detection found the launcher
+// *off* PATH — a user-set custom path, or the prefix install OpenClaw's desktop
+// app creates under `~/.openclaw/bin` — the bare name resolves to nothing, so
+// the absolute path is used instead, quoted for the shell that will run it.
+function launcherCommand(detectBin: string, path?: string): string {
+  if (!path) return detectBin
+  // cmd.exe has no escape for `"` inside a quoted token; POSIX shells take the
+  // close-escape-reopen dance. Neither appears in a real install path, but a
+  // username can contain a quote.
+  return osType() === 'windows'
+    ? `"${path.replace(/"/g, '')}"`
+    : `'${path.replace(/'/g, `'\\''`)}'`
+}
+
 // Snapshot the app proxy config (if enabled) into the payload the Rust
 // `install_agent` / `open_agent_terminal` commands expect, so spawned installers
 // and the launched agent can reach the network behind a region block. Returns
@@ -50,13 +69,8 @@ const SPINNER_DELAY_MS = 350
 function buildProxyPayload():
   | { url: string; username?: string; password?: string; no_proxy?: string }
   | undefined {
-  const {
-    proxyEnabled,
-    proxyUrl,
-    proxyUsername,
-    proxyPassword,
-    noProxy,
-  } = useProxyConfig.getState()
+  const { proxyEnabled, proxyUrl, proxyUsername, proxyPassword, noProxy } =
+    useProxyConfig.getState()
   if (!proxyEnabled || !proxyUrl.trim()) return undefined
   return {
     url: proxyUrl.trim(),
@@ -66,13 +80,7 @@ function buildProxyPayload():
   }
 }
 
-function IconBox({
-  children,
-  bg,
-}: {
-  children: ReactNode
-  bg?: string
-}) {
+function IconBox({ children, bg }: { children: ReactNode; bg?: string }) {
   return (
     <div
       className="flex size-8 shrink-0 items-center justify-center overflow-hidden rounded-md"
@@ -109,16 +117,12 @@ function AgentIcon({ agent }: { agent: IntegrationAgent }) {
       )
     case 'codex':
       return (
-        <IconBox bg="#000000">
-          <svg
-            width="20"
-            height="20"
-            viewBox="0 0 24 24"
-            fill="#ffffff"
-            xmlns="http://www.w3.org/2000/svg"
-          >
-            <path d="M22.2819 9.8211a5.9847 5.9847 0 0 0-.5157-4.9108 6.0462 6.0462 0 0 0-6.5098-2.9A6.0651 6.0651 0 0 0 4.9807 4.1818a5.9847 5.9847 0 0 0-3.9977 2.9 6.0462 6.0462 0 0 0 .7427 7.0966 5.98 5.98 0 0 0 .511 4.9107 6.051 6.051 0 0 0 6.5146 2.9001A5.9847 5.9847 0 0 0 13.2599 24a6.0557 6.0557 0 0 0 5.7718-4.2058 5.9894 5.9894 0 0 0 3.9977-2.9001 6.0557 6.0557 0 0 0-.7475-7.0729zm-9.022 12.6081a4.4755 4.4755 0 0 1-2.8764-1.0408l.1419-.0804 4.7783-2.7582a.7948.7948 0 0 0 .3927-.6813v-6.7369l2.02 1.1686a.071.071 0 0 1 .038.052v5.5826a4.504 4.504 0 0 1-4.4945 4.4944zm-9.6607-4.1254a4.4708 4.4708 0 0 1-.5346-3.0137l.142.0852 4.783 2.7582a.7712.7712 0 0 0 .7806 0l5.8428-3.3685v2.3324a.0804.0804 0 0 1-.0332.0615L9.74 19.9502a4.4992 4.4992 0 0 1-6.1408-1.6464zM2.3408 7.8956a4.485 4.485 0 0 1 2.3655-1.9728V11.6a.7664.7664 0 0 0 .3879.6765l5.8144 3.3543-2.0201 1.1685a.0757.0757 0 0 1-.071 0l-4.8303-2.7865A4.504 4.504 0 0 1 2.3408 7.872zm16.5963 3.8558L13.1038 8.364 15.1192 7.2a.0757.0757 0 0 1 .071 0l4.8303 2.7913a4.4944 4.4944 0 0 1-.6765 8.1042v-5.6772a.79.79 0 0 0-.407-.667zm2.0107-3.0231l-.142-.0852-4.7735-2.7818a.7759.7759 0 0 0-.7854 0L9.409 9.2297V6.8974a.0662.0662 0 0 1 .0284-.0615l4.8303-2.7866a4.4992 4.4992 0 0 1 6.6802 4.66zM8.3065 12.863l-2.02-1.1638a.0804.0804 0 0 1-.038-.0567V6.0742a4.4992 4.4992 0 0 1 7.3757-3.4537l-.142.0805L8.704 5.459a.7948.7948 0 0 0-.3927.6813zm1.0976-2.3654l2.602-1.4998 2.6069 1.4998v2.9994l-2.5974 1.4997-2.6067-1.4997Z" />
-          </svg>
+        <IconBox bg="#ffffff">
+          <img
+            src="/images/integrations/codex.png"
+            alt={agent.name}
+            className="size-full object-contain"
+          />
         </IconBox>
       )
     case 'opencode':
@@ -151,6 +155,18 @@ function AgentIcon({ agent }: { agent: IntegrationAgent }) {
           />
         </IconBox>
       )
+    case 'zcode':
+      // ZCode's app icon (packages/desktop/build/icons in zai-org/ZCode). Its
+      // squircle has transparent corners, filled with the icon's own black.
+      return (
+        <IconBox bg="#0b0c0c">
+          <img
+            src="/images/integrations/zcode.png"
+            alt={agent.name}
+            className="size-full object-contain"
+          />
+        </IconBox>
+      )
     case 'zed':
       // Official Zed brand mark (assets/images/zed_logo.svg from zed-industries/zed),
       // rendered light-on-dark to match Zed's app icon.
@@ -170,6 +186,19 @@ function AgentIcon({ agent }: { agent: IntegrationAgent }) {
               fill="#ffffff"
             />
           </svg>
+        </IconBox>
+      )
+    case 'muse':
+      // Meta's own mark, the same `/svg/meta-color.svg` the Llama and Muse
+      // model families use elsewhere in the app. Its gradient is tuned for a
+      // light ground, so the box stays white in both themes.
+      return (
+        <IconBox bg="#ffffff">
+          <img
+            src="/svg/meta-color.svg"
+            alt={agent.name}
+            className="size-5 object-contain"
+          />
         </IconBox>
       )
     case 'mimo':
@@ -271,6 +300,25 @@ function AgentIcon({ agent }: { agent: IntegrationAgent }) {
           />
         </IconBox>
       )
+    case 'atomic-agent':
+      // Atomic Agent's own mark (assets/logo.svg in AtomicBot-ai/atomic-agent),
+      // white on the Atomic brand blue.
+      return (
+        <IconBox bg="#006aff">
+          <svg
+            width="22"
+            height="22"
+            viewBox="0 0 64 64"
+            fill="none"
+            xmlns="http://www.w3.org/2000/svg"
+          >
+            <path
+              d="M35.2357 49.918C35.923 49.918 36.4741 49.359 36.5369 48.6746C37.1268 42.2442 42.2464 37.1246 48.6768 36.5347C49.3612 36.4719 49.9202 35.9208 49.9202 35.2335L49.9202 28.7624C49.9202 28.0751 49.363 27.518 48.6757 27.518L37.7246 27.518C37.0373 27.518 36.4802 26.9608 36.4802 26.2735L36.4802 15.3224C36.4802 14.6351 35.923 14.078 35.2357 14.078L28.7646 14.078C28.0773 14.078 27.5262 14.6369 27.4634 15.3213C26.8736 21.7517 21.754 26.8714 15.3236 27.4612C14.6391 27.524 14.0802 28.0751 14.0802 28.7624L14.0802 35.2335C14.0802 35.9208 14.6373 36.478 15.3246 36.478L26.2757 36.478C26.963 36.478 27.5202 37.0351 27.5202 37.7224L27.5202 48.6735C27.5202 49.3608 28.0773 49.918 28.7646 49.918L35.2357 49.918Z"
+              fill="#ffffff"
+            />
+          </svg>
+        </IconBox>
+      )
     case 'hermes':
       return (
         <IconBox bg="#ffffff">
@@ -289,6 +337,26 @@ function AgentIcon({ agent }: { agent: IntegrationAgent }) {
             alt={agent.name}
             className="size-full object-cover"
           />
+        </IconBox>
+      )
+    case 'dsh':
+      // Official DeepSeek fish mark, taken from the harness' own
+      // `packages/client/ui-primitives/src/FishLogo.tsx` (MIT), rendered white
+      // on the DeepSeek brand blue.
+      return (
+        <IconBox bg="#4d6bfe">
+          <svg
+            width="20"
+            height="15"
+            viewBox="0 0 23.16 17.04"
+            fill="none"
+            xmlns="http://www.w3.org/2000/svg"
+          >
+            <path
+              d="M22.9168 1.43018C22.6713 1.31018 22.5658 1.53918 22.4223 1.65519C22.3733 1.69269 22.3318 1.74169 22.2903 1.78669C21.9317 2.1697 21.5127 2.42121 20.9657 2.39121C20.1657 2.34621 19.4827 2.59771 18.8787 3.20973C18.7502 2.45521 18.3236 2.0047 17.6746 1.71569C17.3351 1.56568 16.9916 1.41518 16.7536 1.08867C16.5876 0.856163 16.5421 0.597155 16.4591 0.341647C16.4061 0.187643 16.3536 0.0301382 16.1761 0.00363739C15.9836 -0.0263635 15.9081 0.135141 15.8326 0.270145C15.5306 0.822162 15.4136 1.43018 15.4251 2.0462C15.4516 3.43174 16.0366 4.53527 17.1991 5.3203C17.3311 5.4103 17.3651 5.5003 17.3236 5.63181C17.2441 5.90231 17.1501 6.16482 17.0671 6.43533C17.0141 6.60784 16.9351 6.64584 16.7501 6.57033C16.1121 6.30383 15.5611 5.90931 15.074 5.4328C14.2475 4.63328 13.5 3.75075 12.568 3.05973C12.349 2.89822 12.13 2.74822 11.9034 2.60522C10.9524 1.68169 12.028 0.923165 12.277 0.833162C12.5375 0.739159 12.3675 0.41615 11.5259 0.42015C10.6844 0.42365 9.91439 0.705658 8.93286 1.08117C8.78935 1.13767 8.63835 1.17867 8.48384 1.21267C7.59332 1.04367 6.66829 1.00617 5.70226 1.11517C3.88321 1.31768 2.43016 2.1777 1.36213 3.64575C0.0790928 5.4103 -0.222916 7.41536 0.146595 9.50642C0.535106 11.7105 1.66014 13.535 3.38869 14.9616C5.18125 16.4406 7.24581 17.1657 9.60138 17.0266C11.0319 16.9441 12.6245 16.7526 14.421 15.2321C14.874 15.4576 15.3496 15.5476 16.1381 15.6151C16.7456 15.6716 17.3306 15.5851 17.7836 15.4911C18.4931 15.3411 18.4441 14.6841 18.1876 14.5636C16.1081 13.595 16.5646 13.9891 16.1496 13.67C17.2061 12.42 18.8202 10.1979 19.3182 7.17235C19.3672 6.83834 19.4297 6.36783 19.4222 6.09732C19.4182 5.93231 19.4562 5.86831 19.6447 5.84931C20.1657 5.78931 20.6712 5.64681 21.1357 5.3913C22.4833 4.65528 23.0268 3.44624 23.1548 1.9972C23.1738 1.77569 23.1508 1.54668 22.9168 1.43018ZM11.1749 14.4736C9.15936 12.889 8.18184 12.3675 7.77832 12.39C7.40081 12.4125 7.46881 12.8445 7.55182 13.126C7.63882 13.404 7.75182 13.5955 7.91033 13.8396C8.01983 14.0011 8.09533 14.2411 7.80083 14.4216C7.15181 14.8231 6.02327 14.2866 5.97027 14.2601C4.65673 13.4865 3.5587 12.4655 2.78467 11.069C2.03715 9.72493 1.60314 8.28289 1.53164 6.74384C1.51264 6.37233 1.62214 6.24082 1.99215 6.17332C2.47916 6.08332 2.98118 6.06432 3.46769 6.13582C5.52476 6.43633 7.27581 7.35586 8.74385 8.8129C9.58188 9.64243 10.2159 10.634 10.8689 11.6025C11.5634 12.631 12.3105 13.611 13.262 14.4146C13.598 14.6961 13.866 14.9101 14.1225 15.0681C13.349 15.1546 12.058 15.1731 11.1749 14.4746L11.1749 14.4736ZM12.141 8.25988C12.141 8.09488 12.273 7.96338 12.439 7.96338C12.4765 7.96338 12.5105 7.97088 12.541 7.98188C12.5825 7.99688 12.6205 8.01938 12.6505 8.05338C12.7035 8.10588 12.7335 8.18088 12.7335 8.25988C12.7335 8.42489 12.6015 8.55639 12.4355 8.55639C12.2695 8.55639 12.141 8.42489 12.141 8.25988ZM15.1415 9.79893C14.949 9.87793 14.7565 9.94544 14.5715 9.95294C14.2845 9.96794 13.9715 9.85143 13.8015 9.70893C13.5375 9.48742 13.3485 9.36342 13.2695 8.97691C13.2355 8.8119 13.2545 8.55639 13.2845 8.40989C13.3525 8.09438 13.277 7.89187 13.0545 7.70787C12.8735 7.55786 12.643 7.51636 12.39 7.51636C12.2955 7.51636 12.209 7.47486 12.1445 7.44136C12.039 7.38886 11.9519 7.25735 12.035 7.09585C12.0615 7.04335 12.19 6.91584 12.22 6.89334C12.5635 6.69784 12.9595 6.76184 13.326 6.90834C13.6655 7.04735 13.9225 7.30236 14.292 7.66287C14.6695 8.09838 14.7375 8.21838 14.9525 8.54539C15.1225 8.8009 15.277 9.06341 15.3831 9.36392C15.4471 9.55142 15.3641 9.70493 15.1415 9.79893Z"
+              fill="#ffffff"
+            />
+          </svg>
         </IconBox>
       )
     case 'vscode':
@@ -422,13 +490,8 @@ function LaunchPage() {
   const {
     serverHost,
     serverPort,
-    setServerPort,
     apiPrefix,
     apiKey,
-    trustedHosts,
-    corsEnabled,
-    verboseLogs,
-    proxyTimeout,
     defaultModelLocalApiServer,
   } = useLocalApiServer()
   const { serverStatus, setServerStatus } = useAppState()
@@ -441,6 +504,7 @@ function LaunchPage() {
   const setInstalled = useLaunchStore((s) => s.setInstalled)
   const viaWsl = useLaunchStore((s) => s.viaWsl)
   const setViaWsl = useLaunchStore((s) => s.setViaWsl)
+  const setBinPath = useLaunchStore((s) => s.setBinPath)
   const customPaths = useLaunchSettings((s) => s.customPaths)
   const setCustomPath = useLaunchSettings((s) => s.setCustomPath)
   const busy = useLaunchStore((s) => s.busy)
@@ -461,23 +525,32 @@ function LaunchPage() {
   const detect = useCallback(
     async (agent: IntegrationAgent): Promise<boolean> => {
       try {
-        const result = await invoke<{ installed: boolean; viaWsl: boolean }>(
-          'detect_agent_installed',
-          {
-            bin: agent.detectBin,
-            customPath: customPaths[agent.id] || null,
-          }
-        )
+        const result = await invoke<{
+          installed: boolean
+          viaWsl: boolean
+          path?: string | null
+        }>('detect_agent_installed', {
+          bin: agent.detectBin,
+          customPath: customPaths[agent.id] || null,
+        })
         setInstalled((prev) => ({ ...prev, [agent.id]: result.installed }))
         setViaWsl((prev) => ({ ...prev, [agent.id]: result.viaWsl }))
+        // Only set for launchers found off PATH (a custom path, or a prefix
+        // install like OpenClaw's app-managed `~/.openclaw/bin/openclaw`), where
+        // the bare binary name would not resolve in the terminal we open.
+        setBinPath((prev) => ({
+          ...prev,
+          [agent.id]: result.path ?? undefined,
+        }))
         return result.installed
       } catch {
         setInstalled((prev) => ({ ...prev, [agent.id]: false }))
         setViaWsl((prev) => ({ ...prev, [agent.id]: false }))
+        setBinPath((prev) => ({ ...prev, [agent.id]: undefined }))
         return false
       }
     },
-    [setInstalled, setViaWsl, customPaths]
+    [setInstalled, setViaWsl, setBinPath, customPaths]
   )
 
   const refreshRunningModels = useCallback(async () => {
@@ -514,35 +587,13 @@ function LaunchPage() {
   const ensureServerRunning = useCallback(async () => {
     if (serverStatus === 'running') return
     try {
-      const actualPort = await window.core?.api?.startServer({
-        host: serverHost,
-        port: serverPort,
-        prefix: apiPrefix,
-        apiKey,
-        trustedHosts,
-        isCorsEnabled: corsEnabled,
-        isVerboseEnabled: verboseLogs,
-        proxyTimeout,
-      })
-      if (actualPort && actualPort !== serverPort) setServerPort(actualPort)
+      await startLocalApiServer()
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err)
       if (!msg.includes('already running')) throw err
     }
     setServerStatus('running')
-  }, [
-    serverStatus,
-    serverHost,
-    serverPort,
-    apiPrefix,
-    apiKey,
-    trustedHosts,
-    corsEnabled,
-    verboseLogs,
-    proxyTimeout,
-    setServerPort,
-    setServerStatus,
-  ])
+  }, [serverStatus, setServerStatus])
 
   // Install the agent's binary, streaming its installer log. Returns whether
   // the install succeeded. Does NOT manage the shared busy/spinner state —
@@ -552,16 +603,15 @@ function LaunchPage() {
       setLogs((prev) => ({ ...prev, [agent.id]: [] }))
       setOpenLog((prev) => ({ ...prev, [agent.id]: true }))
 
-      let unlisten: UnlistenFn | undefined
+      let detachInstallLog: (() => Promise<void>) | undefined
       try {
-        unlisten = await listen<string>(
-          `agent_install_log:${agent.id}`,
-          (event) => {
+        detachInstallLog = createSafeUnlisten(
+          await listen<string>(`agent_install_log:${agent.id}`, (event) => {
             setLogs((prev) => ({
               ...prev,
               [agent.id]: [...(prev[agent.id] ?? []), event.payload],
             }))
-          }
+          })
         )
         await invoke('install_agent', {
           agentId: agent.id,
@@ -578,9 +628,10 @@ function LaunchPage() {
         const msg = err instanceof Error ? err.message : String(err)
         // Surface a localized, actionable hint for network/DNS failures
         // (commonly a region block with no proxy); keep the raw detail otherwise.
-        const isNetworkFailure = /dns|tunnel|proxy|os error 11001|wsahost_not_found|could not reach the network|resolve host|getaddrinfo|name resolution/i.test(
-          msg
-        )
+        const isNetworkFailure =
+          /dns|tunnel|proxy|os error 11001|wsahost_not_found|could not reach the network|resolve host|getaddrinfo|name resolution/i.test(
+            msg
+          )
         toast.error(t('launch:toast.installFailed', { name: agent.name }), {
           description: isNetworkFailure
             ? t('launch:toast.installFailedNetworkDesc')
@@ -588,7 +639,7 @@ function LaunchPage() {
         })
         return false
       } finally {
-        unlisten?.()
+        await detachInstallLog?.()
       }
     },
     [detect, t, setLogs, setOpenLog]
@@ -643,11 +694,17 @@ function LaunchPage() {
         case 'zed':
           await invoke('configure_zed', { apiUrl, model, apiKey: key })
           break
+        case 'zcode':
+          await invoke('configure_zcode', { apiUrl, model, apiKey: key })
+          break
         case 'copilot':
           await invoke('configure_copilot', { apiUrl, model, apiKey: key })
           break
         case 'droid':
           await invoke('configure_droid', { apiUrl, model, apiKey: key })
+          break
+        case 'atomic-agent':
+          await invoke('configure_atomic_agent', { apiUrl, model, apiKey: key })
           break
         case 'hermes':
           await invoke('configure_hermes_agent', {
@@ -674,24 +731,46 @@ function LaunchPage() {
         case 'poolside':
           await invoke('configure_poolside', { apiUrl, model, apiKey: key })
           break
+        case 'muse':
+          await invoke('configure_muse', { apiUrl, model, apiKey: key })
+          break
         case 'openclaw':
           await invoke('configure_openclaw', { apiUrl, model, apiKey: key })
+          break
+        case 'dsh':
+          await invoke('configure_dsh', { apiUrl, model, apiKey: key })
           break
         default:
           throw new Error(`Unknown agent: ${agent.id}`)
       }
 
+      const configuredDescKey =
+        agent.id === 'zed'
+          ? 'launch:toast.configuredDescEditor'
+          : agent.id === 'openclaw'
+            ? // OpenClaw's Gateway watches the config file and hot-reloads, so
+              // there is nothing to restart — but a chat that was already pinned
+              // to another model keeps it, and only `/model default` clears that.
+              'launch:toast.configuredDescOpenclaw'
+            : agent.id === 'zcode'
+              ? // ZCode polls its provider file, so a running app switches
+                // over without a restart.
+                'launch:toast.configuredDescZcode'
+              : 'launch:toast.configuredDesc'
       toast.success(t('launch:toast.configured', { name: agent.name }), {
-        description: t(
-          agent.id === 'zed'
-            ? 'launch:toast.configuredDescEditor'
-            : 'launch:toast.configuredDesc',
-          { name: agent.name }
-        ),
+        description: t(configuredDescKey, { name: agent.name }),
         duration: 8000,
       })
     },
-    [serverStatus, ensureServerRunning, serverHost, serverPort, apiPrefix, apiKey, t]
+    [
+      serverStatus,
+      ensureServerRunning,
+      serverHost,
+      serverPort,
+      apiPrefix,
+      apiKey,
+      t,
+    ]
   )
 
   // Single entry point behind the unified button: install first if the agent
@@ -704,7 +783,7 @@ function LaunchPage() {
         return
       }
 
-      posthog.capture('agent_run', {
+      queuedCapture('agent_run', {
         agent_id: agent.id,
         agent_name: agent.name,
         agent_kind: agent.kind,
@@ -739,6 +818,44 @@ function LaunchPage() {
             await invoke('launch_zed')
             return
           }
+          // ZCode is a desktop app too, and it is never installed from here:
+          // the provider file is written either way and read on its next start,
+          // so a missing app is a pointer to the download, not a failure.
+          if (agent.id === 'zcode') {
+            const app = await invoke<{ installed: boolean; launched: boolean }>(
+              'launch_zcode',
+              { path: useLaunchStore.getState().binPath[agent.id] ?? null }
+            )
+            if (!app.installed) {
+              toast.info(t('launch:toast.zcodeNotInstalled'), {
+                description: t('launch:toast.zcodeNotInstalledDesc'),
+                duration: 10000,
+              })
+            }
+            return
+          }
+          // OpenClaw also ships a desktop app (macOS `OpenClaw.app`, Windows
+          // Hub), and it reads the very config we just wrote — its Gateway owns
+          // the file and hot-reloads it. So when the app is installed it *is*
+          // the destination, and dropping the user into a terminal TUI would
+          // land them in the wrong window.
+          if (agent.id === 'openclaw') {
+            const app = await invoke<{
+              installed: boolean
+              launched: boolean
+            }>('launch_openclaw_app')
+            if (app.launched) return
+            if (app.installed) {
+              // Windows Hub installs per-user with no documented path or AUMID
+              // to launch it by, so hand the user the one instruction we can
+              // give confidently instead of guessing at a shortcut.
+              toast.info(t('launch:toast.openclawAppReady'), {
+                description: t('launch:toast.openclawAppReadyDesc'),
+                duration: 10000,
+              })
+              return
+            }
+          }
           // OpenClaw's bare `openclaw` entry is the Crestodian setup/repair
           // helper (deterministic commands), not a chat. `openclaw chat` runs
           // the embedded local agent runtime, so the user lands straight in a
@@ -748,12 +865,50 @@ function LaunchPage() {
           // launched with `--override-with-envs`. Everything else runs its
           // bare detect binary.
           let command: string
+          // Off-PATH installs (custom path, or OpenClaw's app-managed prefix)
+          // have to be spawned by absolute path; everything else keeps the bare
+          // binary name.
+          // Read through the store rather than a render-closure copy: this same
+          // callback may have just run `detect`, whose result is not in the
+          // closure it was invoked from.
+          const launcher = launcherCommand(
+            agent.detectBin,
+            useLaunchStore.getState().binPath[agent.id]
+          )
           if (agent.id === 'openclaw') {
-            command = 'openclaw chat'
+            command = `${launcher} chat`
           } else if (agent.id === 'goose') {
-            command = 'goose session'
+            command = `${launcher} session`
           } else if (agent.id === 'openhands') {
-            command = 'openhands --override-with-envs'
+            command = `${launcher} --override-with-envs`
+          } else if (agent.id === 'dsh') {
+            // DeepSeek Harness is a browser app, not a terminal chat: a bare
+            // `dsh` has no profile to hand its arguments to and only prints the
+            // launcher's own help. `dsh web` is the alias for `--profile web`,
+            // which serves the UI on http://127.0.0.1:3080. The first run of
+            // that profile initializes it from a shipped template, so the URL
+            // can take a while to appear.
+            command = `${launcher} web`
+          } else if (agent.id === 'muse') {
+            // Muse Code has no writable endpoint configuration: the provider,
+            // base URL and model are flags on every invocation, and META_API_KEY
+            // only has to be non-empty for its provider check -- the request
+            // itself goes to whatever --base-url points at. `apiUrl` already
+            // carries the /v1 prefix (endpointWithPrefix), which is the root
+            // Muse appends `/responses` to.
+            const connectHost =
+              serverHost === '0.0.0.0' || (serverHost as string) === '::'
+                ? '127.0.0.1'
+                : serverHost
+            const apiUrl = `http://${connectHost}:${serverPort}${apiPrefix}`
+            const key = apiKey || 'atomic'
+            if (osType() === 'windows') {
+              const modelArg = model ? ` --model ${model}` : ''
+              command = `set META_API_KEY=${key}&& ${launcher} --provider meta --base-url ${apiUrl}${modelArg}`
+            } else {
+              const modelArg = model ? ` --model '${model}'` : ''
+              command = `META_API_KEY='${key}' ${launcher} --provider meta --base-url '${apiUrl}'${modelArg}`
+            }
           } else if (agent.id === 'poolside') {
             const connectHost =
               serverHost === '0.0.0.0' || (serverHost as string) === '::'
@@ -764,12 +919,12 @@ function LaunchPage() {
             const key = apiKey || 'atomic'
             const modelId = model ?? ''
             if (osType() === 'windows') {
-              command = `set POOLSIDE_STANDALONE_BASE_URL=${standaloneBase}&& set POOLSIDE_API_KEY=${key}&& set POOLSIDE_STANDALONE_MODEL=${modelId}&& pool`
+              command = `set POOLSIDE_STANDALONE_BASE_URL=${standaloneBase}&& set POOLSIDE_API_KEY=${key}&& set POOLSIDE_STANDALONE_MODEL=${modelId}&& ${launcher}`
             } else {
-              command = `POOLSIDE_STANDALONE_BASE_URL='${standaloneBase}' POOLSIDE_API_KEY='${key}' POOLSIDE_STANDALONE_MODEL='${modelId}' pool`
+              command = `POOLSIDE_STANDALONE_BASE_URL='${standaloneBase}' POOLSIDE_API_KEY='${key}' POOLSIDE_STANDALONE_MODEL='${modelId}' ${launcher}`
             }
           } else {
-            command = agent.detectBin
+            command = launcher
           }
           await invoke('open_agent_terminal', {
             command,
@@ -778,9 +933,12 @@ function LaunchPage() {
         } catch (termErr) {
           const tmsg =
             termErr instanceof Error ? termErr.message : String(termErr)
-          toast.warning(t('launch:toast.terminalFailed', { name: agent.name }), {
-            description: tmsg,
-          })
+          toast.warning(
+            t('launch:toast.terminalFailed', { name: agent.name }),
+            {
+              description: tmsg,
+            }
+          )
         }
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err)
@@ -859,7 +1017,7 @@ function LaunchPage() {
       const launchId = agent.editor?.launchId
       if (!launchId) return
 
-      posthog.capture('editor_launch', {
+      queuedCapture('editor_launch', {
         editor_id: agent.id,
         editor_name: agent.name,
       })
@@ -877,9 +1035,12 @@ function LaunchPage() {
         })
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err)
-        toast.error(t('launch:toast.editorLaunchFailed', { name: agent.name }), {
-          description: msg,
-        })
+        toast.error(
+          t('launch:toast.editorLaunchFailed', { name: agent.name }),
+          {
+            description: msg,
+          }
+        )
       } finally {
         setEditorBusy((prev) => ({ ...prev, [agent.id]: false }))
       }
@@ -940,9 +1101,7 @@ function LaunchPage() {
               onClick={() => handleLaunchEditor(agent)}
               disabled={isBusy}
             >
-              {isBusy && (
-                <IconLoader2 size={14} className="animate-spin" />
-              )}
+              {isBusy && <IconLoader2 size={14} className="animate-spin" />}
               {t('launch:enable')}
             </Button>
           </div>
@@ -1125,7 +1284,13 @@ function LaunchPage() {
 
   return (
     <div className="flex h-svh w-full flex-col">
-      <HeaderPage />
+      <HeaderPage>
+        <div className="flex items-center gap-2 w-full">
+          <span className="font-medium text-base font-studio">
+            {t('launch:title')}
+          </span>
+        </div>
+      </HeaderPage>
       <div className="h-[calc(100%-60px)] overflow-y-auto p-4 pt-0">
         <div className="mx-auto flex max-w-3xl flex-col gap-6">
           <section className="flex flex-col gap-3">
@@ -1137,7 +1302,7 @@ function LaunchPage() {
                 {t('launch:serverSectionDesc')}
               </p>
             </div>
-            <LocalApiServerPanel />
+            <LocalApiServerStatusRow />
           </section>
 
           {assistants.length > 0 && (

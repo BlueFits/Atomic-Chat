@@ -1,10 +1,14 @@
-import type { CatalogModel } from '@/services/models/types'
+import { DEFAULT_MODEL_QUANTIZATIONS } from '@/constants/models'
+import { getTotalDownloadFileSize } from '@/lib/models'
+import type { CatalogModel, ModelQuant } from '@/services/models/types'
+import type { StaffPickCategory } from '@/services/staff-picks-registry'
 
 /**
  * Helpers for the Hub model card (v12). Hugging Face has no "capabilities"
- * field, so badges are derived from pipeline/tags signals available on the
- * catalog entry. Hardware fit is estimated from the quant size vs the user's
- * memory budget (HF computes the same thing client-side).
+ * field, so badges come from the curated staff-picks manifest where there is
+ * one and from pipeline/tags signals on the catalog entry otherwise. Hardware
+ * fit is estimated from the quant size vs the user's memory budget (HF computes
+ * the same thing client-side).
  */
 
 export type HardwareFit = 'ok' | 'maybe' | 'no'
@@ -16,16 +20,28 @@ export const HARDWARE_FIT: Record<
 > = {
   ok: {
     label: 'Good fit',
-    tip: 'This model is likely to run on your hardware',
+    tip: 'Full offload likely possible on your system.',
   },
   maybe: {
-    label: 'Should run',
-    tip: 'This model can probably run on your hardware',
+    label: 'Might fit',
+    tip: 'Within the last GB of VRAM headroom, so loading can fail if other apps are using GPU memory.',
   },
   no: {
-    label: 'Too large',
-    tip: 'This model is probably too large for your hardware',
+    label: 'Won’t fit',
+    tip: 'Exceeds combined VRAM and system RAM budget.',
   },
+}
+
+/**
+ * Outlined-tinted pill palette for the fit badge, in the same canon as the
+ * capability badges: a light pill in light theme, a muted dark one with light
+ * text in dark theme, so the badge survives both without losing its colour.
+ */
+export const FIT_BADGE_CLASS: Record<HardwareFit, string> = {
+  ok: 'border border-emerald-200 bg-emerald-50 text-emerald-900 dark:border-emerald-800 dark:bg-emerald-950/45 dark:text-emerald-200',
+  maybe:
+    'border border-amber-200 bg-amber-50 text-amber-900 dark:border-amber-800 dark:bg-amber-950/45 dark:text-amber-200',
+  no: 'border border-red-200 bg-red-50 text-red-900 dark:border-red-800 dark:bg-red-950/45 dark:text-red-200',
 }
 
 const SIZE_UNIT_BYTES: Record<string, number> = {
@@ -43,6 +59,35 @@ export function parseFileSizeToBytes(fileSize?: string): number | undefined {
   const value = Number(match[1])
   if (!Number.isFinite(value)) return undefined
   return value * SIZE_UNIT_BYTES[match[2].toUpperCase()]
+}
+
+/**
+ * Representative quant for "how large is this model": the median of the
+ * variants whose size is known.
+ *
+ * The smallest quant is a poor stand-in — a repo's IQ1/IQ2 rounding is a
+ * curiosity almost nobody runs, so quoting it understates the row's size and
+ * lets the device filter promise a fit the user will not get from the quant
+ * they actually pick. Quants with no declared size are ignored rather than
+ * treated as zero; if none carry a size we keep catalog order.
+ */
+export function pickMedianQuant(
+  quants?: readonly ModelQuant[]
+): ModelQuant | undefined {
+  if (!quants?.length) return undefined
+
+  const sized = quants
+    .map((quant) => ({ quant, bytes: parseFileSizeToBytes(quant.file_size) }))
+    .filter(
+      (entry): entry is { quant: ModelQuant; bytes: number } =>
+        entry.bytes !== undefined
+    )
+    .sort((left, right) => left.bytes - right.bytes)
+
+  if (!sized.length) return quants[0]
+  // Lower median on an even count: between two equally central quants, quote
+  // the one more likely to run.
+  return sized[Math.floor((sized.length - 1) / 2)].quant
 }
 
 /** Full download count with thin-space grouping, e.g. 1163988 -> "1 163 988". */
@@ -136,9 +181,30 @@ export async function fetchModelStats(modelId: string): Promise<ModelStats> {
   return stats
 }
 
-export type ModelFormat = 'mlx' | 'gguf'
+/**
+ * A Hub format: a file format, or a managed engine (its provider id) for a safetensors checkpoint.
+ * `atomic-prism` is a list rather than a file format: the Bonsai GGUF files only PrismML's
+ * llama.cpp runs, which `modelFormat` reads as GGUF.
+ */
+export type ModelFormat =
+  | 'mlx'
+  | 'gguf'
+  | 'vllm'
+  | 'sglang'
+  | 'tensorrt-llm'
+  | 'atomic-prism'
+  | 'foundry-local'
 
-export function modelFormat(model: CatalogModel): ModelFormat {
+/**
+ * The format a card is shown under. A managed engine's checkpoint is one for every managed engine
+ * (change `add-vllm-runtime`): it reads as the managed format the Hub is showing, `managedFormat`.
+ */
+export function modelFormat(
+  model: CatalogModel,
+  managedFormat: ModelFormat = 'tensorrt-llm'
+): ModelFormat {
+  if (model.is_foundry_local) return 'foundry-local'
+  if (model.is_managed) return managedFormat
   if (model.is_mlx || model.library_name?.toLowerCase() === 'mlx') return 'mlx'
   return 'gguf'
 }
@@ -148,9 +214,9 @@ export type Capability = {
   className: string
 }
 
-//* Outlined-tinted палитра с light + dark вариантами — тот же канон, что у
-//* FIT_BADGE_CLASS: светлый pill в light-теме и приглушённый тёмный с светлым
-//* текстом в dark. Цвет каждой способности сохранён (amber/blue/fuchsia/teal).
+//* Outlined-tinted palette with light + dark variants — the same convention as
+//* FIT_BADGE_CLASS: a light pill in the light theme and a muted dark one with light
+//* text in dark. Each capability keeps its color (amber/blue/fuchsia/teal).
 const CAP_COLORS = {
   vision:
     'border border-amber-200 bg-amber-50 text-amber-900 dark:border-amber-800 dark:bg-amber-950/45 dark:text-amber-200',
@@ -161,12 +227,48 @@ const CAP_COLORS = {
     'border border-teal-200 bg-teal-50 text-teal-900 dark:border-teal-800 dark:bg-teal-950/45 dark:text-teal-200',
 } as const
 
+/** Manifest category -> badge, in the order the badges are rendered. */
+const CURATED_CAPABILITIES: ReadonlyArray<{
+  category: StaffPickCategory
+  label: Capability['label']
+  className: string
+}> = [
+  { category: 'vision', label: 'Vision', className: CAP_COLORS.vision },
+  { category: 'tools', label: 'Tool Use', className: CAP_COLORS.tool },
+  {
+    category: 'reasoning',
+    label: 'Reasoning',
+    className: CAP_COLORS.reasoning,
+  },
+  { category: 'audio', label: 'Audio', className: CAP_COLORS.audio },
+]
+
 /**
- * Canonical capability badges (no synonyms) derived from the signals the
- * catalog entry exposes: mmproj presence, the `tools` flag, plus keyword hints
- * in the name/description/library for reasoning and audio.
+ * Canonical capability badges (no synonyms).
+ *
+ * Two sources, in priority order:
+ *
+ *  1. `curated` — the `categories` of a staff-picks entry. A recommended model
+ *     is hand-checked against its own model card, so its declaration wins
+ *     outright, including when it declares no capability at all: an entry
+ *     listing only `general` means "we looked, there is nothing to badge".
+ *  2. Otherwise the catalog signals: mmproj presence, the `tools` flag, plus
+ *     keyword hints in the name/description/library for reasoning and audio.
+ *     Search results have no curated metadata, so they stay best-effort.
+ *
+ * `curated` being absent (not empty) is what selects the heuristic, so a pick
+ * published without `categories` still gets badges.
  */
-export function deriveCapabilities(model: CatalogModel): Capability[] {
+export function deriveCapabilities(
+  model: CatalogModel,
+  curated?: readonly StaffPickCategory[]
+): Capability[] {
+  if (curated) {
+    return CURATED_CAPABILITIES.filter((entry) =>
+      curated.includes(entry.category)
+    ).map(({ label, className }) => ({ label, className }))
+  }
+
   const hay =
     `${model.model_name} ${model.description ?? ''} ${model.library_name ?? ''}`.toLowerCase()
   const caps: Capability[] = []
@@ -201,11 +303,31 @@ export function quantLabel(modelId: string): string {
   // MLX: trailing "<n>bit"
   const bit = seg.match(/(\d+)\s*bit$/i)
   if (bit) return `${bit[1]}BIT`
-  // GGUF: trailing quant token after a separator
-  const gguf = seg.match(/[-_.]((?:I?Q\d[0-9A-Za-z_]*)|BF16|F16|F32)$/i)
+  // GGUF: trailing quant token after a separator (I-quants, ternary TQ,
+  // PrismML's PQ / PTQ packings, plain Q)
+  const gguf = seg.match(/[-_.]((?:(?:[IT]|PT?)?Q\d[0-9A-Za-z_]*)|BF16|F16|F32)$/i)
   if (gguf) return gguf[1].toUpperCase()
   // Fallback: last separator-delimited segment
   return (seg.split(/[-_.]/).pop() ?? seg).toUpperCase()
+}
+
+/**
+ * The manifest entry that pins a quant names it as a plain token (`Q8_0`).
+ * Match it against the token {@link quantLabel} parses out of the file id,
+ * rather than a substring test — `includes('q4_0')` would also hit `Q4_0_4_4`,
+ * and `includes('q8_0')` would hit a projector when scanning weights.
+ *
+ * `sanitizeModelId` rewrites `.` to `_`, so a pin written `Q4.K.M` still
+ * matches. Returns `undefined` when nothing matches, so callers fall back to
+ * their normal selection instead of failing the download.
+ */
+export function findPinnedQuant<T extends { model_id: string }>(
+  candidates: readonly T[] | undefined,
+  pin?: string
+): T | undefined {
+  if (!candidates?.length || !pin) return undefined
+  const wanted = pin.toUpperCase().replace(/\./g, '_')
+  return candidates.find((c) => quantLabel(c.model_id) === wanted)
 }
 
 /**
@@ -234,4 +356,47 @@ export function estimateFit(
   if (sizeBytes <= budgetBytes * 0.7) return 'ok'
   if (sizeBytes <= budgetBytes) return 'maybe'
   return 'no'
+}
+
+/**
+ * Quant the download panel opens on.
+ *
+ * The house default (`iq4_xs` / `q4_k_m`) wins whenever the repo ships it. Repos
+ * that ship neither used to fall back to catalog order, which is how a card for
+ * a 27B model opened on its F16 dump and greeted the user with "Too large"; the
+ * median quant is the same variant the list row quotes, so the two agree.
+ *
+ * Either way the pick is checked against the memory budget: a preselection the
+ * device cannot run is worthless, so we step down to the largest variant that
+ * does fit. When nothing fits we offer the smallest one and let the badge say so.
+ */
+export function pickDownloadQuant(
+  model: CatalogModel,
+  budgetBytes = 0
+): ModelQuant | undefined {
+  const quants = model.quants
+  if (!quants?.length) return undefined
+
+  const preferred = quants.find((quant) =>
+    DEFAULT_MODEL_QUANTIZATIONS.some((scheme) =>
+      quant.model_id.toLowerCase().includes(scheme)
+    )
+  )
+  const candidate = preferred ?? pickMedianQuant(quants)
+  if (!candidate || !budgetBytes) return candidate
+
+  const bytesOf = (quant: ModelQuant) =>
+    parseFileSizeToBytes(getTotalDownloadFileSize(model, quant))
+  if (estimateFit(bytesOf(candidate), budgetBytes) !== 'no') return candidate
+
+  const sized = quants
+    .map((quant) => ({ quant, bytes: bytesOf(quant) }))
+    .filter(
+      (entry): entry is { quant: ModelQuant; bytes: number } =>
+        entry.bytes !== undefined
+    )
+    .sort((left, right) => left.bytes - right.bytes)
+
+  const fitting = sized.filter((entry) => entry.bytes <= budgetBytes)
+  return (fitting.at(-1) ?? sized[0])?.quant ?? candidate
 }

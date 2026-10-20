@@ -47,6 +47,21 @@ describe('projectImagesForInference', () => {
     expect(projectImagesForInference([generatedImage()], true)).toEqual([])
   })
 
+  it('excludes legacy assistant image parts without generation metadata', () => {
+    const legacyAssistantImage: UIMessage = {
+      id: 'legacy-assistant-image',
+      role: 'assistant',
+      parts: [
+        {
+          type: 'file',
+          mediaType: 'image/png',
+          url: 'asset://localhost/legacy.png',
+        },
+      ],
+    }
+    expect(projectImagesForInference([legacyAssistantImage], true)).toEqual([])
+  })
+
   it('includes a generated image after explicit opt-in on a vision model', () => {
     const message = generatedImage(true)
     expect(projectImagesForInference([message], true)).toEqual([message])

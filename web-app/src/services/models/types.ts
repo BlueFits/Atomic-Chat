@@ -7,8 +7,10 @@ import {
   modelInfo,
   ThreadMessage,
   UnloadResult,
+  type ModelLoadOptions,
 } from '@janhq/core'
 import { Model as CoreModel } from '@janhq/core'
+import type { FoundryLocalHubModel } from '@/services/foundry-local/types'
 
 // Types for model catalog
 export interface ModelQuant {
@@ -36,6 +38,7 @@ export interface CatalogModel {
   library_name?: string
   developer?: string
   downloads: number
+  likes?: number
   num_quants?: number
   quants?: ModelQuant[]
   mmproj_models?: MMProjModel[]
@@ -43,12 +46,99 @@ export interface CatalogModel {
   safetensors_files?: SafetensorsFile[]
   num_safetensors?: number
   created_at?: string
+  last_modified?: string
   readme?: string
   tools?: boolean
   is_mlx?: boolean
+  /**
+   * A safetensors checkpoint for the managed engines (TensorRT-LLM, vLLM), listed under their Hub
+   * formats (changes `add-tensorrt-llm-model-hub`, `add-vllm-runtime`): whether it runs is each
+   * engine's verdict, never this flag.
+   */
+  is_managed?: boolean
+  /** What the Hub knows of a managed entry before the engines' verdicts. */
+  managed?: ManagedCatalogFields
+  /**
+   * A Foundry Local model (change `add-foundry-local`), listed under the "Foundry Local" format from
+   * conf's curated list or Microsoft's catalog; never a Hugging Face repository.
+   */
+  is_foundry_local?: boolean
+  foundry_local?: FoundryLocalHubModel
+}
+
+export interface ManagedCatalogFields {
+  /** One of a descriptor's curated checkpoints. */
+  curated?: boolean
+  /** The engine whose descriptor curates it, when `curated`. */
+  curatedBy?: string
+  /** The revision to read and download at: the descriptor's pin; absent means `main`. */
+  revision?: string
+  /** `config.architectures` from Hugging Face's listing (`expand[]=config`). */
+  architectures?: string[]
+  /** Parameter counts by safetensors dtype from the listing (`expand[]=safetensors`). */
+  parameters?: Record<string, number>
 }
 
 export type ModelCatalog = CatalogModel[]
+
+/**
+ * Why `pullModelWithMetadata` did not start a download. Returned, not thrown:
+ * most callers fire-and-forget the pull, and a refusal is not a failure to
+ * report — the choke point has already told the user and cleared the
+ * pre-download state it set.
+ */
+export interface DownloadRefusal {
+  kind: 'disk_full'
+  /** Bytes the drive would need free: the files plus the downloader's headroom. */
+  needed: number
+  /** Bytes the drive has free. */
+  available: number
+}
+
+/**
+ * What a caller of `pullModelWithMetadata` already knows: the llama.cpp
+ * provider that imports and lists the model (the platform's default when
+ * absent) and the files' expected hashes and sizes, which the downloader then
+ * verifies. A Bonsai file downloads under `atomic-prism`, with the hashes and
+ * sizes of the core's Bonsai families.
+ */
+export interface PullModelOptions {
+  provider?: string
+  modelSha256?: string
+  modelSize?: number
+  mmprojSha256?: string
+  mmprojSize?: number
+}
+
+/** Hugging Face's own orders for a listing (`sort=` on `/api/models`). */
+export type HuggingFaceFeedSort =
+  | 'trending'
+  | 'downloads'
+  | 'likes'
+  | 'lastModified'
+
+/**
+ * `safetensors` lists every safetensors repository with its architectures and parameters by dtype,
+ * for the managed engines' formats (change `add-tensorrt-llm-model-hub`, design D4); whether one
+ * runs is each engine's verdict.
+ */
+export type HuggingFaceFeedFormat = 'gguf' | 'mlx' | 'safetensors'
+
+export type HuggingFaceFeedParams = {
+  format: HuggingFaceFeedFormat
+  sort: HuggingFaceFeedSort
+  /** Optional Hugging Face full-text search, paginated with the same cursor. */
+  search?: string
+  /** Opaque cursor from the previous page's `nextCursor`. */
+  cursor?: string | null
+  limit?: number
+  hfToken?: string
+}
+
+export type HuggingFaceFeedPage = {
+  models: CatalogModel[]
+  nextCursor: string | null
+}
 
 // HuggingFace repository information
 export interface HuggingFaceRepo {
@@ -105,6 +195,14 @@ export type PreflightReason =
   | 'NETWORK'
   | 'UNKNOWN'
 
+/**
+ * What a delete freed, from an engine that deletes through the core and has it measured there
+ * (TensorRT-LLM: the model folder and every engine cache of it, core task 2.24).
+ */
+export interface ModelDeletionReport {
+  freedBytes: number
+}
+
 export interface ModelsService {
   getModel(modelId: string): Promise<modelInfo | undefined>
   fetchModels(): Promise<modelInfo[]>
@@ -124,8 +222,18 @@ export interface ModelsService {
   searchHuggingFaceCandidates(
     query: string,
     hfToken?: string,
-    limit?: number
+    limit?: number,
+    format?: HuggingFaceFeedFormat
   ): Promise<CatalogModel[]>
+  /**
+   * One page of Hugging Face's own listing of a format, in one of its sort
+   * orders — the Hub's long tail under the curated picks. Entries are
+   * lightweight (no quants: the list endpoint carries no file sizes); the
+   * page's `nextCursor` feeds the next call, `null` when the listing ends.
+   */
+  listHuggingFaceFeed(
+    params: HuggingFaceFeedParams
+  ): Promise<HuggingFaceFeedPage>
   convertHfRepoToCatalogModel(repo: HuggingFaceRepo): CatalogModel
   updateModel(modelId: string, model: Partial<CoreModel>): Promise<void>
   pullModel(
@@ -136,7 +244,8 @@ export interface ModelsService {
     mmprojPath?: string,
     mmprojSha256?: string,
     mmprojSize?: number,
-    resume?: boolean
+    resume?: boolean,
+    provider?: string
   ): Promise<void>
   pullModelWithMetadata(
     id: string,
@@ -144,18 +253,33 @@ export interface ModelsService {
     mmprojPath?: string,
     hfToken?: string,
     skipVerification?: boolean,
-    resume?: boolean
-  ): Promise<void>
+    resume?: boolean,
+    options?: PullModelOptions
+  ): Promise<DownloadRefusal | undefined>
   abortDownload(id: string): Promise<void>
-  deleteModel(id: string, provider?: string): Promise<void>
+  /** Resolves with what the delete freed when the engine measures it (TensorRT-LLM does). */
+  deleteModel(id: string, provider?: string): Promise<ModelDeletionReport | void>
   getActiveModels(provider?: string): Promise<string[]>
   stopModel(model: string, provider?: string): Promise<UnloadResult | undefined>
   stopAllModels(): Promise<void>
+  /**
+   * Unload every locally loaded model except `(providerName, modelId)`.
+   * Lets a switch drop stray copies of a model living in another engine
+   * without touching the one that is currently serving requests.
+   */
+  stopAllModelsExcept(modelId: string, providerName: string): Promise<void>
   startModel(
     provider: ProviderObject,
     model: string,
-    bypassAutoUnload?: boolean
+    bypassAutoUnload?: boolean,
+    options?: ModelLoadOptions
   ): Promise<SessionInfo | undefined>
+  /**
+   * Stop a load of `model` on `provider` that has not finished (ATO-530).
+   * Resolves `true` when the engine had one to stop; that load then rejects
+   * with `MODEL_LOAD_CANCELLED_CODE`.
+   */
+  cancelModelLoad(provider: string, model: string): Promise<boolean>
   isToolSupported(modelId: string): Promise<boolean>
   checkMmprojExistsAndUpdateOffloadMMprojSetting(
     modelId: string,

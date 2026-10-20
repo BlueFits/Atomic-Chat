@@ -78,7 +78,7 @@ pub async fn prepare_call_paths(
     validate_destructive_args(&call.tool, args)?;
 
     match call.tool.as_str() {
-        "os.fs.read" | "os.fs.read_document" | "os.fs.hash" => {
+        "os.fs.read" | "os.fs.read_document" | "os.fs.hash" | "os.media.transcribe" => {
             resolve_field(args, "path", &[], None, "read", &root, &mut resources).await?;
         }
         "os.fs.list" => {
@@ -190,6 +190,14 @@ pub async fn prepare_call_paths(
                 resolve_field(args, "path", &[], None, "read", &cwd, &mut resources).await?;
             }
         }
+        "os.code.symbols" => {
+            resolve_field(args, "path", &[], None, "read", &root, &mut resources).await?;
+        }
+        // Defaulting to the workspace root makes the common "search everywhere"
+        // call the one with no arguments to get wrong.
+        "os.code.refs" => {
+            resolve_field(args, "path", &[], Some("."), "read", &root, &mut resources).await?;
+        }
         "os.shell.run" => {
             resolve_field(
                 args,
@@ -197,6 +205,20 @@ pub async fn prepare_call_paths(
                 &[],
                 Some("."),
                 "shell_cwd",
+                &root,
+                &mut resources,
+            )
+            .await?;
+        }
+        // A spawned process is a shell command that outlives the step, so its
+        // working directory goes through exactly the same resolution.
+        "os.proc.spawn" => {
+            resolve_field(
+                args,
+                "cwd",
+                &[],
+                Some("."),
+                "spawn_cwd",
                 &root,
                 &mut resources,
             )
@@ -300,7 +322,10 @@ async fn nearest_existing_directory(path: &Path) -> Result<PathBuf, String> {
 }
 
 fn is_path_aware_filesystem_tool(tool: &str) -> bool {
-    tool.starts_with("os.fs.") || tool.starts_with("os.git.") || tool == "vision.describe"
+    tool.starts_with("os.fs.")
+        || tool.starts_with("os.git.")
+        || tool == "vision.describe"
+        || tool == "os.media.transcribe"
 }
 
 pub fn root_id_for_path(path: &Path) -> String {
@@ -452,7 +477,8 @@ async fn expand_attachment_aliases(
         | "os.fs.hash"
         | "os.fs.archive.list"
         | "os.fs.archive.read_entry"
-        | "os.fs.archive.extract" => {
+        | "os.fs.archive.extract"
+        | "os.media.transcribe" => {
             expand_attachment_alias_field(args, "path", trusted_read_roots).await
         }
         "vision.describe" => {
@@ -665,7 +691,10 @@ fn path_buf_from_input(raw: &str) -> PathBuf {
     if let Some(rest) = raw.strip_prefix(r"\?\") {
         return PathBuf::from(format!(r"\\?\{rest}"));
     }
-    PathBuf::from(raw)
+    // Models sometimes write a drive path in URL form, `/C:\Users\...`. Windows
+    // reads that as rooted but drive-less and joins it onto the workspace's
+    // drive, so the tool hit a folder that does not exist (#271).
+    PathBuf::from(jan_utils::path::strip_windows_drive_slash(raw))
 }
 
 #[cfg(not(windows))]
@@ -918,6 +947,38 @@ mod tests {
         std::fs::remove_dir_all(parent).unwrap();
     }
 
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn resolves_windows_drive_path_with_a_leading_slash() {
+        let parent = test_dir();
+        let root = parent.join("workspace");
+        let outside = parent.join("outside");
+        tokio::fs::create_dir(&root).await.unwrap();
+        tokio::fs::create_dir(&outside).await.unwrap();
+        tokio::fs::write(outside.join("notes.md"), "x").await.unwrap();
+        let canonical_outside = tokio::fs::canonicalize(&outside).await.unwrap();
+        let verbatim = canonical_outside.to_string_lossy().into_owned();
+        let plain = verbatim
+            .strip_prefix(r"\\?\")
+            .expect("Windows canonical paths use the verbatim prefix");
+
+        for raw in [format!(r"/{plain}\notes.md"), format!(r"\{plain}\notes.md")] {
+            let call = ToolCallPayload {
+                tool: "os.fs.read".into(),
+                args: serde_json::json!({ "path": &raw }),
+            };
+            let prepared = prepare_call_paths(&call, &root, &[]).await.unwrap();
+
+            assert!(prepared.escaped_root, "{raw} must leave the workspace");
+            assert_eq!(
+                prepared.call.args["path"],
+                canonical_outside.join("notes.md").to_string_lossy().as_ref()
+            );
+        }
+
+        std::fs::remove_dir_all(parent).unwrap();
+    }
+
     #[tokio::test]
     async fn detects_parent_escape() {
         let parent = test_dir();
@@ -964,6 +1025,32 @@ mod tests {
             .unwrap();
         assert!(prepared.escaped_root);
 
+        std::fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[tokio::test]
+    async fn media_transcribe_maps_its_path_to_a_trusted_read_resource() {
+        let parent = test_dir();
+        let root = parent.join("workspace");
+        let attachments = parent.join("attachments");
+        tokio::fs::create_dir(&root).await.unwrap();
+        tokio::fs::create_dir(&attachments).await.unwrap();
+        let attachment = attachments.join("recording.mp3");
+        tokio::fs::write(&attachment, "fixture").await.unwrap();
+        let trusted_root = tokio::fs::canonicalize(&attachments).await.unwrap();
+        let call = ToolCallPayload {
+            tool: "os.media.transcribe".into(),
+            args: serde_json::json!({"path": attachment}),
+        };
+
+        let prepared = prepare_call_paths(&call, &root, std::slice::from_ref(&trusted_root))
+            .await
+            .unwrap();
+
+        assert!(!prepared.escaped_root);
+        assert_eq!(prepared.resources.len(), 1);
+        assert_eq!(prepared.resources[0].kind, "path");
+        assert_eq!(prepared.resources[0].operation, "read");
         std::fs::remove_dir_all(parent).unwrap();
     }
 

@@ -23,7 +23,11 @@ export function basenameNoExt(filePath: string): string {
   }
 
   // fallback: remove only the last extension
-  return base.slice(0, -path.extname(base).length)
+  const ext = path.extname(base)
+  if (ext) {
+    return base.slice(0, -ext.length)
+  }
+  return base
 }
 
 /**
@@ -76,11 +80,30 @@ export function getProviderLogo(provider: string) {
   switch (provider) {
     case 'jan':
       return '/images/model-provider/jan.png'
+    // Both engines the app starts, plus the `llama-server` the user starts and
+    // we merely connect to — same engine, so the same mark.
     case 'llamacpp':
     case 'llamacpp-upstream':
+    case 'llamacpp-server':
       return '/images/model-provider/llamacpp.svg'
+    // PrismML's own fork carries PrismML's mark, the one the Hub shows on
+    // Bonsai models (a monochrome mark, tinted to the text color).
+    case 'atomic-prism':
+      return '/images/model-provider/prism-ml.webp'
     case 'mlx':
       return '/images/model-provider/mlx.png'
+    // NVIDIA's own engine; the same mark as the NVIDIA NIM cloud provider.
+    case 'tensorrt-llm':
+      return '/images/model-provider/nvidia.svg'
+    case 'vllm':
+      return '/images/model-provider/vllm.svg'
+    // A monogram until there is an approved mark, like vLLM's (change add-sglang-runtime, D7).
+    case 'sglang':
+      return '/images/model-provider/sglang.svg'
+    // Our own mark in Fluent's palette (a chip with a spark): neither Microsoft's four-square logo
+    // nor the Foundry product icon, which are their trademarks (change add-foundry-local).
+    case 'foundry-local':
+      return '/images/model-provider/foundry-local.svg'
     case 'anthropic':
       return '/images/model-provider/anthropic.svg'
     case 'huggingface':
@@ -97,18 +120,41 @@ export function getProviderLogo(provider: string) {
       return '/images/model-provider/gemini.svg'
     case 'openai':
       return '/images/model-provider/openai.svg'
+    // Meta Model API — the same mark the Llama/Muse model families already use.
+    case 'meta':
+      return '/svg/meta-color.svg'
+    // The subscription is reached through the Codex backend, and the Codex app
+    // mark keeps it apart from the API-key OpenAI provider in the same list.
+    case 'chatgpt':
+      return '/images/model-provider/codex.svg'
     case 'azure':
       return '/images/model-provider/azure.svg'
     case 'xai':
       return '/images/model-provider/xai.svg'
+    // AUTOMATIC1111's own mark, @lobehub/icons-static-svg 1.95.1; Forge has none of its own.
+    case 'automatic1111':
+      return '/images/model-provider/automatic1111.svg'
+    // The project's cat, cropped from stable-diffusion.cpp's own assets/logo.png (leejet/stable-diffusion.cpp).
+    case 'sdcpp-server':
+      return '/images/model-provider/sdcpp-server.png'
     case 'minimax':
-      return '/images/model-provider/minimax.svg'
+      return '/svg/minimax.svg'
     case 'nvidia':
       return '/images/model-provider/nvidia.svg'
     case 'moonshot':
       return '/images/model-provider/moonshot.svg'
     case 'qwen':
       return '/images/model-provider/qwen.svg'
+    // The same whale mark the DeepSeek model family already resolves to via
+    // `model-logo.ts`, so the provider row and its models read as one brand.
+    case 'deepseek':
+      return '/svg/deepseek-color.svg'
+    // The brand's own file, cropped to the hexagon: its wordmark is white and
+    // would vanish on the light theme.
+    case 'aimlapi':
+      return '/images/model-provider/aimlapi.svg'
+    case 'edenai':
+      return '/images/model-provider/edenai.svg'
     case 'ollama':
       return '/images/model-provider/ollama.svg'
     default:
@@ -147,12 +193,15 @@ export const LOCAL_LLAMACPP_PROVIDER = 'llamacpp-upstream'
 export const LOCAL_LLAMACPP_EXTENSION_NAME = '@janhq/llamacpp-upstream-extension'
 
 /**
- * Returns true for either llamacpp provider id ('llamacpp' = turboquant,
- * 'llamacpp-upstream' = upstream ggml-org build). Both providers support
- * client-side token counting via their respective getTokensCount() methods.
+ * Returns true for every llamacpp provider id the app starts ('llamacpp' =
+ * turboquant, 'llamacpp-upstream' = upstream ggml-org build, 'atomic-prism' =
+ * PrismML's fork). Each supports client-side token counting via its own
+ * getTokensCount() method.
  */
 export const isLlamacppProvider = (provider: string) =>
-  provider === 'llamacpp' || provider === 'llamacpp-upstream'
+  provider === 'llamacpp' ||
+  provider === 'llamacpp-upstream' ||
+  provider === 'atomic-prism'
 
 export const getProviderTitle = (provider: string) => {
   switch (provider) {
@@ -163,13 +212,37 @@ export const getProviderTitle = (provider: string) => {
       // side-by-side with `llamacpp-upstream` (which stays the default),
       // so the `llamacpp` provider carries its real Turboquant name on
       // every platform.
-      return 'Llama.cpp Turboquant'
+      return 'llama.cpp turboquant'
     case 'llamacpp-upstream':
-      return 'Llama.cpp'
+      return 'llama.cpp'
+    // The PrismML fork: the engine Bonsai's PQ2_0 / PTQ1_0 files need.
+    case 'atomic-prism':
+      return 'PrismML llama.cpp'
+    // Named for what it is from here: a llama.cpp server the user runs and
+    // connects to, as opposed to the two engines the app starts itself.
+    case 'llamacpp-server':
+      return 'llama.cpp server'
+    case 'automatic1111':
+      return 'Automatic1111 / Forge'
+    case 'sdcpp-server':
+      return 'stable-diffusion.cpp server'
     case 'mlx':
       return 'MLX'
+    case 'tensorrt-llm':
+      return 'TensorRT-LLM'
+    case 'vllm':
+      return 'vLLM'
+    case 'sglang':
+      return 'SGLang'
+    case 'foundry-local':
+      return 'Foundry Local'
+    // The media engine, named on the engine-update banner. Not a chat provider.
+    case 'sd-cpp':
+      return 'stable-diffusion.cpp'
     case 'openai':
       return 'OpenAI'
+    case 'chatgpt':
+      return 'ChatGPT subscription (Codex)'
     case 'openrouter':
       return 'OpenRouter'
     case 'gemini':
@@ -186,6 +259,12 @@ export const getProviderTitle = (provider: string) => {
       return 'Moonshot'
     case 'qwen':
       return 'Qwen'
+    case 'deepseek':
+      return 'DeepSeek'
+    case 'aimlapi':
+      return 'AI/ML API'
+    case 'edenai':
+      return 'Eden AI'
     case 'ollama':
       return 'Ollama'
     default:

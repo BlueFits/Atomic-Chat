@@ -5,7 +5,18 @@ import { useGeneralSetting } from '@/hooks/useGeneralSetting'
 import { useModelProvider } from '@/hooks/useModelProvider'
 import { useServiceHub } from '@/hooks/useServiceHub'
 import { useTranslation } from '@/i18n'
-import { markDownloadCancellationRequested } from '@/lib/downloadCancellation'
+import { DeleteModelAction } from '@/containers/hub/DeleteModelAction'
+import { LargeModelWarningDialog } from '@/containers/hub/LargeModelWarningDialog'
+import {
+  isDownloadCancellationError,
+  markDownloadCancellationRequested,
+  wasDownloadCancellationRequested,
+} from '@/lib/downloadCancellation'
+import {
+  findInstalledLocalModel,
+  MLX_PROVIDER,
+  mlxModelIds,
+} from '@/lib/hub-installed'
 import { CatalogModel } from '@/services/models/types'
 import { cn } from '@/lib/utils'
 import { switchToModel } from '@/utils/switchModel'
@@ -16,7 +27,18 @@ import { toast } from 'sonner'
 import { useNavigate } from '@tanstack/react-router'
 
 export const MlxModelDownloadAction = memo(
-  ({ model }: { model: CatalogModel }) => {
+  ({
+    model,
+    deletable = false,
+    warnTooLarge = false,
+  }: {
+    model: CatalogModel
+    // Offer a trash button next to "New chat" once the repo is on disk.
+    deletable?: boolean
+    // The hardware-fit estimate calls this repo too large for the device:
+    // Download asks first instead of starting (see LargeModelWarningDialog).
+    warnTooLarge?: boolean
+  }) => {
     const serviceHub = useServiceHub()
     const { t } = useTranslation()
     const huggingfaceToken = useGeneralSetting(
@@ -25,7 +47,10 @@ export const MlxModelDownloadAction = memo(
 
     const navigate = useNavigate()
 
-    const [isDownloaded, setDownloaded] = useState(false)
+    // `justDownloaded` is set by the download-success event: the provider list
+    // is only re-listed a moment later, and the button must flip immediately.
+    const [justDownloaded, setDownloaded] = useState(false)
+    const [warningOpen, setWarningOpen] = useState(false)
 
     const {
       downloads,
@@ -35,6 +60,8 @@ export const MlxModelDownloadAction = memo(
       removeLocalDownloadingModel,
       markResumableDownload,
       clearResumableDownload,
+      setDownloadOrigin,
+      clearDownloadOrigin,
     } = useDownloadStore()
 
     // Construct the model ID - use just the sanitized model name if developer is same as org
@@ -61,25 +88,18 @@ export const MlxModelDownloadAction = memo(
     const downloadProgress =
       downloadProcesses.find((e) => e.id === modelId)?.progress || 0
 
-    // Get the actual downloaded model ID (with or without developer prefix)
-    const downloadedModelId = useMemo(() => {
-      const mlxProvider = useModelProvider.getState().getProviderByName('mlx')
-      const foundModel = mlxProvider?.models.find(
-        (m: { id: string }) =>
-          m.id === modelId || m.id === `${model.developer}/${modelId}`
-      )
-      return foundModel?.id || modelId
-    }, [modelId, model.developer])
+    // Read the MLX provider reactively so the row reflects a download or a
+    // deletion that happened elsewhere in the app.
+    const providers = useModelProvider((state) => state.providers)
+    const installed = useMemo(
+      () =>
+        findInstalledLocalModel(providers, mlxModelIds(model), [MLX_PROVIDER]),
+      [providers, model]
+    )
+    const isDownloaded = installed !== null || justDownloaded
 
-    // Check if MLX model is already downloaded
-    useEffect(() => {
-      const mlxProvider = useModelProvider.getState().getProviderByName('mlx')
-      const downloaded = mlxProvider?.models.some(
-        (m: { id: string }) =>
-          m.id === modelId || m.id === `${model.developer}/${modelId}`
-      )
-      setDownloaded(!!downloaded)
-    }, [modelId, model.developer])
+    // The id the engine registered (with or without the developer prefix).
+    const downloadedModelId = installed?.modelId ?? modelId
 
     // Listen for download success
     useEffect(() => {
@@ -124,6 +144,7 @@ export const MlxModelDownloadAction = memo(
     const handleDownloadMlxModel = useCallback(async () => {
       clearResumableDownload(modelId)
       addLocalDownloadingModel(modelId)
+      setDownloadOrigin(modelId, model.model_name, 'standalone')
 
       const modelPath = `${model.developer}/${modelName}`
       try {
@@ -182,6 +203,13 @@ export const MlxModelDownloadAction = memo(
         console.error('Error downloading MLX model:', error)
         markResumableDownload(modelId)
         removeLocalDownloadingModel(modelId)
+        clearDownloadOrigin(modelId)
+        if (
+          wasDownloadCancellationRequested(modelId) ||
+          isDownloadCancellationError(error)
+        ) {
+          return
+        }
         toast.error('Failed to download MLX model', {
           description: error instanceof Error ? error.message : 'Unknown error',
         })
@@ -193,11 +221,21 @@ export const MlxModelDownloadAction = memo(
       addLocalDownloadingModel,
       removeLocalDownloadingModel,
       clearResumableDownload,
+      setDownloadOrigin,
+      clearDownloadOrigin,
       markResumableDownload,
       resumableDownloads,
       modelId,
       modelName,
     ])
+
+    const requestDownload = useCallback(() => {
+      if (warnTooLarge) {
+        setWarningOpen(true)
+        return
+      }
+      void handleDownloadMlxModel()
+    }, [warnTooLarge, handleDownloadMlxModel])
 
     const handleCancelDownload = useCallback(() => {
       markResumableDownload(modelId)
@@ -231,25 +269,42 @@ export const MlxModelDownloadAction = memo(
           </Button>
         )}
         {isDownloaded ? (
-          <Button
-            variant="default"
-            size="sm"
-            onClick={handleUseModel}
-            data-test-id={`hub-model-${modelId}`}
-          >
-            {t('hub:newChat')}
-          </Button>
+          <div className="flex shrink-0 items-center gap-1">
+            <Button
+              variant="default"
+              size="sm"
+              onClick={handleUseModel}
+              data-test-id={`hub-model-${modelId}`}
+            >
+              {t('hub:newChat')}
+            </Button>
+            {deletable && installed && (
+              <DeleteModelAction
+                modelId={installed.modelId}
+                provider={installed.provider}
+                onDeleted={() => setDownloaded(false)}
+              />
+            )}
+          </div>
         ) : (
           <Button
             data-test-id={`hub-model-${modelId}`}
-            variant="outline"
+            variant="default"
             size="sm"
-            onClick={handleDownloadMlxModel}
+            onClick={requestDownload}
             className={cn(isDownloading && 'hidden')}
           >
             {t('hub:download')}
           </Button>
         )}
+        <LargeModelWarningDialog
+          open={warningOpen}
+          onOpenChange={setWarningOpen}
+          onConfirm={() => {
+            setWarningOpen(false)
+            void handleDownloadMlxModel()
+          }}
+        />
       </div>
     )
   }

@@ -11,14 +11,7 @@
  *   - Platform filter helper (`filterRecommendationsForPlatform`).
  */
 
-import {
-  afterEach,
-  beforeEach,
-  describe,
-  expect,
-  it,
-  vi,
-} from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 vi.mock('@tauri-apps/plugin-http', () => ({
   fetch: vi.fn(),
@@ -31,10 +24,15 @@ import {
   getCachedManifest,
   getRecommendationsOrFallback,
   isCacheFresh,
+  selectTierRecommendations,
   SUPPORTED_SCHEMA_VERSION,
   type Recommendation,
 } from '../recommended-models-registry'
-import { BASELINE_RECOMMENDED_MODELS } from '@/constants/models'
+import {
+  BASELINE_RECOMMENDED_MODELS,
+  BASELINE_TIER_RECOMMENDATIONS,
+} from '@/constants/models'
+import { HARDWARE_TIERS } from '@/lib/hardware-tier'
 
 const REMOTE_URL = 'https://example.test/recommended.json'
 
@@ -207,10 +205,7 @@ describe('recommended-models-registry loader', () => {
 
     // Backdate the cache so isCacheFresh returns false.
     const tsKey = 'jan_recommended_models_cache_ts_v1'
-    window.localStorage.setItem(
-      tsKey,
-      String(Date.now() - CACHE_TTL_MS - 1000)
-    )
+    window.localStorage.setItem(tsKey, String(Date.now() - CACHE_TTL_MS - 1000))
 
     const cached = getCachedManifest()
     expect(isCacheFresh(cached)).toBe(false)
@@ -280,6 +275,240 @@ describe('filterRecommendationsForPlatform', () => {
         (r) => r.model_name
       )
       expect(names).not.toContain('disabled/everywhere')
+    }
+  })
+})
+
+describe('per-tier recommendations and quant pins', () => {
+  beforeEach(() => {
+    clearRegistryCache()
+  })
+
+  afterEach(() => {
+    vi.restoreAllMocks()
+  })
+
+  const tieredManifest = () =>
+    buildManifest({
+      tiers: {
+        unified_8: [
+          {
+            model_name: 'LiquidAI/LFM2.5-2.6B-GGUF',
+            description_key: 'hub:recEverydayUse',
+            quant: 'Q4_K_M',
+          },
+        ],
+        vram_64_plus: [
+          {
+            model_name: 'unsloth/gemma-4-12B-it-qat-GGUF',
+            description_key: 'hub:recVisionKnowledge',
+            quant: 'Q4_K_XL',
+            mmproj_quant: 'F16',
+          },
+        ],
+      },
+    })
+
+  it('carries the tier lists and their quant pins through a fetch', async () => {
+    mockFetchSuccess(tieredManifest())
+
+    const result = await getRecommendationsOrFallback({ url: REMOTE_URL })
+
+    expect(result.tiers.unified_8?.map((r) => r.model_name)).toEqual([
+      'LiquidAI/LFM2.5-2.6B-GGUF',
+    ])
+    expect(result.tiers.vram_64_plus?.[0].quant).toBe('Q4_K_XL')
+    expect(result.tiers.vram_64_plus?.[0].mmproj_quant).toBe('F16')
+  })
+
+  it('survives the cache round-trip', async () => {
+    mockFetchSuccess(tieredManifest())
+    await getRecommendationsOrFallback({ url: REMOTE_URL })
+
+    const cached = getCachedManifest()
+    expect(cached?.manifest.tiers?.vram_64_plus?.[0].quant).toBe('Q4_K_XL')
+  })
+
+  it('reports no tier lists when the manifest has none', async () => {
+    mockFetchSuccess(buildManifest())
+
+    const result = await getRecommendationsOrFallback({ url: REMOTE_URL })
+
+    expect(result.tiers).toEqual({})
+  })
+
+  it('drops keys that are not tiers this build knows about', async () => {
+    // The tier vocabulary is a release-time contract. A manifest written for a
+    // newer one must leave this client on its bundled ladder, not on a rung it
+    // cannot interpret.
+    mockFetchSuccess(
+      buildManifest({
+        tiers: {
+          unified_8: [
+            {
+              model_name: 'LiquidAI/LFM2.5-2.6B-GGUF',
+              description_key: 'hub:recEverydayUse',
+            },
+          ],
+          npu_42: [
+            {
+              model_name: 'Someone/Future-GGUF',
+              description_key: 'hub:recEverydayUse',
+            },
+          ],
+        },
+      })
+    )
+
+    const result = await getRecommendationsOrFallback({ url: REMOTE_URL })
+
+    expect(Object.keys(result.tiers)).toEqual(['unified_8'])
+  })
+
+  it('drops quant pins that are not plain quant tokens', async () => {
+    // These are used to pick a file to download, so a malformed manifest must
+    // not be able to smuggle a value through.
+    mockFetchSuccess(
+      buildManifest({
+        tiers: {
+          vram_4: [
+            {
+              model_name: 'LiquidAI/LFM2.5-2.6B-GGUF',
+              description_key: 'hub:recEverydayUse',
+              quant: '../../etc/passwd',
+            },
+            {
+              model_name: 'LiquidAI/Other-GGUF',
+              description_key: 'hub:recEverydayUse',
+              quant: 12345,
+            },
+          ],
+        },
+      })
+    )
+
+    const result = await getRecommendationsOrFallback({ url: REMOTE_URL })
+
+    expect(result.tiers.vram_4).toHaveLength(2)
+    expect(result.tiers.vram_4?.[0].quant).toBeUndefined()
+    expect(result.tiers.vram_4?.[1].quant).toBeUndefined()
+  })
+
+  it('normalises a lowercase pin to upper case', async () => {
+    mockFetchSuccess(
+      buildManifest({
+        tiers: {
+          vram_4: [
+            {
+              model_name: 'LiquidAI/LFM2.5-2.6B-GGUF',
+              description_key: 'hub:recEverydayUse',
+              quant: 'q4_k_m',
+            },
+          ],
+        },
+      })
+    )
+
+    const result = await getRecommendationsOrFallback({ url: REMOTE_URL })
+
+    expect(result.tiers.vram_4?.[0].quant).toBe('Q4_K_M')
+  })
+
+  it('ignores the superseded low-spec list without choking on it', async () => {
+    // It stays in the published manifest for clients shipped before `tiers`
+    // existed. This client must read past it, not fail on it.
+    mockFetchSuccess(
+      buildManifest({
+        low_spec_recommendations: [
+          {
+            model_name: 'LiquidAI/LFM2.5-VL-450M-GGUF',
+            description_key: 'hub:recVisionKnowledge',
+            quant: 'Q8_0',
+          },
+        ],
+      })
+    )
+
+    const result = await getRecommendationsOrFallback({ url: REMOTE_URL })
+
+    expect(result.source).toBe('remote')
+    expect(result.recommendations).toHaveLength(2)
+    expect(result.tiers).toEqual({})
+  })
+
+  it('loads cleanly when the manifest carries an unknown top-level key', async () => {
+    // The v1-compatibility contract: this is exactly how a client built before
+    // `tiers` existed sees the new manifest.
+    mockFetchSuccess(buildManifest({ some_future_key: { anything: true } }))
+
+    const result = await getRecommendationsOrFallback({ url: REMOTE_URL })
+
+    expect(result.source).toBe('remote')
+    expect(result.recommendations).toHaveLength(2)
+  })
+
+  it('falls back to the bundled baseline with no tier overrides', async () => {
+    const fetchMock = vi.fn(async () => {
+      throw new Error('offline')
+    })
+    vi.stubGlobal('fetch', fetchMock)
+
+    const result = await getRecommendationsOrFallback({ url: REMOTE_URL })
+
+    expect(result.source).toBe('baseline')
+    expect(result.recommendations.map((r) => r.model_name)).toEqual(
+      BASELINE_RECOMMENDED_MODELS.map((r) => r.model_name)
+    )
+    // Empty rather than a copy of the ladder: `selectTierRecommendations` is
+    // where the bundled ladder is applied, per tier, so a partial manifest can
+    // override one rung and inherit the rest.
+    expect(result.tiers).toEqual({})
+  })
+})
+
+describe('selectTierRecommendations', () => {
+  const override: Recommendation[] = [
+    {
+      model_name: 'Someone/Override-GGUF',
+      description_key: 'hub:recEverydayUse',
+    },
+  ]
+
+  it('prefers the manifest entry for that tier', () => {
+    expect(
+      selectTierRecommendations({ unified_16: override }, 'unified_16').map(
+        (r) => r.model_name
+      )
+    ).toEqual(['Someone/Override-GGUF'])
+  })
+
+  it('falls back per tier, not wholesale', () => {
+    // A manifest that overrides one rung must leave every other rung on the
+    // bundled ladder rather than emptying the picker.
+    expect(
+      selectTierRecommendations({ unified_16: override }, 'cpu_only').map(
+        (r) => r.model_name
+      )
+    ).toEqual(BASELINE_TIER_RECOMMENDATIONS.cpu_only.map((r) => r.model_name))
+  })
+
+  it('falls back to the bundled ladder when there are no tier lists at all', () => {
+    for (const tier of HARDWARE_TIERS) {
+      expect(selectTierRecommendations(undefined, tier)).toEqual(
+        BASELINE_TIER_RECOMMENDATIONS[tier]
+      )
+    }
+  })
+
+  it('treats an empty tier list as absent', () => {
+    expect(selectTierRecommendations({ vram_8: [] }, 'vram_8')).toEqual(
+      BASELINE_TIER_RECOMMENDATIONS.vram_8
+    )
+  })
+
+  it('has a bundled entry for every tier, so no machine gets an empty picker', () => {
+    for (const tier of HARDWARE_TIERS) {
+      expect(BASELINE_TIER_RECOMMENDATIONS[tier].length).toBeGreaterThan(0)
     }
   })
 })

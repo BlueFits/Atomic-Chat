@@ -1,5 +1,6 @@
 import { IconSettings } from '@tabler/icons-react'
 import debounce from 'lodash.debounce'
+import { useEffect, useMemo } from 'react'
 
 import {
   Sheet,
@@ -15,53 +16,55 @@ import { useModelProvider } from '@/hooks/useModelProvider'
 import { useServiceHub } from '@/hooks/useServiceHub'
 import { cn, getModelDisplayName } from '@/lib/utils'
 import { useTranslation } from '@/i18n/react-i18next-compat'
-import { syncActiveModelsFromEngines } from '@/utils/activeModelsSync'
+import {
+  LEGACY_SAMPLING_KEYS,
+  RESTART_REQUIRED_SETTINGS,
+} from '@/lib/model-settings-defaults'
+import { restartLocalModel } from '@/utils/restartLocalModel'
 
 type ModelSettingProps = {
   provider: ProviderObject
   model: Model
 }
 
-// Sampling parameters are edited globally in the Sampling popover; their
-// legacy load-time twins under `model.settings.*` are hidden from this gear
-// to avoid two competing sources of truth. Data on disk is preserved.
-const LEGACY_SAMPLING_KEYS = new Set<string>([
-  'temperature',
-  'top_p',
-  'top_k',
-  'min_p',
-  'repeat_penalty',
-  'repeat_last_n',
-  'presence_penalty',
-  'frequency_penalty',
-])
+type ModelSettingsListProps = ModelSettingProps & {
+  /** Settings already surfaced elsewhere by the host (e.g. `ctx_len`). */
+  excludeKeys?: string[]
+  className?: string
+}
 
-export function ModelSetting({
+/**
+ * The model's load-time settings as a plain list of controls, shared by the
+ * providers page gear sheet and the chat's Run settings panel. Restart-worthy
+ * changes restart the model when it is loaded.
+ */
+export function ModelSettingsList({
   model,
   provider,
-}: ModelSettingProps) {
+  excludeKeys = [],
+  className,
+}: ModelSettingsListProps) {
   const { updateProvider } = useModelProvider()
-  const { t } = useTranslation()
   const serviceHub = useServiceHub()
 
-  // Create a debounced version that stops and restarts the model with updated settings
-  const debouncedRestartModel = debounce(async (modelId: string, providerName: string) => {
-    try {
-      await serviceHub.models().stopModel(modelId)
+  const debouncedRestartModel = useMemo(
+    () =>
+      debounce(async (modelId: string, providerName: string) => {
+        try {
+          await restartLocalModel(serviceHub, providerName, modelId)
+        } catch (error) {
+          console.error('Failed to restart model after settings change:', error)
+        }
+      }, 500),
+    [serviceHub]
+  )
 
-      const freshProvider = useModelProvider.getState().getProviderByName(providerName)
-      if (freshProvider) {
-        await serviceHub.models().startModel(freshProvider, modelId, true)
-      }
-
-      const models = await serviceHub.models().getActiveModels()
-      // Preserve any active cloud model from the UI state so the restart
-      // of a local model's settings doesn't clear it.
-      syncActiveModelsFromEngines(models || [])
-    } catch (error) {
-      console.error('Failed to restart model after settings change:', error)
-    }
-  }, 500)
+  useEffect(
+    () => () => {
+      debouncedRestartModel.cancel()
+    },
+    [debouncedRestartModel]
+  )
 
   const handleSettingChange = (
     key: string,
@@ -69,15 +72,23 @@ export function ModelSetting({
   ) => {
     if (!provider) return
 
-    // Create a copy of the model with updated settings
+    const freshProvider =
+      useModelProvider.getState().getProviderByName(provider.provider) ??
+      provider
+    const freshModel =
+      freshProvider.models.find((candidate) => candidate.id === model.id) ??
+      model
+
     const updatedModel = {
-      ...model,
+      ...freshModel,
       settings: {
-        ...model.settings,
+        ...freshModel.settings,
         [key]: {
-          ...(model.settings?.[key] != null ? model.settings?.[key] : {}),
+          ...(freshModel.settings?.[key] != null
+            ? freshModel.settings?.[key]
+            : {}),
           controller_props: {
-            ...(model.settings?.[key]?.controller_props ?? {}),
+            ...(freshModel.settings?.[key]?.controller_props ?? {}),
             value: value,
           },
         },
@@ -85,43 +96,107 @@ export function ModelSetting({
     }
 
     // Find the model index in the provider's models array
-    const modelIndex = provider.models.findIndex((m) => m.id === model.id)
+    const modelIndex = freshProvider.models.findIndex((m) => m.id === model.id)
 
     if (modelIndex !== -1) {
       // Create a copy of the provider's models array
-      const updatedModels = [...provider.models]
+      const updatedModels = [...freshProvider.models]
 
       // Update the specific model in the array
       updatedModels[modelIndex] = updatedModel as Model
 
       // Update the provider with the new models array
-      updateProvider(provider.provider, {
+      updateProvider(freshProvider.provider, {
         models: updatedModels,
       })
 
-      // Call debounced stopModel only when updating ctx_len, ngl, chat_template, or offload_mmproj
-      // and only if the model is currently running
-      if (
-        key === 'ctx_len' ||
-        key === 'ngl' ||
-        key === 'chat_template' ||
-        key === 'offload_mmproj' ||
-        key === 'batch_size' ||
-        key === 'cpu_moe' ||
-        key === 'n_cpu_moe'
-      ) {
+      if (RESTART_REQUIRED_SETTINGS.has(key)) {
         // Check if model is running before restarting it with new settings
         serviceHub
           .models()
-          .getActiveModels()
+          .getActiveModels(freshProvider.provider)
           .then((activeModels) => {
             if (activeModels.includes(model.id)) {
-              debouncedRestartModel(model.id, provider.provider)
+              debouncedRestartModel(model.id, freshProvider.provider)
             }
           })
       }
     }
   }
+
+  const excluded = new Set(excludeKeys)
+
+  return (
+    <div className={cn('space-y-8', className)}>
+      {Object.entries(model.settings || {})
+        .reduce<[string, unknown][]>((acc, entry) => {
+          if (entry[0] === 'auto_increase_ctx_len') return acc
+          if (entry[0] === 'ctx_len') {
+            const autoIncrease = Object.entries(model.settings || {}).find(
+              ([k]) => k === 'auto_increase_ctx_len'
+            )
+            if (autoIncrease) acc.push(autoIncrease)
+          }
+          acc.push(entry)
+          return acc
+        }, [])
+        .filter(([key]) => {
+          if (excluded.has(key)) return false
+          // Sampling lives solely in the Run settings panel. Hide the legacy
+          // load-time sampling controls here so there is exactly one place
+          // to tune sampling. The persisted `model.settings.*` values are
+          // left untouched on disk.
+          if (LEGACY_SAMPLING_KEYS.has(key)) return false
+          // MLX loads with a context size and honours the auto-increase
+          // ladder; nothing else in a model's settings reaches it. The
+          // ladder's checkbox used to be filtered out here, so an MLX user
+          // could not turn it off (ATO-466).
+          if (provider.provider === 'mlx') {
+            return key === 'ctx_len' || key === 'auto_increase_ctx_len'
+          }
+          return true
+        })
+        .map(([key, value]) => {
+          const config = value as ProviderSetting
+          return (
+            <div key={key} className="space-y-2">
+              <div
+                className={cn(
+                  'flex items-start justify-between gap-8',
+                  (key === 'chat_template' ||
+                    key === 'override_tensor_buffer_t') &&
+                    'flex-col gap-1 w-full'
+                )}
+              >
+                <div className="mb-1 truncate">
+                  <span title={config.title} className="font-medium">
+                    {config.title}
+                  </span>
+                </div>
+                <DynamicControllerSetting
+                  key={config.key}
+                  title={config.title}
+                  description={config.description}
+                  controllerType={config.controller_type}
+                  controllerProps={{
+                    ...config.controller_props,
+                    value: config.controller_props?.value,
+                  }}
+                  onChange={(newValue) => handleSettingChange(key, newValue)}
+                />
+              </div>
+              <p className="text-muted-foreground leading-normal text-xs">
+                {config.description}
+              </p>
+            </div>
+          )
+        })}
+    </div>
+  )
+}
+
+export function ModelSetting({ model, provider }: ModelSettingProps) {
+  const { t } = useTranslation()
 
   return (
     <Sheet>
@@ -137,70 +212,16 @@ export function ModelSetting({
               modelId: getModelDisplayName(model),
             })}
           </SheetTitle>
-          <SheetDescription className='text-xs leading-normal'>
+          <SheetDescription className="text-xs leading-normal">
             {t('common:modelSettings.description')}
           </SheetDescription>
         </SheetHeader>
 
-        <div className="px-4 space-y-8 pb-4">
-          {Object.entries(model.settings || {})
-          .reduce<[string, unknown][]>((acc, entry) => {
-            if (entry[0] === 'auto_increase_ctx_len') return acc
-            if (entry[0] === 'ctx_len') {
-              const autoIncrease = Object.entries(model.settings || {}).find(
-                ([k]) => k === 'auto_increase_ctx_len'
-              )
-              if (autoIncrease) acc.push(autoIncrease)
-            }
-            acc.push(entry)
-            return acc
-          }, [])
-          .filter(([key]) => {
-            // Sampling now lives solely in the global Sampling popover
-            // (model bar). Hide the legacy load-time sampling controls here
-            // so there is exactly one place to tune sampling. The persisted
-            // `model.settings.*` values are left untouched on disk.
-            if (LEGACY_SAMPLING_KEYS.has(key)) return false
-            // MLX models only support context size setting
-            if (provider.provider === 'mlx') {
-              return key === 'ctx_len'
-            }
-            return true
-          })
-          .map(([key, value]) => {
-            const config = value as ProviderSetting
-            return (
-              <div key={key} className="space-y-2">
-                <div
-                  className={cn(
-                    'flex items-start justify-between gap-8',
-                    (key === 'chat_template' ||
-                      key === 'override_tensor_buffer_t') &&
-                      'flex-col gap-1 w-full'
-                  )}
-                >
-                  <div className="mb-1 truncate">
-                    <span title={config.title} className="font-medium">{config.title}</span>
-                  </div>
-                  <DynamicControllerSetting
-                    key={config.key}
-                    title={config.title}
-                    description={config.description}
-                    controllerType={config.controller_type}
-                    controllerProps={{
-                      ...config.controller_props,
-                      value: config.controller_props?.value,
-                    }}
-                    onChange={(newValue) => handleSettingChange(key, newValue)}
-                  />
-                </div>
-                <p className="text-muted-foreground leading-normal text-xs">
-                  {config.description}
-                </p>
-              </div>
-            )
-          })}
-        </div>
+        <ModelSettingsList
+          model={model}
+          provider={provider}
+          className="px-4 pb-4"
+        />
       </SheetContent>
     </Sheet>
   )

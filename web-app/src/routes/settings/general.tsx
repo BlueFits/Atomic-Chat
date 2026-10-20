@@ -1,10 +1,5 @@
 import { createFileRoute } from '@tanstack/react-router'
-import { invoke } from '@tauri-apps/api/core'
-import {
-  enable as enableAutostart,
-  disable as disableAutostart,
-  isEnabled as isAutostartEnabled,
-} from '@tauri-apps/plugin-autostart'
+import { isEnabled as isAutostartEnabled } from '@tauri-apps/plugin-autostart'
 import { route } from '@/constants/routes'
 import SettingsMenu from '@/containers/SettingsMenu'
 import HeaderPage from '@/containers/HeaderPage'
@@ -21,12 +16,14 @@ import ChangeDataFolderLocation from '@/containers/dialogs/ChangeDataFolderLocat
 import LocalModelLocationsCard from '@/containers/LocalModelLocationsCard'
 import { FactoryResetDialog } from '@/containers/dialogs'
 import { useServiceHub } from '@/hooks/useServiceHub'
+import { useExportLogs } from '@/hooks/useExportLogs'
 import {
   IconBrandDiscord,
   IconBrandGithub,
   IconExternalLink,
   IconFolder,
   IconLogs,
+  IconDownload,
   IconCopy,
   IconCopyCheck,
 } from '@tabler/icons-react'
@@ -39,17 +36,10 @@ import LanguageSwitcher from '@/containers/LanguageSwitcher'
 import { isRootDir } from '@/utils/path'
 import { useAnalytic } from '@/hooks/useAnalytic'
 import posthog from 'posthog-js'
+import { setLaunchAtStartup } from '@/lib/launchAtStartup'
+import { PlatformFeatures } from '@/lib/platform/const'
+import { PlatformFeature } from '@/lib/platform/types'
 const TOKEN_VALIDATION_TIMEOUT_MS = 10_000
-const ATOMIC_CLI_COMMAND = 'atomic-chat-cli'
-
-function formatAtomicCliDisplayPath(path: string): string {
-  if (/[/\\]jan\.exe$/i.test(path)) {
-    return path.replace(/jan\.exe$/i, 'atomic-chat-cli.exe')
-  }
-  return path.replace(/[/\\]jan$/, (segment) =>
-    segment.replace(/jan$/, ATOMIC_CLI_COMMAND)
-  )
-}
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 export const Route = createFileRoute(route.settings.general as any)({
@@ -65,6 +55,8 @@ function General() {
     setHuggingfaceToken,
     preloadModelOnStartup,
     setPreloadModelOnStartup,
+    legacyChatEngine,
+    setLegacyChatEngine,
     reasoningBudget,
     setReasoningBudget,
   } = useGeneralSetting()
@@ -81,6 +73,7 @@ function General() {
     (state) => state.setGloballyEnabled
   )
   const serviceHub = useServiceHub()
+  const { exportLogs, exporting: exportingLogs } = useExportLogs()
   const { setProductAnalytic, productAnalytic } = useAnalytic()
 
   const openFileTitle = (): string => {
@@ -100,10 +93,9 @@ function General() {
   const [isDialogOpen, setIsDialogOpen] = useState(false)
   const [isCheckingUpdate, setIsCheckingUpdate] = useState(false)
   const [isValidatingToken, setIsValidatingToken] = useState(false)
-  const [cliInstalled, setCliInstalled] = useState<boolean | null>(null)
-  const [cliPath, setCliPath] = useState<string | null>(null)
-  const [isCliLoading, setIsCliLoading] = useState(false)
   const [autostartEnabled, setAutostartEnabled] = useState<boolean | null>(null)
+  const [coreVersion, setCoreVersion] = useState<string | undefined>()
+  const canManageAutostart = IS_TAURI && !isDev()
 
   useEffect(() => {
     const fetchDataFolder = async () => {
@@ -115,75 +107,38 @@ function General() {
   }, [serviceHub])
 
   useEffect(() => {
-    if (!IS_TAURI) return
-    invoke<{ installed: boolean; path: string | null }>(
-      'check_jan_cli_installed'
-    )
-      .then((s) => {
-        setCliInstalled(s.installed)
-        setCliPath(s.path)
+    let cancelled = false
+    serviceHub
+      .app()
+      .getCoreVersion()
+      .then((version) => {
+        if (!cancelled) setCoreVersion(version)
       })
-      .catch(() => setCliInstalled(false))
-  }, [])
+    return () => {
+      cancelled = true
+    }
+  }, [serviceHub])
 
   useEffect(() => {
-    if (!IS_TAURI) return
+    if (!canManageAutostart) return
     isAutostartEnabled()
       .then(setAutostartEnabled)
       .catch(() => setAutostartEnabled(false))
-  }, [])
+  }, [canManageAutostart])
 
   const handleToggleAutostart = useCallback(
     async (next: boolean) => {
+      if (!canManageAutostart) return
       try {
-        if (next) {
-          await enableAutostart()
-        } else {
-          await disableAutostart()
-        }
-        setAutostartEnabled(await isAutostartEnabled())
+        setAutostartEnabled(await setLaunchAtStartup(serviceHub.app(), next))
       } catch (error) {
         console.error('Failed to toggle launch at startup:', error)
         toast.error(t('settings:general.launchAtStartupError'))
         setAutostartEnabled(await isAutostartEnabled().catch(() => !next))
       }
     },
-    [t]
+    [canManageAutostart, serviceHub, t]
   )
-
-  const handleInstallCli = async () => {
-    setIsCliLoading(true)
-    try {
-      const s = await invoke<{ installed: boolean; path: string | null }>(
-        'install_jan_cli'
-      )
-      setCliInstalled(s.installed)
-      setCliPath(s.path)
-      toast.success(
-        t('settings:general.atomicBotCliInstalledToast', {
-          path: s.path ? formatAtomicCliDisplayPath(s.path) : ATOMIC_CLI_COMMAND,
-        })
-      )
-    } catch (e) {
-      toast.error('Install failed', { description: String(e) })
-    } finally {
-      setIsCliLoading(false)
-    }
-  }
-
-  const handleUninstallCli = async () => {
-    setIsCliLoading(true)
-    try {
-      await invoke('uninstall_jan_cli')
-      setCliInstalled(false)
-      setCliPath(null)
-      toast.success('Atomic Bot CLI uninstalled')
-    } catch (e) {
-      toast.error('Uninstall failed', { description: String(e) })
-    } finally {
-      setIsCliLoading(false)
-    }
-  }
 
   const resetApp = async () => {
     // Prevent resetting if data folder is root directory
@@ -246,10 +201,15 @@ function General() {
             setIsDialogOpen(false)
           } catch (error) {
             console.error(error)
+            // A refused command arrives as the string Rust returned, which says
+            // what went wrong (no permission, no space, a folder inside the
+            // current one); only something else falls back to the general text.
             toast.error(
               error instanceof Error
                 ? error.message
-                : t('settings:general.failedToRelocateDataFolder')
+                : typeof error === 'string' && error
+                  ? error
+                  : t('settings:general.failedToRelocateDataFolder')
             )
           }
         }, 1000)
@@ -315,6 +275,16 @@ function General() {
                   </span>
                 }
               />
+              {coreVersion && (
+                <CardItem
+                  title={t('settings:general.coreVersion')}
+                  actions={
+                    <span className="text-foreground font-medium">
+                      v{coreVersion}
+                    </span>
+                  }
+                />
+              )}
               {!AUTO_UPDATER_DISABLED && (
                 <CardItem
                   title={t('settings:general.checkForUpdates')}
@@ -338,7 +308,7 @@ function General() {
                 title={t('common:language')}
                 actions={<LanguageSwitcher />}
               />
-              {IS_TAURI && (
+              {canManageAutostart && (
                 <CardItem
                   title={t('settings:general.launchAtStartup')}
                   description={t('settings:general.launchAtStartupDesc')}
@@ -351,6 +321,16 @@ function General() {
                   }
                 />
               )}
+              <CardItem
+                title={t('settings:general.preloadModelOnStartup')}
+                description={t('settings:general.preloadModelOnStartupDesc')}
+                actions={
+                  <Switch
+                    checked={preloadModelOnStartup}
+                    onCheckedChange={setPreloadModelOnStartup}
+                  />
+                }
+              />
             </Card>
 
             <Card title="Contact Us">
@@ -434,6 +414,20 @@ function General() {
                   />
                 }
               />
+              {/* Only meaningful next to Agent mode: with it hidden every
+                  turn already runs on the chat pipeline. */}
+              {PlatformFeatures[PlatformFeature.AGENT_MODE] && (
+                <CardItem
+                  title={t('settings:chatBehavior.legacyChatEngine')}
+                  description={t('settings:chatBehavior.legacyChatEngineDesc')}
+                  actions={
+                    <Switch
+                      checked={legacyChatEngine}
+                      onCheckedChange={setLegacyChatEngine}
+                    />
+                  }
+                />
+              )}
             </Card>
 
             {/* Privacy / Analytics */}
@@ -559,7 +553,7 @@ function General() {
                 description={t('settings:dataFolder.appLogsDesc')}
                 className="items-start flex-row gap-y-2"
                 actions={
-                  <div className="flex items-center gap-2">
+                  <div className="flex flex-wrap items-center gap-2">
                     <Button
                       variant="outline"
                       size="sm"
@@ -591,6 +585,19 @@ function General() {
                       <IconLogs size={12} className="text-muted-foreground" />
                       <span>{t('settings:general.openLogs')}</span>
                     </Button>
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      onClick={() => void exportLogs()}
+                      disabled={exportingLogs}
+                      title={t('settings:general.exportLogs')}
+                    >
+                      <IconDownload
+                        size={12}
+                        className="text-muted-foreground"
+                      />
+                      <span>{t('settings:general.exportLogs')}</span>
+                    </Button>
                   </div>
                 }
               />
@@ -601,39 +608,6 @@ function General() {
 
             {/* Advanced - Desktop only */}
             <Card title="Advanced">
-              {IS_TAURI && (
-                <CardItem
-                  title={t('settings:general.atomicBotCliTitle')}
-                  description={
-                    cliInstalled && cliPath
-                      ? t('settings:general.atomicBotCliInstalled', {
-                          path: formatAtomicCliDisplayPath(cliPath),
-                        })
-                      : t('settings:general.atomicBotCliNotInstalled')
-                  }
-                  actions={
-                    cliInstalled ? (
-                      <Button
-                        variant="outline"
-                        size="sm"
-                        onClick={handleUninstallCli}
-                        disabled={isCliLoading || cliInstalled === null}
-                      >
-                        {isCliLoading ? 'Uninstalling…' : 'Uninstall'}
-                      </Button>
-                    ) : (
-                      <Button
-                        variant="secondary"
-                        size="sm"
-                        onClick={handleInstallCli}
-                        disabled={isCliLoading || cliInstalled === null}
-                      >
-                        {isCliLoading ? 'Installing…' : 'Install'}
-                      </Button>
-                    )
-                  }
-                />
-              )}
               <CardItem
                 title={t('settings:others.resetFactory', {
                   ns: 'settings',
@@ -668,18 +642,8 @@ function General() {
                 }
               />
               <CardItem
-                title="Preload last used model on startup"
-                description="Start the local inference server with your last model when the app opens."
-                actions={
-                  <Switch
-                    checked={preloadModelOnStartup}
-                    onCheckedChange={setPreloadModelOnStartup}
-                  />
-                }
-              />
-              <CardItem
-                title="Reasoning budget (local models)"
-                description="Limits thinking tokens for llama.cpp / MLX. Off disables reasoning entirely."
+                title="Thinking effort (local models)"
+                description="Default effort for llama.cpp / MLX, also shown next to the chat input. Models with their own effort setting receive that; the rest get a thinking-token budget. Off disables thinking entirely."
                 actions={
                   <select
                     className="border-input bg-background rounded-md border px-2 py-1 text-sm"
@@ -691,10 +655,11 @@ function General() {
                     }
                   >
                     <option value="off">Off</option>
-                    <option value="low">Low (256)</option>
-                    <option value="medium">Medium (1024)</option>
-                    <option value="high">High (4096)</option>
-                    <option value="unlimited">Unlimited</option>
+                    <option value="low">Low (256 tokens)</option>
+                    <option value="medium">Medium (1024 tokens)</option>
+                    <option value="high">High (4096 tokens)</option>
+                    <option value="xhigh">Extra High (8192 tokens)</option>
+                    <option value="max">Max (no limit)</option>
                   </select>
                 }
               />
@@ -779,7 +744,7 @@ function General() {
               />
             </Card>
 
-            {/* Resources — закомментировано */}
+            {/* Resources — commented out */}
             {false && (
               <Card title={t('settings:general.resources')}>
                 <CardItem
@@ -817,7 +782,7 @@ function General() {
               </Card>
             )}
 
-            {/* Community — закомментировано */}
+            {/* Community — commented out */}
             {false && (
               <Card title={t('settings:general.community')}>
                 <CardItem
@@ -855,7 +820,7 @@ function General() {
               </Card>
             )}
 
-            {/* Support — закомментировано */}
+            {/* Support — commented out */}
             {false && (
               <Card title={t('settings:general.support')}>
                 <CardItem
@@ -876,7 +841,7 @@ function General() {
               </Card>
             )}
 
-            {/* Credits — закомментировано */}
+            {/* Credits — commented out */}
             {false && (
               <Card title={t('settings:general.credits')}>
                 <CardItem

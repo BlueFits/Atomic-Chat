@@ -4,7 +4,13 @@
 
 import { MCPTool, MCPToolCallResult } from '@janhq/core'
 import type { MCPServerConfig } from '@/hooks/useMCPServers'
-import type { MCPService, MCPConfig, ToolCallWithCancellationResult } from './types'
+import type {
+  MCPService,
+  MCPConfig,
+  MCPServerStatus,
+  MCPToolsResponse,
+  ToolCallWithCancellationResult,
+} from './types'
 
 export class DefaultMCPService implements MCPService {
   async updateMCPConfig(configs: string): Promise<void> {
@@ -24,7 +30,15 @@ export class DefaultMCPService implements MCPService {
     return []
   }
 
+  async getToolsWithStatus(): Promise<MCPToolsResponse> {
+    return { tools: [], servers: [] }
+  }
+
   async getConnectedServers(): Promise<string[]> {
+    return []
+  }
+
+  async getMCPServerStatuses(): Promise<MCPServerStatus[]> {
     return []
   }
 
@@ -69,5 +83,21 @@ export class DefaultMCPService implements MCPService {
 
   async checkJanBrowserExtensionConnected(): Promise<boolean> {
     return false
+  }
+
+  async mcpOauthLogin(name: string, url: string): Promise<void> {
+    console.log('mcpOauthLogin called:', { name, url })
+    // Throws (unlike the other no-ops) so the card surfaces something real —
+    // same convention as DefaultAuthService.chatgptLogin.
+    throw new Error('MCP sign-in requires the desktop app')
+  }
+
+  async mcpOauthCancel(): Promise<void> {
+    // No-op - not implemented in default service
+  }
+
+  async mcpOauthLogout(name: string): Promise<void> {
+    console.log('mcpOauthLogout called with name:', name)
+    // No-op - not implemented in default service
   }
 }

@@ -1,4 +1,25 @@
 // Types
+
+/**
+ * Which device the loaded model actually runs on, parsed from the llama-server
+ * startup log. `--list-devices` only reports what a binary can enumerate, so it
+ * cannot tell a healthy GPU load apart from a CUDA/Vulkan build that silently
+ * degraded to CPU (missing cudart, parked dGPU, driver/ABI mismatch).
+ */
+export interface RuntimeDeviceInfo {
+  /** Backend libraries the process loaded: `CUDA`, `Vulkan`, `Metal`, `CPU`, ... */
+  loaded_backends: string[]
+  /** Buffer label holding most of the weights: `CUDA0`, `Vulkan0`, `Metal`, `CPU`. */
+  primary_device: string
+  gpu_layers_offloaded?: number | null
+  total_layers?: number | null
+  gpu_buffer_bytes?: number | null
+  /** The binary needs a CUDA runtime that is not installed on this host. */
+  cuda_runtime_missing?: boolean
+  /** First device-initialisation failure the backend reported, verbatim. */
+  device_init_error?: string | null
+}
+
 export interface SessionInfo {
   pid: number
   port: number
@@ -7,6 +28,7 @@ export interface SessionInfo {
   is_embedding: boolean
   api_key: string
   mmproj_path?: string
+  runtime_device?: RuntimeDeviceInfo | null
 }
 
 export interface UnloadResult {
@@ -29,6 +51,8 @@ export interface GgufMetadata {
 // llama.cpp settings
 export type LlamacppConfig = {
   version_backend: string
+  /** Offer llama.cpp releases conf lists but has not approved yet (the core decides). */
+  allow_candidate_builds?: boolean
   auto_unload: boolean
   timeout: number
   llamacpp_env: string
@@ -95,6 +119,8 @@ export type LlamacppConfig = {
   concurrent_mode: boolean
   concurrent_slots: number
   expose_metrics: boolean
+  reasoning_preserve: boolean
+  extra_args: string
 }
 
 export type ModelPlan = {
@@ -125,6 +151,13 @@ export interface ModelConfig {
   mmproj_sha256?: string
   mmproj_size_bytes?: number
   embedding?: boolean
+  /**
+   * Which modality this model's mmproj carries. Cached on first read so
+   * `list()` does not have to parse the projector GGUF every time. An
+   * mmproj is not necessarily vision — Voxtral's is an audio encoder.
+   */
+  projector_vision?: boolean
+  projector_audio?: boolean
   /**
    * Path (relative to Jan's data folder) to the downloaded Gemma 4 MTP draft
    * head GGUF, if MTP was enabled for this model. Absent for non-MTP models
@@ -180,6 +213,7 @@ export type BackendFeatures = {
   cuda12: boolean
   cuda13: boolean
   vulkan: boolean
+  rocm: boolean
 }
 
 export type SupportedFeatures = {
@@ -190,6 +224,7 @@ export type SupportedFeatures = {
   cuda12: boolean
   cuda13: boolean
   vulkan: boolean
+  rocm: boolean
 }
 export type NvidiaInfo = {
   compute_capability: string
@@ -197,10 +232,13 @@ export type NvidiaInfo = {
 
 export type VulkanInfo = {
   api_version: string
+  /// PCI device id, the only pre-launch gfx signal on Windows.
+  device_id?: number
 }
 
 export type GpuInfo = {
   driver_version: string
+  vendor?: string
   nvidia_info?: NvidiaInfo | null
   vulkan_info?: VulkanInfo | null
 }

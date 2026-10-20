@@ -1,32 +1,44 @@
+import { isManagedProvider, managedEngine } from '@/lib/managed-engines'
 import {
   enable as enableAutostart,
   isEnabled as isAutostartEnabled,
 } from '@tauri-apps/plugin-autostart'
 import { invoke } from '@tauri-apps/api/core'
 import { useModelProvider } from '@/hooks/useModelProvider'
-import { localStorageKey } from '@/constants/localStorage'
-import { EMBEDDING_MODEL_ID } from '@/constants/models'
+import { refreshAppManagedProviders } from '@/lib/provider-visibility'
+import {
+  BACKEND_PRESERVE_KEYS,
+  localStorageKey,
+} from '@/constants/localStorage'
 
 import { useServiceHub } from '@/hooks/useServiceHub'
+import { useModelCompatibilitySync } from '@/hooks/useModelSetup'
 import { useEffect } from 'react'
 import { useMCPServers, DEFAULT_MCP_SETTINGS } from '@/hooks/useMCPServers'
 import { useAssistant, defaultAssistant } from '@/hooks/useAssistant'
 import { useNavigate } from '@tanstack/react-router'
 import { route } from '@/constants/routes'
 import { useThreads } from '@/hooks/useThreads'
+import { ensureProjectsLoaded } from '@/hooks/useThreadManagement'
 import { useLocalApiServer } from '@/hooks/useLocalApiServer'
+import { ensureModelForServer } from '@/utils/ensureModelForServer'
 import { useAppState } from '@/hooks/useAppState'
 import { useAppUpdater } from '@/hooks/useAppUpdater'
-import { switchToModel } from '@/utils/switchModel'
-import { useModelLoad } from '@/hooks/useModelLoad'
 import { consumeSilentImport } from '@/utils/backgroundImports'
+import { isAnyChatBusy } from '@/stores/chat-session-store'
 import {
   isDev,
-  LOCAL_LLAMACPP_PROVIDER,
   SERVER_START_WATCHDOG_MS,
   withTimeout,
 } from '@/lib/utils'
-import { AppEvent, events, ModelEvent } from '@janhq/core'
+import {
+  AppEvent,
+  events,
+  ModelEvent,
+  type Assistant as CoreAssistant,
+} from '@janhq/core'
+import { migrateGlobalSamplingToAssistants } from '@/lib/samplingParams'
+import { createSafeUnlisten } from '@/lib/tauriEvent'
 import { toast } from 'sonner'
 import { SystemEvent } from '@/types/events'
 import {
@@ -36,17 +48,167 @@ import {
 import {
   isKeylessRemoteProvider,
   isLocalProvider,
+  isSubscriptionProvider,
   registerRemoteProvider,
   unregisterRemoteProvider,
 } from '@/utils/registerRemoteProvider'
 import { hydrateActiveModelsForRunningServer } from '@/utils/activeModelsSync'
 import { ensureRemoteProviderReady } from '@/utils/ensureRemoteProviderReady'
+import { reconcileLaunchAtStartup } from '@/lib/launchAtStartup'
+import { ModelFactory } from '@/lib/model-factory'
+import { isProviderConnected } from '@/lib/cloud-providers'
+import { mediaToSeed } from '@/lib/media-models'
+import { useMediaCatalog } from '@/stores/media-catalog-store'
+
+export function applyAtomicCoreServerState(payload: { running: boolean; port: number | null }) {
+  if (payload.running && typeof payload.port === 'number' && payload.port > 0) {
+    useLocalApiServer.getState().setServerPort(payload.port)
+    useAppState.getState().setServerStatus('running')
+  } else if (!payload.running) {
+    useAppState.getState().setServerStatus('stopped')
+  }
+}
+
+/**
+ * A recovered listener needs its model back. The core's public server loads nothing by itself: it
+ * serves the sessions that exist, and answers 503 "No models are available" when there are none.
+ * When the core dies, its sessions die with it; the app has the new core listen again on the same
+ * address (`recover_public_server`), and without this an outside client would find the server up
+ * and unusable for as long as nobody touched the app. The model is the one the server was last
+ * started with, or the user's default for it — what "Start server" itself would have loaded.
+ */
+export async function restoreServerModelAfterRecovery(
+  modelsService: Parameters<typeof ensureModelForServer>[0]['modelsService']
+): Promise<void> {
+  const { lastServerModels, defaultModelLocalApiServer } =
+    useLocalApiServer.getState()
+  const wanted = lastServerModels[0] ?? defaultModelLocalApiServer
+  try {
+    const result = await ensureModelForServer({
+      modelsService,
+      modelOverride: wanted,
+    })
+    if (result.status === 'no_model_available') {
+      console.warn('[LocalAPI] recovered server has no model to load')
+    }
+  } catch (error) {
+    console.warn('[LocalAPI] could not reload the model for the recovered server:', error)
+  }
+}
+
+/** Providers whose session lookups `ModelFactory` caches (Foundation Models resolves every time). */
+const SESSION_CACHED_PROVIDERS = [
+  'llamacpp',
+  'llamacpp-upstream',
+  'atomic-prism',
+  'mlx',
+  'foundry-local',
+] as const
+
+/** Those, and every managed engine (`isManagedProvider`). */
+const isSessionCachedProvider = (provider: string): boolean =>
+  (SESSION_CACHED_PROVIDERS as readonly string[]).includes(provider) ||
+  isManagedProvider(provider)
+
+/** `atomic-core://session:died`: a loaded session's process exited without being unloaded. */
+export type CoreSessionDiedPayload = {
+  provider?: string
+  /** `null` for a container session, which has no host process. */
+  pid?: number | null
+  model_id?: string
+  exit_code?: number | null
+  signal?: string | null
+  message?: string
+}
+
+/**
+ * ATO-244: a local model's process died after it loaded (typically mid-generation). The core
+ * reports this for every local runtime it owns, and the recovery does not depend on which one:
+ * forget the cached port, mark the model inactive, and tell the user why generation stopped.
+ */
+export function handleCoreSessionDied(
+  payload: CoreSessionDiedPayload | undefined,
+  // What the message depends on besides the event, which carries neither: a
+  // reply being produced, and the platform. Parameters so both can be tested.
+  context: { generating: boolean; macos: boolean } = {
+    generating: isAnyChatBusy(),
+    macos: IS_MACOS,
+  }
+): void {
+  console.warn('[LocalAPI] atomic-core session:died:', payload)
+  const provider = payload?.provider ?? 'llamacpp-upstream'
+  const modelId = payload?.model_id
+  if (isSessionCachedProvider(provider)) {
+    ModelFactory.invalidateLocalSessionCache(provider, modelId)
+  }
+  // `useAppState.activeModels` (the store every "is this model running?" check in the UI reads
+  // from — ChatInput's auto-start effect, the status dot, etc.) still lists the model as active
+  // until something re-queries the engine. Without this, a "New chat" on the same model/provider
+  // never re-checks (its auto-start effect only reruns on model/provider change) and sends
+  // straight into the dead backend, surfacing a raw "Connection refused" instead of silently
+  // reloading. Dropping the model flips `isModelActive` to false, which re-triggers that effect
+  // and lets it restart the model on its own.
+  if (modelId) {
+    const { activeModels, setActiveModels } = useAppState.getState()
+    if (activeModels.includes(modelId)) {
+      setActiveModels(activeModels.filter((id) => id !== modelId))
+    }
+  }
+  // The core reports every exit of a loaded model, whether or not anything was
+  // being generated, so the title only says "during generation" when a reply
+  // was. The Vulkan advice is for llama.cpp where Vulkan backends exist; on
+  // macOS the backend is Metal and there is no CPU backend to switch to.
+  const managed = managedEngine(provider)
+  const vulkanAdvice =
+    (provider === 'llamacpp' ||
+      provider === 'llamacpp-upstream' ||
+      provider === 'atomic-prism') &&
+    !context.macos
+  toast.error(
+    context.generating
+      ? 'Model crashed during generation'
+      : 'Model stopped unexpectedly',
+    {
+      id: `session-died-${modelId ?? 'unknown'}`,
+      description: vulkanAdvice
+        ? "The model's backend process exited unexpectedly. This can happen with Vulkan backends on some GPU drivers. Try reloading the model, or switch to a CPU backend in Settings → Providers."
+        : managed
+          ? // A container, not a process on this machine: its log is on the provider's page.
+            `The model's engine container stopped unexpectedly. Try reloading the model; its logs are in Settings → Providers → ${managed.label}.`
+          : "The model's backend process exited unexpectedly. Try reloading the model.",
+    }
+  )
+}
 
 const safeRegisterRemoteProvider = async (provider: ModelProvider) => {
   try {
     await registerRemoteProvider(provider)
   } catch (error) {
     console.error(`Failed to register provider ${provider.provider}:`, error)
+  }
+}
+
+/** Tries at the core's media catalog while the core is still starting. */
+const MEDIA_CATALOG_ATTEMPTS = 5
+const MEDIA_CATALOG_RETRY_MS = 3000
+
+/**
+ * Give every provider the catalog's curated image and video models it has not had yet, the way a
+ * registry provider comes with its chat models: the Cloud page shows them before a key is in, and
+ * the pickers once it is. A model the user removed is never put back. A keyless server of the
+ * user's own waits until it has answered, so its models never claim a connection it does not have.
+ */
+const seedProviderMedia = () => {
+  const catalog = useMediaCatalog.getState().catalog
+  if (!catalog) return
+  const { providers, updateProvider } = useModelProvider.getState()
+  for (const provider of providers) {
+    const seed = mediaToSeed(
+      provider,
+      catalog,
+      !isKeylessRemoteProvider(provider) || isProviderConnected(provider)
+    )
+    if (seed) updateProvider(provider.provider, { media: seed })
   }
 }
 
@@ -60,15 +222,21 @@ const syncRemoteProviders = () => {
 
   providers.forEach((provider) => {
     // Only cloud providers should be registered with the backend proxy. Local
-    // engines (`llamacpp`, `llamacpp-upstream`, `mlx`, `foundation-models`)
+    // engines (`llamacpp`, `llamacpp-upstream`, `mlx`, `foundation-models`,
+    // `tensorrt-llm`)
     // run in-process and must never be treated as remote. Both local llama.cpp
     // provider ids are packaged on every desktop platform.
     // The pre-fix check excluded only `'llamacpp'`, which silently leaked
     // `'llamacpp-upstream'` into the remote-registration path on Windows.
+    // Subscriptions (ChatGPT/Codex) hold no `api_key` on the provider object —
+    // the token lives in the Rust backend — so they register on the same
+    // footing as keyless self-hosted servers.
     if (
       provider.active &&
       !isLocalProvider(provider.provider) &&
-      (provider.api_key || isKeylessRemoteProvider(provider))
+      (provider.api_key ||
+        isKeylessRemoteProvider(provider) ||
+        isSubscriptionProvider(provider.provider))
     ) {
       safeRegisterRemoteProvider(provider)
       currentActive.add(provider.provider)
@@ -94,17 +262,20 @@ export function DataProvider() {
   const navigate = useNavigate()
   const serviceHub = useServiceHub()
   const { checkForUpdate } = useAppUpdater()
+  useModelCompatibilitySync()
 
   const setServerStatus = useAppState((state) => state.setServerStatus)
 
   useEffect(() => {
     if (localStorage.getItem(localStorageKey.factoryResetPending) === 'true') {
-      const backendType = localStorage.getItem('llama_cpp_backend_type')
+      const preserved = BACKEND_PRESERVE_KEYS.map(
+        (key) => [key, localStorage.getItem(key)] as const
+      )
 
       localStorage.clear()
 
-      if (backendType) {
-        localStorage.setItem('llama_cpp_backend_type', backendType)
+      for (const [key, value] of preserved) {
+        if (value) localStorage.setItem(key, value)
       }
 
       console.log(
@@ -113,55 +284,37 @@ export function DataProvider() {
     }
   }, [])
 
-  // Default "Launch at startup" to ON for every user (new and existing). We
-  // seed the OS autostart entry exactly once and record it, so a later manual
-  // disable in Settings → General is never overridden. (Flips the ATO-96
-  // default from OFF to ON; users can still turn it off.)
   useEffect(() => {
-    if (!IS_TAURI) return
-    if (localStorage.getItem(localStorageKey.autostartSeeded) === 'true') return
+    if (!IS_TAURI || isDev()) return
     ;(async () => {
-      try {
-        if (!(await isAutostartEnabled())) {
-          await enableAutostart()
-        }
-        localStorage.setItem(localStorageKey.autostartSeeded, 'true')
-      } catch (error) {
-        console.error('Failed to seed launch-at-startup default:', error)
-      }
-    })()
-  }, [])
-
-  // macOS: migrate the autostart mechanism from the legacy LaunchAgent plist to
-  // a real AppleScript Login Item (visible in System Settings, reliably started
-  // on reboot). Runs once. The Rust side removes the stale plist and reports
-  // whether the user had launch-at-startup ON under the old launcher; if so we
-  // re-register a Login Item so it keeps working after the switch. A user who
-  // had it off has no legacy plist and is left untouched (choice preserved).
-  useEffect(() => {
-    if (!IS_TAURI || !IS_MACOS) return
-    if (
-      localStorage.getItem(localStorageKey.autostartAppleScriptMigrated) ===
-      'true'
-    )
-      return
-    ;(async () => {
-      try {
-        const hadLegacyAutostart = await invoke<boolean>(
-          'migrate_macos_autostart_launchagent'
-        )
-        if (hadLegacyAutostart && !(await isAutostartEnabled())) {
-          await enableAutostart()
-        }
-        localStorage.setItem(
-          localStorageKey.autostartAppleScriptMigrated,
+      if (
+        IS_MACOS &&
+        localStorage.getItem(localStorageKey.autostartAppleScriptMigrated) !==
           'true'
-        )
+      ) {
+        try {
+          const hadLegacyAutostart = await invoke<boolean>(
+            'migrate_macos_autostart_launchagent'
+          )
+          if (hadLegacyAutostart && !(await isAutostartEnabled())) {
+            await enableAutostart()
+          }
+          localStorage.setItem(
+            localStorageKey.autostartAppleScriptMigrated,
+            'true'
+          )
+        } catch (error) {
+          console.error('Failed to migrate macOS autostart launcher:', error)
+        }
+      }
+
+      try {
+        await reconcileLaunchAtStartup(serviceHub.app())
       } catch (error) {
-        console.error('Failed to migrate macOS autostart launcher:', error)
+        console.error('Failed to reconcile launch-at-startup state:', error)
       }
     })()
-  }, [])
+  }, [serviceHub])
 
   useEffect(() => {
     console.log('Initializing DataProvider...')
@@ -170,6 +323,13 @@ export function DataProvider() {
       .getProviders()
       .then((providers) => {
         setProviders(providers)
+        // An engine that decides its own visibility (TensorRT-LLM) answers after its probe, which
+        // runs in the background so it does not hold the app start up.
+        void refreshAppManagedProviders(() =>
+          serviceHub.providers().getProviders()
+        ).catch((error) =>
+          console.warn('Could not refresh gated providers:', error)
+        )
         // Register active remote providers with the backend
         providers.forEach((provider) => {
           if (provider.active) {
@@ -209,24 +369,55 @@ export function DataProvider() {
       .getAssistants()
       .then((data) => {
         if (data && Array.isArray(data) && data.length > 0) {
-          //? Миграция: ассистент с id 'jan' всегда подменяем на дефолт Atomic Chat (name/description/avatar)
+          // Keep built-in branding current without overwriting user settings.
           const migrated = (data as unknown as Assistant[]).map((a) =>
             a.id === 'jan'
-              ? { ...defaultAssistant, id: 'jan', created_at: a.created_at }
+              ? {
+                  ...a,
+                  name: defaultAssistant.name,
+                  description: defaultAssistant.description,
+                  avatar: defaultAssistant.avatar,
+                }
               : a
           )
-          setAssistants(migrated)
+          const sampling = migrateGlobalSamplingToAssistants(migrated)
+          sampling.changed.forEach((assistant) => {
+            serviceHub
+              .assistants()
+              .createAssistant(assistant as unknown as CoreAssistant)
+              .catch((error) => {
+                console.warn(
+                  'Failed to persist migrated assistant sampling:',
+                  error
+                )
+              })
+          })
+          setAssistants(sampling.assistants)
           initializeWithLastUsed()
         }
       })
       .catch((error) => {
         console.warn('Failed to load assistants, keeping default:', error)
       })
+    let cancelled = false
+    let detachOpenUrl = () => {}
+    let unsubscribe = () => {}
+
     serviceHub.deeplink().getCurrent().then(handleDeepLink)
-    serviceHub.deeplink().onOpenUrl(handleDeepLink)
+    // `onOpenUrl` hands back a detacher; dropping it left the handler
+    // registered for the life of the process.
+    serviceHub
+      .deeplink()
+      .onOpenUrl(handleDeepLink)
+      .then((detach) => {
+        if (cancelled) detach()
+        else detachOpenUrl = detach
+      })
+      .catch((error) => {
+        console.warn('Failed to subscribe to deep links:', error)
+      })
 
     // Listen for deep link events
-    let unsubscribe = () => {}
     serviceHub
       .events()
       .listen(SystemEvent.DEEP_LINK, (event) => {
@@ -234,9 +425,12 @@ export function DataProvider() {
         handleDeepLink([deep_link])
       })
       .then((unsub) => {
-        unsubscribe = unsub
+        if (cancelled) unsub()
+        else unsubscribe = unsub
       })
     return () => {
+      cancelled = true
+      detachOpenUrl()
       unsubscribe()
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -251,11 +445,44 @@ export function DataProvider() {
       })
   }, [serviceHub, setThreads])
 
+  // Single owner of the initial projects read. Sidebar consumers used to each
+  // issue their own `getProjects()` on mount.
+  useEffect(() => {
+    void ensureProjectsLoaded()
+  }, [])
+
   // Sync remote providers with backend when providers change
   const providers = useModelProvider.getState().providers
   useEffect(() => {
     syncRemoteProviders()
   }, [providers])
+
+  // The core's media catalog, asked again while the core is still starting.
+  const mediaCatalog = useMediaCatalog((state) => state.catalog)
+  useEffect(() => {
+    let cancelled = false
+    let timer: ReturnType<typeof setTimeout> | null = null
+    const attempt = (left: number) => {
+      void useMediaCatalog
+        .getState()
+        .load({ force: left < MEDIA_CATALOG_ATTEMPTS })
+        .then(() => {
+          const { status } = useMediaCatalog.getState()
+          if (cancelled || status !== 'error' || left <= 1) return
+          timer = setTimeout(() => attempt(left - 1), MEDIA_CATALOG_RETRY_MS)
+        })
+    }
+    attempt(MEDIA_CATALOG_ATTEMPTS)
+    return () => {
+      cancelled = true
+      if (timer) clearTimeout(timer)
+    }
+  }, [])
+
+  // A provider connected now, or before the catalog arrived, gets its default media models.
+  useEffect(() => {
+    seedProviderMedia()
+  }, [providers, mediaCatalog])
 
   useEffect(() => {
     if (isDev()) {
@@ -275,6 +502,15 @@ export function DataProvider() {
     const handleModelImported = async (eventData?: Record<string, unknown>) => {
       console.log('[LocalAPI] onModelImported fired, eventData:', eventData)
 
+      // Deleting a model tombstones its id so a stale engine listing cannot
+      // resurrect the row. Importing it again is the user undoing that, so
+      // lift the tombstone before the refresh below — otherwise `setProviders`
+      // filters the freshly downloaded model straight back out.
+      const importedId = eventData?.modelId as string | undefined
+      if (importedId) {
+        useModelProvider.getState().clearDeletedModel(importedId)
+      }
+
       try {
         const fetchedProviders = await serviceHub.providers().getProviders()
         setProviders(fetchedProviders)
@@ -287,7 +523,7 @@ export function DataProvider() {
         return
       }
 
-      const modelId = eventData?.modelId as string | undefined
+      const modelId = importedId
       if (!modelId) {
         console.warn(
           '[LocalAPI] onModelImported: no modelId in event data, skipping'
@@ -295,110 +531,20 @@ export function DataProvider() {
         return
       }
 
-      if (modelId === EMBEDDING_MODEL_ID) {
-        console.log(
-          '[LocalAPI] onModelImported: embedding model imported, skipping server switch'
-        )
-        return
-      }
-
-      // Background bulk-imports (onboarding adds every detected model to the
-      // library by design) emit `onModelImported` too. Auto-switching to them
-      // would hijack the model the user actually picked. This registry is
-      // independent of any screen lifecycle, so it also covers imports that
-      // settle AFTER the onboarding screen unmounts (when `onboardingActive` is
-      // already false again).
+      // Clear the background-import marker if this was one. Import completion
+      // is deliberately library-only for every source: downloading a model
+      // must never unload the model serving an active chat or Agent run.
       if (consumeSilentImport(modelId)) {
         console.log(
-          '[LocalAPI] onModelImported: silent (background) import, skipping auto-switch for',
+          '[LocalAPI] onModelImported: background import added to library:',
           modelId
         )
         return
       }
-
-      // While onboarding is on screen it launches the chosen model itself, so
-      // DataProvider stands down entirely to avoid double-launching it.
-      if (useModelLoad.getState().onboardingActive) {
-        console.log(
-          '[LocalAPI] onModelImported: onboarding active, skipping auto-switch for',
-          modelId
-        )
-        return
-      }
-
-      // Resolve against the post-merge store, not the raw extension payload.
-      // This keeps model/provider selection aligned with migrations and
-      // persisted deletions before `switchToModel` runs.
-      const storeProviders = useModelProvider.getState().providers
-      let provider = storeProviders.find((p) =>
-        p?.models?.some((m: { id: string }) => m.id === modelId)
-      )
-      if (!provider) {
-        const altId = modelId.replace(/\//g, '\\')
-        provider = storeProviders.find((p) =>
-          p?.models?.some((m: { id: string }) => m.id === altId)
-        )
-      }
-      if (!provider) {
-        provider = storeProviders.find(
-          (p) => p?.provider === LOCAL_LLAMACPP_PROVIDER
-        )
-        console.warn(
-          '[LocalAPI] Could not find provider for model',
-          modelId,
-          `— falling back to ${LOCAL_LLAMACPP_PROVIDER}`
-        )
-      }
-      const providerName = provider?.provider ?? LOCAL_LLAMACPP_PROVIDER
-      console.log('[LocalAPI] Provider for model:', providerName)
-
       console.log(
-        '[LocalAPI] Current server status:',
-        useAppState.getState().serverStatus
+        '[LocalAPI] Model imported into the library; active model unchanged:',
+        modelId
       )
-
-      // A model switch / server start may already be in flight (e.g. the
-      // startup auto-start fired right as the download finished). Previously
-      // we bailed out on 'pending', which left the freshly downloaded model
-      // with nothing running and forced the user to start it manually from
-      // Settings after onboarding. Instead, wait for the in-flight operation
-      // to settle, then switch to the just-imported model so it auto-starts.
-      if (useAppState.getState().serverStatus === 'pending') {
-        console.log('[LocalAPI] Server pending — waiting before auto-start')
-        const settled = await new Promise<boolean>((resolve) => {
-          const startedAt = Date.now()
-          const poll = () => {
-            if (useAppState.getState().serverStatus !== 'pending') {
-              resolve(true)
-            } else if (Date.now() - startedAt > 20000) {
-              resolve(false)
-            } else {
-              setTimeout(poll, 500)
-            }
-          }
-          poll()
-        })
-        if (!settled) {
-          console.log(
-            '[LocalAPI] Server still pending after wait — skipping auto-start'
-          )
-          return
-        }
-      }
-
-      // switchToModel handles stopAllModels, start the new model, start/restart
-      // the Local API Server, and syncs all global state.
-      try {
-        await switchToModel({
-          modelId,
-          providerName,
-          serviceHub,
-          isAutoStart: true,
-        })
-        console.log('[LocalAPI] Model imported and switched to:', modelId)
-      } catch (error) {
-        console.error('[LocalAPI] Failed to switch to imported model:', error)
-      }
     }
 
     events.on(AppEvent.onModelImported, handleModelImported)
@@ -448,8 +594,9 @@ export function DataProvider() {
 
       const model = provider.models[modelIndex]
       const currentValue =
-        (model.settings?.ctx_len?.controller_props?.value as number | undefined) ??
-        null
+        (model.settings?.ctx_len?.controller_props?.value as
+          | number
+          | undefined) ?? null
       if (currentValue === newCtxLen) {
         console.log(
           `[LocalAPI] OnAutoIncreasedCtxLen (${source}): ctx_len for ${providerName}/${modelId} already = ${newCtxLen}, no-op`
@@ -503,6 +650,7 @@ export function DataProvider() {
     // Parallel native Tauri bus listener (extensions emit both channels).
     let unlistenTauri: (() => void) | undefined
     let unlistenAtMax: (() => void) | undefined
+    let unlistenMmprojFallback: (() => void) | undefined
     let cancelled = false
     ;(async () => {
       try {
@@ -527,11 +675,12 @@ export function DataProvider() {
           }
           applyNewCtxLen(provider, modelId, newCtxLen, 'tauri')
         })
+        const detachNotify = createSafeUnlisten(unsub)
         if (cancelled) {
-          unsub()
+          void detachNotify()
           return
         }
-        unlistenTauri = unsub
+        unlistenTauri = detachNotify
         console.log(
           '[LocalAPI] Subscribed to Tauri event: local_backend://auto_increase_ctx_notify'
         )
@@ -565,13 +714,33 @@ export function DataProvider() {
             { id: `ctx-at-max-${provider}-${modelId}` }
           )
         })
+        const detachAtMax = createSafeUnlisten(unsubAtMax)
         if (cancelled) {
-          unsubAtMax()
+          void detachAtMax()
         } else {
-          unlistenAtMax = unsubAtMax
+          unlistenAtMax = detachAtMax
           console.log(
             '[LocalAPI] Subscribed to Tauri event: local_backend://auto_increase_ctx_at_max'
           )
+        }
+
+        // Text-only recovery after unsupported mmproj (issue #44).
+        const unsubMmproj = await listen<{ modelId?: string }>(
+          'local_backend://multimodal_disabled_fallback',
+          (event) => {
+            const modelId = event.payload?.modelId ?? 'model'
+            toast.warning('Vision disabled for this session', {
+              id: `mmproj-fallback-${modelId}`,
+              description:
+                'This model’s multimodal projector isn’t supported by the current backend, so it loaded text-only. Image input won’t work until a compatible backend is available.',
+              duration: 10000,
+            })
+          }
+        )
+        if (cancelled) {
+          unsubMmproj()
+        } else {
+          unlistenMmprojFallback = unsubMmproj
         }
       } catch (e) {
         console.warn(
@@ -584,64 +753,74 @@ export function DataProvider() {
     return () => {
       cancelled = true
       events.off(ModelEvent.OnAutoIncreasedCtxLen, handleFromEvents)
-      if (unlistenTauri) unlistenTauri()
-      if (unlistenAtMax) unlistenAtMax()
+      if (unlistenTauri) void unlistenTauri()
+      if (unlistenAtMax) void unlistenAtMax()
+      if (unlistenMmprojFallback) void unlistenMmprojFallback()
     }
   }, [])
 
-  // ATO-244: Listen for unexpected llama-server crashes that happen AFTER
-  // model load (i.e. during generation). The Rust post-load watcher emits
-  // `local_backend://llamacpp_upstream_session_died` when this occurs.
-  // Show an actionable toast so the user knows why generation stopped.
+  // Session lifecycle events relayed from atomic-chat-core. `session:died` is
+  // ATO-244's crash report (see `handleCoreSessionDied`); the others only
+  // invalidate the cached port so the next request resolves the session again.
   useEffect(() => {
     if (!IS_TAURI) return
 
-    let unlistenSessionDied: (() => void) | undefined
+    let unlistenCoreSessionEvents: Array<() => void> = []
+    let coreServerWasRunning = false
     let cancelled = false
     ;(async () => {
       try {
         const { listen } = await import('@tauri-apps/api/event')
         if (cancelled) return
-        const unsub = await listen<{
-          model_id?: string
-          error_code?: string
-          message?: string
-        }>('local_backend://llamacpp_upstream_session_died', (event) => {
-          const { model_id } = event.payload ?? {}
-          console.warn(
-            '[LocalAPI] llamacpp_upstream_session_died:',
-            event.payload
-          )
-          // ATO-244: the backend process is gone, but `useAppState.activeModels`
-          // (the store every "is this model running?" check in the UI reads
-          // from — ChatInput's auto-start effect, the status dot, etc.) still
-          // lists it as active until something re-queries the engine. Without
-          // this, a "New chat" on the same model/provider never re-checks
-          // (its auto-start effect only reruns on model/provider change) and
-          // just sends straight into the dead backend, surfacing a raw
-          // "Connection refused" instead of silently reloading. Dropping the
-          // model here flips `isModelActive` to false, which re-triggers that
-          // effect and lets it restart the model on its own.
-          if (model_id) {
-            const { activeModels, setActiveModels } = useAppState.getState()
-            if (activeModels.includes(model_id)) {
-              setActiveModels(activeModels.filter((id) => id !== model_id))
-            }
+
+        const invalidateCoreSession = (event: {
+          payload?: { model_id?: string; provider?: string }
+        }) => {
+          const provider = event.payload?.provider ?? 'llamacpp-upstream'
+          if (isSessionCachedProvider(provider)) {
+            ModelFactory.invalidateLocalSessionCache(
+              provider,
+              event.payload?.model_id
+            )
           }
-          toast.error('Model crashed during generation', {
-            id: `session-died-${model_id ?? 'unknown'}`,
-            description:
-              "The model's backend process exited unexpectedly. This can happen with Vulkan backends on some GPU drivers. Try reloading the model, or switch to a CPU backend in Settings → Providers.",
-          })
-        })
+        }
+        const coreUnsubs = await Promise.all([
+          listen('atomic-core://session:started', invalidateCoreSession),
+          listen('atomic-core://session:unloaded', invalidateCoreSession),
+          listen<CoreSessionDiedPayload>('atomic-core://session:died', (event) =>
+            handleCoreSessionDied(event.payload)
+          ),
+          listen('atomic-core://detached', () => {
+            // Every local session lived in the core that just went away.
+            for (const provider of SESSION_CACHED_PROVIDERS) {
+              ModelFactory.invalidateLocalSessionCache(provider)
+            }
+            if (coreServerWasRunning) {
+              useAppState.getState().setServerStatus('stopped')
+              coreServerWasRunning = false
+            }
+          }),
+          listen<{ running: boolean; owner: string; port: number | null; generation: number | null }>(
+            'atomic-core://server-state-changed',
+            (event) => {
+              coreServerWasRunning = event.payload.owner === 'core' && event.payload.running
+              applyAtomicCoreServerState(event.payload)
+              // A generation comes only with a listener rebuilt on a new core.
+              if (coreServerWasRunning && event.payload.generation != null) {
+                void restoreServerModelAfterRecovery(serviceHub.models())
+              }
+            }
+          ),
+        ])
+        const safeCoreUnsubs = coreUnsubs.map(createSafeUnlisten)
         if (cancelled) {
-          unsub()
+          safeCoreUnsubs.forEach((unsubscribe) => void unsubscribe())
           return
         }
-        unlistenSessionDied = unsub
+        unlistenCoreSessionEvents = safeCoreUnsubs
       } catch (e) {
         console.warn(
-          '[LocalAPI] Failed to subscribe to llamacpp_upstream_session_died:',
+          '[LocalAPI] Failed to subscribe to atomic-core session events:',
           e
         )
       }
@@ -649,9 +828,9 @@ export function DataProvider() {
 
     return () => {
       cancelled = true
-      if (unlistenSessionDied) unlistenSessionDied()
+      unlistenCoreSessionEvents.forEach((unsubscribe) => void unsubscribe())
     }
-  }, [])
+  }, [serviceHub])
 
   // Auto-start Local API Server on app startup, but only re-attach to an
   // already-running server or raise the proxy for a model that is already
@@ -661,22 +840,34 @@ export function DataProvider() {
     const autoStartServer = async () => {
       try {
         const { enableOnStartup } = useLocalApiServer.getState()
-        if (!enableOnStartup) {
-          console.log(
-            '[LocalAPI:startup] Local API server auto-start disabled in settings; skipping auto-start'
-          )
-          return
-        }
-
         const isRunning = await serviceHub.app().getServerStatus()
         if (isRunning) {
           console.log('[LocalAPI:startup] Server already running')
+          // `startServer` is idempotent for an existing listener and returns
+          // the port it actually bound, including a fallback port.
+          const current = useLocalApiServer.getState()
+          const actualPort = await window.core?.api?.startServer({
+            host: current.serverHost,
+            port: current.serverPort,
+            prefix: current.apiPrefix,
+            apiKey: current.apiKey,
+            trustedHosts: current.trustedHosts,
+            isCorsEnabled: current.corsEnabled,
+            isVerboseEnabled: current.verboseLogs,
+            proxyTimeout: current.proxyTimeout,
+          })
+          if (actualPort && actualPort !== current.serverPort) current.setServerPort(actualPort)
           setServerStatus('running')
           // `activeModels` is in-memory only; without this the provider UI
           // would render "Start" for the cloud model the proxy is already
           // routing, until the user manually re-selects it. See issue where
           // navigating between tabs appears to "forget" the running model.
           await hydrateActiveModelsForRunningServer(serviceHub.models())
+          return
+        }
+
+        if (!enableOnStartup) {
+          console.log('[LocalAPI:startup] Local API server auto-start disabled in settings')
           return
         }
 

@@ -1,7 +1,9 @@
-import { useBackendUpdater } from '@/hooks/useBackendUpdater'
+import {
+  useBackendUpdater,
+  type UseBackendUpdaterConfig,
+} from '@/hooks/useBackendUpdater'
 
 import {
-  IconCheck,
   IconDownload,
   IconLoader2,
   IconRefresh,
@@ -17,27 +19,60 @@ import {
   DialogTitle,
 } from '@/components/ui/dialog'
 
-import { useEffect } from 'react'
+import { useEffect, useRef } from 'react'
+import {
+  captureBackendRecommendationApplied,
+  captureBackendRecommendationShown,
+} from '@/lib/backend-telemetry'
 import { useTranslation } from '@/i18n/react-i18next-compat'
 import { toast } from 'sonner'
+import { getProviderTitle, LOCAL_LLAMACPP_PROVIDER } from '@/lib/utils'
+import { useImageGenerationStore } from '@/stores/image-generation-store'
+import { useUpdateBannerSlot } from '@/stores/update-banner-store'
+
+/// Progress-only view onto the turboquant provider. The recommendation modal
+/// stays upstream-owned so two providers can never argue over the same dialog,
+/// but `reconcileBackendReleaseTag()` starts a download on its own after an app
+/// update — sometimes several hundred megabytes — and that must not happen
+/// invisibly.
+const TURBOQUANT_PROGRESS_CONFIG: UseBackendUpdaterConfig = {
+  extensionName: '@janhq/llamacpp-extension',
+  providerId: 'llamacpp',
+  recommendationKey: 'turboquant_better_backend_recommendation',
+  postUpgradeRecheckEnabled: false,
+}
+
+/// Renders a `<tag>/<backend-id>` pair for humans. The id alone (`macos-arm64`,
+/// `win-cuda-13.3-x64`) says nothing about which release is landing, and the
+/// release tag is the whole point of an unattended engine update.
+const backendLabel = (backendName: string | null | undefined): string => {
+  if (!backendName) return ''
+  const [version, backendId] = backendName.split('/')
+  return backendId ? `${backendId} (${version})` : backendName
+}
 
 const BackendUpdater = () => {
   const { t } = useTranslation()
   const {
-    updateState,
     downloadState,
     recommendation,
     recommendationPhase,
-    updateBackend,
-    checkForUpdate,
-    setRemindMeLater,
     dismissRecommendation,
     downloadRecommendedBackend,
   } = useBackendUpdater()
 
-  useEffect(() => {
-    checkForUpdate()
-  }, [checkForUpdate])
+  const { downloadState: turboquantDownload } = useBackendUpdater(
+    TURBOQUANT_PROGRESS_CONFIG
+  )
+
+  /// The media engine updates through the image store, not an extension:
+  /// from the engine-update banner, Settings → Media or the Images page.
+  const mediaEngineUpdatingTo = useImageGenerationStore(
+    (state) => state.engineUpdatingTo
+  )
+  const mediaEngineInstall = useImageGenerationStore(
+    (state) => state.engineInstall
+  )
 
   const handleRestart = async () => {
     try {
@@ -48,6 +83,14 @@ const BackendUpdater = () => {
   }
 
   const handleDownloadRecommended = async () => {
+    if (recommendation) {
+      captureBackendRecommendationApplied({
+        provider: recommendation.provider ?? LOCAL_LLAMACPP_PROVIDER,
+        backendFrom: null,
+        backendTo: recommendation.recommendedBackend,
+        trigger: 'dialog',
+      })
+    }
     try {
       await downloadRecommendedBackend()
     } catch (error) {
@@ -56,21 +99,10 @@ const BackendUpdater = () => {
     }
   }
 
-  const handleVersionUpdate = async () => {
-    try {
-      await updateBackend()
-      setRemindMeLater(true)
-      toast.success(t('settings:backendUpdater.updateSuccess'))
-    } catch (error) {
-      console.error('Backend update failed:', error)
-      toast.error(t('settings:backendUpdater.updateError'))
-    }
-  }
-
   // Show toast on non-recommendation download completion. We deliberately
   // skip the toast when the recommendation flow is in progress because the
-  // dialog itself surfaces the next step (hotswapping → completed →
-  // restart-required) and a stacked toast would be redundant noise.
+  // compact dialog already surfaces downloading/hot-swapping. Completion uses
+  // the dedicated success toast below; restart-required remains a dialog.
   useEffect(() => {
     if (
       downloadState.status === 'completed' &&
@@ -79,10 +111,10 @@ const BackendUpdater = () => {
       recommendationPhase !== 'hotswapping' &&
       recommendationPhase !== 'completed'
     ) {
-      const backendType =
-        downloadState.backendName.split('/').pop() || downloadState.backendName
       toast.success(
-        t('settings:backendUpdater.downloadComplete', { backend: backendType })
+        t('settings:backendUpdater.downloadComplete', {
+          backend: backendLabel(downloadState.backendName),
+        })
       )
     } else if (
       downloadState.status === 'failed' &&
@@ -103,17 +135,108 @@ const BackendUpdater = () => {
     }
   }, [recommendationPhase, t])
 
+  /// The turboquant reconcile runs unattended, so its outcome only ever
+  /// reaches the user through these toasts.
+  useEffect(() => {
+    if (turboquantDownload.status === 'completed' && turboquantDownload.backendName) {
+      toast.success(
+        t('settings:backendUpdater.downloadComplete', {
+          backend: backendLabel(turboquantDownload.backendName),
+        })
+      )
+    } else if (turboquantDownload.status === 'failed') {
+      toast.error(t('settings:backendUpdater.downloadFailed'))
+    }
+  }, [turboquantDownload.status, turboquantDownload.backendName, t])
+
+  /// The store clears `availableTag` only once the new build is installed,
+  /// so it tells the outcome when `engineUpdatingTo` falls back to null.
+  const mediaEngineTargetRef = useRef<string | null>(null)
+  useEffect(() => {
+    if (mediaEngineUpdatingTo) {
+      mediaEngineTargetRef.current = mediaEngineUpdatingTo
+      return
+    }
+    const target = mediaEngineTargetRef.current
+    if (!target) return
+    mediaEngineTargetRef.current = null
+    if (useImageGenerationStore.getState().engineUpdate.availableTag === null) {
+      toast.success(t('settings:media.updateComplete', { tag: target }))
+    } else {
+      toast.error(t('settings:media.updateFailed'))
+    }
+  }, [mediaEngineUpdatingTo, t])
+
   const showRecommendationDialog =
     recommendationPhase === 'recommend' ||
     recommendationPhase === 'downloading' ||
     recommendationPhase === 'hotswapping' ||
-    recommendationPhase === 'completed' ||
     recommendationPhase === 'restart-required'
 
-  const showVersionUpdateToast =
-    !showRecommendationDialog &&
-    updateState.isUpdateAvailable &&
-    !updateState.remindMeLater
+  // One impression per offer: the phase walks recommend → downloading → …
+  // inside a single opening, and only the first frame is the offer.
+  const shownForRef = useRef<string | null>(null)
+  useEffect(() => {
+    if (recommendationPhase !== 'recommend' || !recommendation) return
+    const key = recommendation.recommendedBackend
+    if (shownForRef.current === key) return
+    shownForRef.current = key
+    captureBackendRecommendationShown({
+      provider: recommendation.provider ?? LOCAL_LLAMACPP_PROVIDER,
+      backendFrom: null,
+      backendTo: recommendation.recommendedBackend,
+      trigger: 'dialog',
+    })
+  }, [recommendationPhase, recommendation])
+
+  /// Both providers download without being asked: each reconciles its release
+  /// tag after an app update, and upstream additionally applies the tier that
+  /// startup detection picked for this host. Anything the user started himself
+  /// is already on screen in the dialog above, so this banner is the only thing
+  /// that tells him the rest is moving.
+  const backgroundDownload = showRecommendationDialog
+    ? null
+    : downloadState.isDownloading
+      ? downloadState
+      : turboquantDownload.isDownloading
+        ? turboquantDownload
+        : null
+
+  /// One card for the corner: a llama.cpp transfer, else the media engine's.
+  const mediaEnginePercent =
+    mediaEngineInstall.total > 0
+      ? Math.round(
+          (mediaEngineInstall.transferred / mediaEngineInstall.total) * 100
+        )
+      : null
+  const backgroundCard = backgroundDownload
+    ? {
+        title: t('settings:backendUpdater.backgroundUpdateTitle'),
+        description: t('settings:backendUpdater.backgroundUpdateDesc', {
+          backend: backendLabel(backgroundDownload.backendName),
+        }),
+      }
+    : mediaEngineUpdatingTo
+      ? {
+          title: t('settings:media.backgroundUpdateTitle'),
+          description: [
+            t('settings:media.backgroundUpdateDesc', {
+              tag: mediaEngineUpdatingTo,
+            }),
+            mediaEnginePercent !== null ? `${mediaEnginePercent}%` : null,
+          ]
+            .filter(Boolean)
+            .join(' · '),
+        }
+      : null
+
+  /// ATO-533: this renders in the same bottom-right corner as the app and
+  /// engine update banners. Live transfer progress outranks both offers —
+  /// it is over in minutes, while an offer stays up until it is acted on.
+  const mayRenderBackgroundDownload = useUpdateBannerSlot(
+    'download',
+    !!backgroundCard
+  )
 
   return (
     <>
@@ -127,6 +250,7 @@ const BackendUpdater = () => {
         }}
       >
         <DialogContent
+          className="gap-4 p-4 sm:max-w-[18rem]"
           showCloseButton={recommendationPhase === 'recommend'}
           onInteractOutside={(e) => {
             if (recommendationPhase !== 'recommend') {
@@ -135,28 +259,47 @@ const BackendUpdater = () => {
           }}
         >
           {recommendationPhase === 'recommend' && recommendation && (
-            <>
-              <DialogHeader>
-                <DialogTitle>
+            <div className="flex flex-col gap-3">
+              <DialogHeader className="gap-1 pr-6 text-left">
+                <DialogTitle className="text-base leading-5">
                   {t('settings:backendUpdater.betterBackendTitle')}
                 </DialogTitle>
-                <DialogDescription>
+                <DialogDescription className="text-xs leading-5">
                   {t('settings:backendUpdater.betterBackendDesc', {
                     backend: recommendation.recommendedCategory,
                   })}
                 </DialogDescription>
+                {/* Both llama providers can recommend a different backend for
+                    the same GPU, so name the one this dialog speaks for. */}
+                <p className="text-[11px] leading-4 text-muted-foreground">
+                  {t('settings:backendUpdater.betterBackendProviderContext', {
+                    provider: getProviderTitle(
+                      recommendation.provider ?? LOCAL_LLAMACPP_PROVIDER
+                    ),
+                    backend:
+                      recommendation.backendId ??
+                      recommendation.recommendedBackend,
+                  })}
+                </p>
               </DialogHeader>
-              <DialogFooter>
-                <Button variant="outline" onClick={dismissRecommendation}>
+              <div className="grid grid-cols-2 gap-2">
+                <Button
+                  variant="outline"
+                  onClick={dismissRecommendation}
+                  className="h-10"
+                >
                   <IconX size={16} className="mr-1" />
                   {t('settings:backendUpdater.notNow')}
                 </Button>
-                <Button onClick={handleDownloadRecommended}>
+                <Button
+                  onClick={handleDownloadRecommended}
+                  className="h-10"
+                >
                   <IconDownload size={16} className="mr-1" />
                   {t('settings:backendUpdater.downloadNow')}
                 </Button>
-              </DialogFooter>
-            </>
+              </div>
+            </div>
           )}
 
           {recommendationPhase === 'downloading' && (
@@ -169,8 +312,8 @@ const BackendUpdater = () => {
                   {t('settings:backendUpdater.downloadingBackendDesc')}
                 </DialogDescription>
               </DialogHeader>
-              <div className="flex items-center justify-center py-4">
-                <IconLoader2 size={32} className="text-blue-500 animate-spin" />
+              <div className="flex items-center justify-center py-2">
+                <IconLoader2 size={24} className="text-blue-500 animate-spin" />
               </div>
             </>
           )}
@@ -190,29 +333,8 @@ const BackendUpdater = () => {
                   })}
                 </DialogDescription>
               </DialogHeader>
-              <div className="flex items-center justify-center py-4">
-                <IconLoader2 size={32} className="text-blue-500 animate-spin" />
-              </div>
-            </>
-          )}
-
-          {recommendationPhase === 'completed' && (
-            <>
-              <DialogHeader>
-                <DialogTitle>
-                  {t('settings:backendUpdater.hotSwapSuccess')}
-                </DialogTitle>
-                <DialogDescription>
-                  {t('settings:backendUpdater.hotSwapSuccessDesc', {
-                    backend:
-                      recommendation?.recommendedCategory ??
-                      recommendation?.recommendedBackend ??
-                      '',
-                  })}
-                </DialogDescription>
-              </DialogHeader>
-              <div className="flex items-center justify-center py-4">
-                <IconCheck size={32} className="text-emerald-500" />
+              <div className="flex items-center justify-center py-2">
+                <IconLoader2 size={24} className="text-blue-500 animate-spin" />
               </div>
             </>
           )}
@@ -238,54 +360,22 @@ const BackendUpdater = () => {
         </DialogContent>
       </Dialog>
 
-      {/* Version update toast (existing flow, separate from GPU recommendation) */}
-      {showVersionUpdateToast && (
-        <div className="fixed z-50 bottom-3 right-3 bg-background flex items-center border rounded-lg shadow-md">
-          <div className="px-2 py-4">
-            <div className="px-4">
-              <div className="flex items-start gap-2">
-                <IconDownload
-                  size={20}
-                  className="shrink-0 text-muted-foreground mt-1"
-                />
-                <div>
-                  <div className="text-base font-medium">
-                    {t('settings:backendUpdater.newBackendVersion', {
-                      version: updateState.updateInfo?.newVersion,
-                    })}
-                  </div>
-                  <div className="mt-1 text-muted-foreground font-normal mb-2">
-                    {t('settings:backendUpdater.backendUpdateAvailable')}
-                  </div>
-                </div>
-              </div>
-            </div>
-
-            <div className="pt-3 px-4">
-              <div className="flex gap-x-4 w-full items-center justify-end">
-                <div className="flex gap-x-2">
-                  <Button
-                    variant="ghost"
-                    size="sm"
-                    onClick={() => setRemindMeLater(true)}
-                  >
-                    {t('settings:backendUpdater.remindMeLater')}
-                  </Button>
-                  <Button
-                    size="sm"
-                    onClick={handleVersionUpdate}
-                    disabled={updateState.isUpdating}
-                  >
-                    {updateState.isUpdating
-                      ? t('settings:backendUpdater.updating')
-                      : t('settings:backendUpdater.updateNow')}
-                  </Button>
-                </div>
-              </div>
+      {/* Unattended backend download — non-blocking progress */}
+      {backgroundCard && mayRenderBackgroundDownload && (
+        <div className="fixed z-50 bottom-3 right-3 bg-background flex items-start gap-2 border rounded-lg shadow-md px-4 py-3 max-w-[22rem]">
+          <IconLoader2
+            size={18}
+            className="shrink-0 text-blue-500 animate-spin mt-0.5"
+          />
+          <div>
+            <div className="text-sm font-medium">{backgroundCard.title}</div>
+            <div className="mt-0.5 text-xs text-muted-foreground">
+              {backgroundCard.description}
             </div>
           </div>
         </div>
       )}
+
     </>
   )
 }

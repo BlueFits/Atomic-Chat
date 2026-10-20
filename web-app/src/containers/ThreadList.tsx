@@ -1,7 +1,14 @@
-import { Folder, MoreHorizontal, Pencil, Trash2, X } from 'lucide-react'
+import {
+  Folder,
+  MoreHorizontal,
+  Pencil,
+  SquareArrowOutUpRight,
+  Trash2,
+  X,
+} from 'lucide-react'
 import { useThreads } from '@/hooks/useThreads'
 import { useMessages } from '@/hooks/useMessages'
-import { useThreadManagement } from '@/hooks/useThreadManagement'
+import { useThreadManagementStore } from '@/hooks/useThreadManagement'
 import { useServiceHub } from '@/hooks/useServiceHub'
 import { useEffect, useRef } from 'react'
 
@@ -24,7 +31,7 @@ import {
   useSidebar,
 } from '@/components/ui/sidebar'
 import { useTranslation } from '@/i18n/react-i18next-compat'
-import { memo, useMemo, useState } from 'react'
+import { memo, useMemo, useState, type MouseEvent } from 'react'
 import { Link, useParams } from '@tanstack/react-router'
 import { RenameThreadDialog, DeleteThreadDialog } from '@/containers/dialogs'
 import { toast } from 'sonner'
@@ -33,8 +40,9 @@ import { ThreadMessage } from '@janhq/core'
 import { useChatSessions, isSessionBusy } from '@/stores/chat-session-store'
 import { useThreadReadStatus } from '@/stores/thread-read-store'
 import { ThreadStatusDot } from '@/components/left-sidebar/ThreadStatusDot'
+import { isPlatformTauri } from '@/lib/platform/utils'
 
-//* Заголовок приветственного треда: новый бренд и старая строка из прошлых версий
+//* Welcome thread title: the new brand and the old string from previous versions
 const WELCOME_THREAD_TITLES = new Set([
   'What is Atomic Bot?',
   'What is Overchat?',
@@ -57,15 +65,25 @@ const ThreadItem = memo(
     const deleteThread = useThreads((state) => state.deleteThread)
     const renameThread = useThreads((state) => state.renameThread)
     const updateThread = useThreads((state) => state.updateThread)
-    const getFolderById = useThreadManagement().getFolderById
-    const { folders } = useThreadManagement()
+    const getFolderById = useThreadManagementStore(
+      (state) => state.getFolderById
+    )
+    const folders = useThreadManagementStore((state) => state.folders)
     const { t } = useTranslation()
     const [renameOpen, setRenameOpen] = useState(false)
     const [deleteConfirmOpen, setDeleteConfirmOpen] = useState(false)
+    // Controlled so a right-click can open it. Without this the row is a plain
+    // <a> and the WebView shows its own native link menu, whose "Open link in
+    // new window" the embedding WebView silently drops (issue #254).
+    const [menuOpen, setMenuOpen] = useState(false)
 
     const serviceHub = useServiceHub()
     const getMessages = useMessages((state) => state.getMessages)
     const setMessages = useMessages((state) => state.setMessages)
+
+    // Only the project cards render a message preview. History rows are titles,
+    // so hydrating their message history would be N pointless round-trips.
+    const showPreview = Boolean(currentProjectId)
 
     // Use a ref to track if messages have been loaded
     const messagesLoadedRef = useRef(false)
@@ -74,11 +92,13 @@ const ThreadItem = memo(
 
     // Get messages reactively via ref tracking (to avoid infinite re-renders)
     const [messages, setLocalMessages] = useState<ThreadMessage[]>(() =>
-      getMessages(thread.id)
+      showPreview ? getMessages(thread.id) : []
     )
 
     // Fetch messages if not loaded yet
     useEffect(() => {
+      if (!showPreview) return
+
       const currentMessages = getMessages(thread.id)
 
       // Initial load: no messages yet, fetch them
@@ -105,7 +125,7 @@ const ThreadItem = memo(
         setLocalMessages(currentMessages)
         messagesLengthRef.current = currentMessages.length
       }
-    }, [thread.id, serviceHub, getMessages, setMessages])
+    }, [thread.id, serviceHub, getMessages, setMessages, showPreview])
 
     const lastUserMessageText = useMemo(() => {
       const userMessages = messages.filter((m) => m.role === 'user')
@@ -151,6 +171,25 @@ const ThreadItem = memo(
       }
     }
 
+    // Tauri window labels only accept alphanumerics, `-`, `_`, `/` and `:`.
+    const openInNewWindow = () => {
+      serviceHub
+        .window()
+        .openWindow({
+          url: `/threads/${thread.id}`,
+          label: `thread-${thread.id.replace(/[^a-zA-Z0-9_-]/g, '-')}`,
+          title: thread.title || 'Atomic Chat',
+          width: 1000,
+          height: 800,
+          resizable: true,
+          center: true,
+        })
+        .catch((error) => {
+          console.error('Failed to open thread in a new window:', error)
+          toast.error(t('common:openInNewWindowFailed'))
+        })
+    }
+
     const isBusy = useChatSessions((state) =>
       isSessionBusy(state.sessions[thread.id])
     )
@@ -170,6 +209,10 @@ const ThreadItem = memo(
       // not when hovering the project or sibling chats.
       <MenuItemWrapper
         className={cn(subItem && 'group/menu-sub-item relative')}
+        onContextMenu={(event: MouseEvent<HTMLLIElement>) => {
+          event.preventDefault()
+          setMenuOpen(true)
+        }}
       >
         {currentProjectId ? (
           <Link
@@ -204,7 +247,7 @@ const ThreadItem = memo(
             </Link>
           </MenuButtonWrapper>
         )}
-        <DropdownMenu>
+        <DropdownMenu open={menuOpen} onOpenChange={setMenuOpen}>
           <DropdownMenuTrigger asChild>
             <SidebarMenuAction
               showOnHover={!subItem}
@@ -224,6 +267,15 @@ const ThreadItem = memo(
             side={isMobile ? 'bottom' : 'right'}
             align={isMobile ? 'end' : 'start'}
           >
+            {/* The browser build has no second window to open — its window
+                service is a no-op, which would reproduce the very "nothing
+                happens" this menu item exists to fix. */}
+            {isPlatformTauri() && (
+              <DropdownMenuItem onSelect={openInNewWindow}>
+                <SquareArrowOutUpRight className="size-4" />
+                <span>{t('common:openInNewWindow')}</span>
+              </DropdownMenuItem>
+            )}
             <DropdownMenuItem onSelect={() => setRenameOpen(true)}>
               <Pencil className="size-4" />
               <span>{t('common:rename')}</span>

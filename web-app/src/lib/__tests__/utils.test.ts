@@ -2,14 +2,17 @@ import { describe, it, expect, vi } from 'vitest'
 import {
   getProviderLogo,
   getProviderTitle,
+  isLlamacppProvider,
   getReadableLanguageName,
   toGigabytes,
   formatMegaBytes,
   formatDuration,
   getModelDisplayName,
+  basenameNoExt,
   withTimeout,
   OPERATION_TIMED_OUT_CODE,
 } from '../utils'
+import { isMonochromeFamilyLogo } from '../model-logo'
 
 describe('getProviderLogo', () => {
   it('returns correct logo paths for known providers', () => {
@@ -21,7 +24,35 @@ describe('getProviderLogo', () => {
     )
     expect(getProviderLogo('openai')).toBe('/images/model-provider/openai.svg')
     expect(getProviderLogo('gemini')).toBe('/images/model-provider/gemini.svg')
+    expect(getProviderLogo('edenai')).toBe(
+      '/images/model-provider/edenai.svg'
+    )
     expect(getProviderLogo('nvidia')).toBe('/images/model-provider/nvidia.svg')
+    expect(getProviderLogo('aimlapi')).toBe(
+      '/images/model-provider/aimlapi.svg'
+    )
+  })
+
+  it('marks TensorRT-LLM with the NVIDIA logo', () => {
+    expect(getProviderLogo('tensorrt-llm')).toBe(
+      '/images/model-provider/nvidia.svg'
+    )
+  })
+
+  it('marks vLLM with its own mark', () => {
+    expect(getProviderLogo('vllm')).toBe('/images/model-provider/vllm.svg')
+  })
+
+  it('marks SGLang with its own monogram', () => {
+    expect(getProviderLogo('sglang')).toBe('/images/model-provider/sglang.svg')
+    expect(getProviderLogo('foundry-local')).toBe('/images/model-provider/foundry-local.svg')
+  })
+
+  it('marks PrismML with its own mark, the one its Bonsai models carry in the Hub', () => {
+    expect(getProviderLogo('atomic-prism')).toBe(
+      '/images/model-provider/prism-ml.webp'
+    )
+    expect(isMonochromeFamilyLogo(getProviderLogo('atomic-prism')!)).toBe(true)
   })
 
   it('returns undefined for unknown providers', () => {
@@ -30,13 +61,36 @@ describe('getProviderLogo', () => {
   })
 })
 
+describe('isLlamacppProvider', () => {
+  it('counts tokens for every llama.cpp engine the app starts', () => {
+    expect(isLlamacppProvider('llamacpp')).toBe(true)
+    expect(isLlamacppProvider('llamacpp-upstream')).toBe(true)
+    expect(isLlamacppProvider('atomic-prism')).toBe(true)
+  })
+
+  it('leaves the other engines and the cloud out', () => {
+    expect(isLlamacppProvider('mlx')).toBe(false)
+    expect(isLlamacppProvider('tensorrt-llm')).toBe(false)
+    expect(isLlamacppProvider('llamacpp-server')).toBe(false)
+    expect(isLlamacppProvider('openai')).toBe(false)
+  })
+})
+
 describe('getProviderTitle', () => {
   it('returns formatted titles for special providers', () => {
-    expect(getProviderTitle('llamacpp')).toBe('Llama.cpp Turboquant')
+    expect(getProviderTitle('llamacpp')).toBe('llama.cpp turboquant')
     expect(getProviderTitle('openai')).toBe('OpenAI')
     expect(getProviderTitle('openrouter')).toBe('OpenRouter')
     expect(getProviderTitle('gemini')).toBe('Gemini')
     expect(getProviderTitle('nvidia')).toBe('NVIDIA NIM')
+    expect(getProviderTitle('aimlapi')).toBe('AI/ML API')
+    expect(getProviderTitle('tensorrt-llm')).toBe('TensorRT-LLM')
+    expect(getProviderTitle('vllm')).toBe('vLLM')
+    expect(getProviderTitle('sglang')).toBe('SGLang')
+    expect(getProviderTitle('foundry-local')).toBe('Foundry Local')
+    expect(getProviderTitle('edenai')).toBe('Eden AI')
+    expect(getProviderTitle('automatic1111')).toBe('Automatic1111 / Forge')
+    expect(getProviderTitle('sdcpp-server')).toBe('stable-diffusion.cpp server')
   })
 
   it('capitalizes first letter for unknown providers', () => {
@@ -252,6 +306,31 @@ describe('getModelDisplayName', () => {
       displayName: 'Model (Version 2.0) - Fine-tuned',
     } as Model
     expect(getModelDisplayName(model)).toBe('Model (Version 2.0) - Fine-tuned')
+  })
+})
+
+describe('basenameNoExt', () => {
+  it('removes a single extension', () => {
+    expect(basenameNoExt('model.gguf')).toBe('model')
+  })
+
+  it('removes compound extensions like .tar.gz', () => {
+    expect(basenameNoExt('backend.tar.gz')).toBe('backend')
+    expect(basenameNoExt('backend.TAR.GZ')).toBe('backend')
+  })
+
+  it('removes .zip extension', () => {
+    expect(basenameNoExt('backend.zip')).toBe('backend')
+  })
+
+  it('returns the name unchanged for files without an extension', () => {
+    expect(basenameNoExt('README')).toBe('README')
+    expect(basenameNoExt('Makefile')).toBe('Makefile')
+  })
+
+  it('handles paths with directory components', () => {
+    expect(basenameNoExt('/path/to/model.gguf')).toBe('model')
+    expect(basenameNoExt('/path/to/README')).toBe('README')
   })
 })
 

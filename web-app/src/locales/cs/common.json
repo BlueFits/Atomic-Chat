@@ -1,7 +1,11 @@
 {
+  "api": "API",
+  "cloud": "Cloud",
   "assistants": "Asistenti",
   "hardware": "Hardware",
   "mcp-servers": "MCP servery",
+  "connectors": "Konektory",
+  "plugins": "Pluginy",
   "local_api_server": "Lokální API server",
   "https_proxy": "HTTPS Proxy",
   "extensions": "Rozšíření",
@@ -22,12 +26,17 @@
   "recents": "Nedávné",
   "hub": "Centrum",
   "models": "Modely",
+  "images": "Images",
+  "video": "Video",
+  "media": "Media",
   "helpSupport": "Nápověda a podpora",
   "helpUsImproveJan": "Pomozte nám vylepšit Atomic Bot",
   "unstarAll": "Odebrat vše z oblíbených",
   "unstar": "Odebrat z oblíbených",
   "deleteAll": "Smazat vše",
   "star": "Přidat do oblíbených",
+  "openInNewWindow": "Otevřít v novém okně",
+  "openInNewWindowFailed": "Tento chat se nepodařilo otevřít v novém okně",
   "rename": "Přejmenovat",
   "delete": "Smazat",
   "copied": "Zkopírováno!",
@@ -240,16 +249,13 @@
     "deleteThread": {
       "description": "Opravdu chcete smazat toto vlákno? Tuto akci nelze vrátit zpět."
     },
-    "editMessage": {
-      "title": "Upravit zprávu"
-    },
     "messageMetadata": {
       "title": "Metadata zprávy"
     }
   },
   "projects": {
     "title": "Projekty",
-    "new": "Nové Projekty",
+    "new": "Nový Projekt",
     "addProject": "Přidat projekt",
     "addToProject": "Přidat do projektu",
     "removeFromProject": "Odebrat z projektu",
@@ -382,5 +388,18 @@
       "title": "Vlákno odebráno",
       "description": "Vlákno bylo úspěšně odebráno z \"{{projectName}}\""
     }
+  },
+  "skills": "Dovednosti",
+  "pluginsMenu": {
+    "title": "Pluginy",
+    "emptySkills": "Zatím žádné dovednosti",
+    "manageSkills": "Spravovat dovednosti"
+  },
+  "desktopNotification": {
+    "modelReadyTitle": "Model stažen",
+    "modelReadyBody": "{{name}} je připraven k použití.",
+    "engineReadyTitle": "Engine nainstalován",
+    "chatEngineReadyBody": "llama.cpp je připraven spouštět modely.",
+    "mediaEngineReadyBody": "Engine pro obrázky a video je připraven."
   }
 }

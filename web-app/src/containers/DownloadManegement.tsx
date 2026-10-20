@@ -1,49 +1,75 @@
 import {
-  Popover,
-  PopoverContent,
-  PopoverTrigger,
-} from '@/components/ui/popover'
-import { Progress } from '@/components/ui/progress'
-import { useDownloadStore } from '@/hooks/useDownloadStore'
-import { useAppUpdater } from '@/hooks/useAppUpdater'
+  useDownloadStore,
+  type DownloadProgressProps,
+  type DownloadStage,
+} from '@/hooks/useDownloadStore'
+import { useGeneralSetting } from '@/hooks/useGeneralSetting'
+import { useProxyConfig } from '@/hooks/useProxyConfig'
 import { useServiceHub } from '@/hooks/useServiceHub'
-import { DownloadEvent, DownloadState, events, AppEvent } from '@janhq/core'
-import { IconX, IconPlayerPause, IconPlayerPlay } from '@tabler/icons-react'
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { PRISM_PROVIDER } from '@/lib/model-setup'
+import {
+  prismSetupDeps,
+  verifyPrismDownload,
+} from '@/services/model-setup/prism-setup'
+import { DownloadEvent, DownloadState, events } from '@janhq/core'
+import { useCallback, useEffect, useMemo, useRef } from 'react'
 import { toast } from 'sonner'
+import { IconCheck } from '@tabler/icons-react'
 import { useTranslation } from '@/i18n/react-i18next-compat'
 import { useNavigate } from '@tanstack/react-router'
 import { route } from '@/constants/routes'
-import { DownloadIcon } from 'lucide-react'
-import { Button } from '@/components/ui/button'
+import { DownloadPanel } from '@/containers/downloads/DownloadPanel'
+import type { DownloadRowProps } from '@/containers/downloads/DownloadProgressRow'
 import {
+  cancelDownload,
   clearDownloadCancellationRequested,
-  markDownloadCancellationRequested,
+  isDownloadCancellationError,
   wasDownloadCancellationRequested,
 } from '@/lib/downloadCancellation'
-import posthog from 'posthog-js'
 import {
+  averageBytesPerSecond,
   classifyDownloadFailure,
   downloadKind,
   finalizeDownloadOnce,
   markModelDownloaded,
+  normalizeModelId,
   parseHttpStatus,
   quantFromModelId,
   scrubPii,
   sizeBucket,
   takeDownloadDuration,
 } from '@/lib/telemetry'
+import { queuedCapture } from '@/lib/telemetry-queue'
 import { captureHandledError } from '@/lib/sentry'
-
-//* Полупрозрачная зелень: текст % и ГБ остаётся читаемым в светлой и тёмной теме
-const DOWNLOAD_PROGRESS_INDICATOR = 'bg-emerald-400/50 dark:bg-emerald-400/45'
-
-function isCancellationLikeError(error?: string): boolean {
-  if (!error) return false
-  return /abort|aborted|cancel|cancelled|canceled|stop|stopped|interrupt/i.test(
-    error
-  )
-}
+import {
+  downloadArtifact,
+  isDiffusionModelDownloadTaskId,
+  resolveDiffusionDownloadTaskId,
+} from '@/lib/diffusion/models'
+import { isDiffusionEngineTaskId } from '@/services/diffusion/engine'
+import { isEngineBuildTaskId } from '@/services/engine-builds/install'
+import { isEngineUpdateTaskId } from '@/services/engines/update'
+import { cancelTransfer } from '@/services/diffusion/transfer'
+import {
+  decisionDownloadTaskId,
+  isDecisionDownloadTaskId,
+} from '@/lib/decision/models'
+import {
+  embeddingDownloadTaskId,
+  isEmbeddingDownloadTaskId,
+} from '@/lib/embedding/models'
+import { isManagedDownloadId } from '@/lib/managed-engine/download-id'
+import { isFoundryLocalDownloadId } from '@/lib/foundry-local/download-id'
+import { useDecisionStore } from '@/stores/decision-store'
+import { useEmbeddingStore } from '@/stores/embedding-store'
+import { useImageGenerationStore } from '@/stores/image-generation-store'
+import { useImageForm } from '@/hooks/useImageForm'
+import { notifyWhenAway } from '@/lib/notifications'
+import {
+  describeDiffusionDownloadToast,
+  describeFinishedDownload,
+} from '@/lib/downloadNotification'
+import type { DiffusionCatalog } from '@/services/diffusion-catalog-registry'
 
 /**
  * ATO-109: emit the terminal `model_download` event. Deduplicated so the two
@@ -52,9 +78,22 @@ function isCancellationLikeError(error?: string): boolean {
 function captureDownloadTerminal(
   status: 'completed' | 'failed' | 'cancelled',
   id: string,
-  opts: { downloadType?: string; error?: string; totalBytes?: number } = {}
+  opts: {
+    downloadType?: string
+    error?: string
+    totalBytes?: number
+    /** The store's row, for handlers that remove it before reporting. */
+    transfer?: DownloadProgressProps
+  } = {}
 ): void {
   if (!finalizeDownloadOnce(id)) return
+
+  // The extensions' terminal events carry no byte counts, so the size used to
+  // come from `state.size` and was always missing: every terminal event of the
+  // 30 days to 2026-09-29 read `size_bucket: 'unknown'`. The store's row has
+  // the total, and what the run did on the way.
+  const transfer = opts.transfer ?? useDownloadStore.getState().downloads[id]
+  const totalBytes = opts.totalBytes || transfer?.total
 
   const kind = downloadKind(id, opts.downloadType)
   if (status === 'completed' && kind === 'model') {
@@ -62,13 +101,19 @@ function captureDownloadTerminal(
   }
 
   try {
-    posthog.capture('model_download', {
-      status,
+    queuedCapture('model_download', {
+      // NOT `status` — that name is globally typed numeric in PostHog by
+      // `api_server_request.status` (an HTTP code), so string values read back
+      // as null. See the same note in `switchModel.ts`.
+      download_status: status,
       download_kind: kind,
-      model_id: id,
+      model_id: normalizeModelId(id),
       quant: quantFromModelId(id),
-      size_bucket: sizeBucket(opts.totalBytes),
+      size_bucket: sizeBucket(totalBytes),
       duration_ms: takeDownloadDuration(id),
+      avg_bytes_per_second: averageBytesPerSecond(transfer),
+      stall_count: transfer?.stalls ?? 0,
+      retry_count: transfer?.retries ?? 0,
       failure_reason:
         status === 'completed'
           ? undefined
@@ -80,18 +125,51 @@ function captureDownloadTerminal(
   }
 }
 
+/**
+ * OS notification for a finished download, shown only while the user is away
+ * from the window (the toast covers a focused one). Must run before the row is
+ * removed: both success events may arrive for one download, and only the
+ * first still finds its row.
+ */
+function notifyDownloadFinished(
+  state: DownloadState,
+  catalog: DiffusionCatalog | null,
+  t: (key: string, options?: Record<string, unknown>) => string
+): void {
+  const { downloads, localDownloadingModels } = useDownloadStore.getState()
+  const hasRow =
+    state.modelId in downloads || localDownloadingModels.has(state.modelId)
+  if (!hasRow) return
+  const notification = describeFinishedDownload(
+    state.modelId,
+    (state as unknown as { downloadType?: string }).downloadType,
+    catalog,
+    t
+  )
+  if (notification) notifyWhenAway(notification.title, notification.body)
+}
+
 export function DownloadManagement() {
   const { t } = useTranslation()
   const navigate = useNavigate()
-  const [isPopoverOpen, setIsPopoverOpen] = useState(false)
   const prevDownloadCount = useRef(0)
-  const autoHidePopoverTimer = useRef<ReturnType<typeof setTimeout> | null>(
-    null
-  )
+  // ATO-462 verification: how long the panel actually stayed expanded while
+  // something was downloading. Accumulated here (the panel owns the collapsed
+  // flag but not the download lifecycle) and reported once per download run.
+  const panelTiming = useRef({
+    collapsed: false,
+    since: 0,
+    expandedMs: 0,
+    collapsedMs: 0,
+    peakDownloads: 0,
+  })
   const serviceHub = useServiceHub()
+  const imageCatalog = useImageGenerationStore((state) => state.catalog)
+  const huggingfaceToken = useGeneralSetting((state) => state.huggingfaceToken)
   const {
     downloads,
     updateProgress,
+    updateStage,
     localDownloadingModels,
     removeDownload,
     removeLocalDownloadingModel,
@@ -103,152 +181,135 @@ export function DownloadManagement() {
     resumeParams,
     clearResumeParams,
     clearDownloadOrigin,
+    downloadOriginByModelId,
   } = useDownloadStore()
-  const { updateState } = useAppUpdater()
-
-  const [appUpdateState, setAppUpdateState] = useState({
-    isDownloading: false,
-    downloadProgress: 0,
-    downloadedBytes: 0,
-    totalBytes: 0,
-  })
-
-  useEffect(() => {
-    setAppUpdateState({
-      isDownloading: updateState.isDownloading,
-      downloadProgress: updateState.downloadProgress,
-      downloadedBytes: updateState.downloadedBytes,
-      totalBytes: updateState.totalBytes,
-    })
-  }, [updateState])
-
-  const onAppUpdateDownloadUpdate = useCallback(
-    (data: {
-      progress?: number
-      downloadedBytes?: number
-      totalBytes?: number
-    }) => {
-      setAppUpdateState((prev) => ({
-        ...prev,
-        isDownloading: true,
-        downloadProgress: data.progress || 0,
-        downloadedBytes: data.downloadedBytes || 0,
-        totalBytes: data.totalBytes || 0,
-      }))
-    },
-    []
-  )
-
-  const onAppUpdateDownloadSuccess = useCallback(() => {
-    setAppUpdateState((prev) => ({
-      ...prev,
-      isDownloading: false,
-      downloadProgress: 1,
-    }))
-    toast.success(t('common:toast.appUpdateDownloaded.title'), {
-      description: t('common:toast.appUpdateDownloaded.description'),
-    })
-  }, [t])
-
-  const onAppUpdateDownloadError = useCallback(() => {
-    setAppUpdateState((prev) => ({
-      ...prev,
-      isDownloading: false,
-    }))
-    toast.error(t('common:toast.appUpdateDownloadFailed.title'), {
-      description: t('common:toast.appUpdateDownloadFailed.description'),
-    })
-  }, [t])
+  const decisionCatalog = useDecisionStore((s) => s.catalog)
+  const embeddingCatalog = useEmbeddingStore((s) => s.catalog)
 
   const downloadProcesses = useMemo(() => {
+    // A managed model's id spells its repository with `_`; the Hub's Download
+    // recorded the repository itself as the download's origin. A decision or
+    // embedding model's task id is its catalog id behind a prefix: the row
+    // shows the model's name instead.
+    const rowName = (id: string) =>
+      (isManagedDownloadId(id) && downloadOriginByModelId[id]) ||
+      (isFoundryLocalDownloadId(id) && downloadOriginByModelId[id]) ||
+      (isEmbeddingDownloadTaskId(id) &&
+        embeddingCatalog.models.find(
+          (model) => embeddingDownloadTaskId(model.id) === id
+        )?.name) ||
+      (isDecisionDownloadTaskId(id) &&
+        decisionCatalog.models.find(
+          (model) => decisionDownloadTaskId(model.id) === id
+        )?.name) ||
+      id
     // Get downloads with progress data
-    const downloadsWithProgress = Object.values(downloads).map((download) => ({
-      id: download.name,
-      name: download.name,
-      progress: download.progress,
-      current: download.current,
-      total: download.total,
-    }))
+    const downloadsWithProgress = Object.entries(downloads).map(
+      ([downloadKey, download]) => {
+        // Early progress events can arrive before the backend fills `name` or
+        // even the mirrored `id`. The store key is still the requested model,
+        // so use it rather than rendering a nameless percentage-only row.
+        const modelId = download.id || download.name || downloadKey
+        return {
+          id: modelId,
+          name: rowName(modelId),
+          progress: download.progress,
+          current: download.current,
+          total: download.total,
+          bytesPerSecond: download.speed?.bytesPerSecond ?? 0,
+          stage: download.stage,
+        }
+      }
+    )
+    const progressIds = new Set(
+      downloadsWithProgress.map((download) => download.id)
+    )
 
     // Add local downloading models that don't have progress data yet
     const localDownloadsWithoutProgress = Array.from(localDownloadingModels)
-      .filter((modelId) => !downloads[modelId]) // Only include models not in downloads
+      .filter((modelId) => !progressIds.has(modelId))
       .map((modelId) => ({
         id: modelId,
-        name: modelId,
+        name: rowName(modelId),
         progress: 0,
         current: 0,
         total: 0,
+        bytesPerSecond: 0,
       }))
 
     return [...downloadsWithProgress, ...localDownloadsWithoutProgress]
-  }, [downloads, localDownloadingModels])
+  }, [
+    downloads,
+    localDownloadingModels,
+    downloadOriginByModelId,
+    decisionCatalog,
+    embeddingCatalog,
+  ])
 
-  const downloadCount = useMemo(() => {
-    const modelDownloads = downloadProcesses.length
-    const appUpdateDownload = appUpdateState.isDownloading ? 1 : 0
-    const total = modelDownloads + appUpdateDownload
-    return total
-  }, [downloadProcesses, appUpdateState.isDownloading])
+  // The app update is not counted: its progress lives in the update banner
+  // itself, the one place that offered it.
+  const downloadCount = downloadProcesses.length
+
+  // ATO-462: each download run starts expanded and stays present while active;
+  // a deliberate collapse lasts for that run. Measure how much of the run the
+  // user actually kept expanded, which is the number this redesign should move.
+  const settlePanelTiming = useCallback(() => {
+    const timing = panelTiming.current
+    if (!timing.since) return
+    const elapsed = Date.now() - timing.since
+    if (timing.collapsed) timing.collapsedMs += elapsed
+    else timing.expandedMs += elapsed
+    timing.since = Date.now()
+  }, [])
+
+  const onPanelCollapsedChange = useCallback(
+    (collapsed: boolean) => {
+      settlePanelTiming()
+      panelTiming.current.collapsed = collapsed
+    },
+    [settlePanelTiming]
+  )
 
   useEffect(() => {
     const prev = prevDownloadCount.current
     prevDownloadCount.current = downloadCount
+
+    const timing = panelTiming.current
+    timing.peakDownloads = Math.max(timing.peakDownloads, downloadCount)
+
     if (downloadCount > 0 && prev === 0) {
-      setIsPopoverOpen(true)
-      if (autoHidePopoverTimer.current) {
-        clearTimeout(autoHidePopoverTimer.current)
-      }
-      autoHidePopoverTimer.current = setTimeout(() => {
-        setIsPopoverOpen(false)
-        autoHidePopoverTimer.current = null
-      }, 3500)
-    } else if (downloadCount === 0 && prev > 0) {
-      if (autoHidePopoverTimer.current) {
-        clearTimeout(autoHidePopoverTimer.current)
-        autoHidePopoverTimer.current = null
-      }
-      setIsPopoverOpen(false)
+      timing.since = Date.now()
+      timing.expandedMs = 0
+      timing.collapsedMs = 0
+      timing.peakDownloads = downloadCount
+      return
     }
-  }, [downloadCount])
 
-  useEffect(() => {
-    return () => {
-      if (autoHidePopoverTimer.current) {
-        clearTimeout(autoHidePopoverTimer.current)
-      }
+    if (downloadCount === 0 && prev > 0) {
+      settlePanelTiming()
+      queuedCapture('download_panel_visibility', {
+        expanded_ms: Math.round(timing.expandedMs),
+        collapsed_ms: Math.round(timing.collapsedMs),
+        collapsed_at_end: timing.collapsed,
+        peak_downloads: timing.peakDownloads,
+      })
+      timing.since = 0
+      timing.expandedMs = 0
+      timing.collapsedMs = 0
+      timing.peakDownloads = 0
     }
-  }, [])
-
-  const overallProgress = useMemo(() => {
-    const modelTotal = downloadProcesses.reduce((acc, download) => {
-      return acc + download.total
-    }, 0)
-    const modelCurrent = downloadProcesses.reduce((acc, download) => {
-      return acc + download.current
-    }, 0)
-
-    // Include app update progress in overall calculation
-    const appUpdateTotal = appUpdateState.isDownloading
-      ? appUpdateState.totalBytes
-      : 0
-    const appUpdateCurrent = appUpdateState.isDownloading
-      ? appUpdateState.downloadedBytes
-      : 0
-
-    const total = modelTotal + appUpdateTotal
-    const current = modelCurrent + appUpdateCurrent
-
-    return total > 0 ? current / total : 0
-  }, [
-    downloadProcesses,
-    appUpdateState.isDownloading,
-    appUpdateState.totalBytes,
-    appUpdateState.downloadedBytes,
-  ])
+  }, [downloadCount, settlePanelTiming])
 
   const onFileDownloadUpdate = useCallback(
     async (state: DownloadState) => {
+      // The downloader also emits status-only updates while its retry ladders
+      // run (`stage`), which carry no byte counts. Feeding those through
+      // `updateProgress` would publish 0/0 and rewind the bar (#290).
+      const stage = (state as unknown as { stage?: DownloadStage }).stage
+      if (stage) {
+        updateStage(state.modelId, stage)
+        return
+      }
       updateProgress(
         state.modelId,
         state.percent,
@@ -257,32 +318,57 @@ export function DownloadManagement() {
         state.size?.total
       )
     },
-    [updateProgress]
+    [updateProgress, updateStage]
   )
 
   const onFileDownloadError = useCallback(
     (state: DownloadState) => {
       console.debug('onFileDownloadError', state)
-      clearPausedDownload(state.modelId)
-      clearResumeParams(state.modelId)
-      removeDownload(state.modelId)
-      removeLocalDownloadingModel(state.modelId)
-      clearDownloadOrigin(state.modelId)
 
       const anyState = state as unknown as {
         error?: string
         downloadType?: string
       }
       const err = anyState?.error || ''
+      // Read before the row is removed below; the terminal event reports it.
+      const transfer = useDownloadStore.getState().downloads[state.modelId]
+
+      // The Rust downloader opens the "verifying…" toast itself and never
+      // closes it. A failure that lands after it (disk error while hashing, a
+      // cancelled check) used to leave that toast spinning forever next to a
+      // download that had already ended.
+      toast.dismiss(`model-validation-started-${state.modelId}`)
+
+      // Stopping a diffusion transfer for Pause rejects its in-flight
+      // download promise. Keep the row and its last progress intact; a real
+      // network/disk failure while paused still follows the normal path.
+      if (
+        useDownloadStore.getState().pausedDownloads.has(state.modelId) &&
+        isDownloadCancellationError(err)
+      ) {
+        markResumableDownload(state.modelId)
+        return
+      }
+
+      clearPausedDownload(state.modelId)
+      clearResumeParams(state.modelId)
+      removeDownload(state.modelId)
+      removeLocalDownloadingModel(state.modelId)
+      clearDownloadOrigin(state.modelId)
 
       const cancelled =
         wasDownloadCancellationRequested(state.modelId) ||
-        isCancellationLikeError(err)
-      captureDownloadTerminal(cancelled ? 'cancelled' : 'failed', state.modelId, {
-        downloadType: anyState?.downloadType,
-        error: err,
-        totalBytes: state.size?.total,
-      })
+        isDownloadCancellationError(err)
+      captureDownloadTerminal(
+        cancelled ? 'cancelled' : 'failed',
+        state.modelId,
+        {
+          downloadType: anyState?.downloadType,
+          error: err,
+          totalBytes: state.size?.total,
+          transfer,
+        }
+      )
 
       if (cancelled) {
         markResumableDownload(state.modelId)
@@ -301,7 +387,7 @@ export function DownloadManagement() {
           failure_reason: classifyDownloadFailure(err),
           http_status: parseHttpStatus(err),
           download_kind: downloadKind(state.modelId, anyState?.downloadType),
-          model_id: state.modelId,
+          model_id: normalizeModelId(state.modelId),
           quant: quantFromModelId(state.modelId),
         }
       )
@@ -344,6 +430,65 @@ export function DownloadManagement() {
         return
       }
 
+      // ATO-467: a filesystem failure now says which one it was. The generic
+      // "download failed" toast told 647 devices nothing they could act on,
+      // and disk faults are the single largest failure cause.
+      const diskReason = classifyDownloadFailure(err)
+      const diskToastKey: Record<string, string> = {
+        disk_full: 'common:toast.downloadDiskFull',
+        disk_permission: 'common:toast.downloadDiskPermission',
+        disk_file_locked: 'common:toast.downloadDiskLocked',
+        disk_path_too_long: 'common:toast.downloadDiskPathTooLong',
+        disk_device_lost: 'common:toast.downloadDiskDeviceLost',
+      }
+      const diskKey = diskToastKey[diskReason]
+      if (diskKey) {
+        markResumableDownload(state.modelId)
+        toast.error(t(`${diskKey}.title`), {
+          id: 'download-failed',
+          description: t(`${diskKey}.description`),
+          duration: 30000,
+        })
+        return
+      }
+
+      // ATO — #290: a download that never reached the server is not a generic
+      // failure, and when the user has a proxy configured it is overwhelmingly
+      // the cause. Naming it (and offering the settings page) is the whole
+      // difference between "it just doesn't work" and a one-click fix.
+      if (diskReason === 'proxy' || diskReason === 'network') {
+        markResumableDownload(state.modelId)
+        const viaProxy =
+          diskReason === 'proxy' ||
+          (useProxyConfig.getState().proxyEnabled &&
+            Boolean(useProxyConfig.getState().proxyUrl))
+        if (viaProxy) {
+          toast.error(t('common:toast.downloadProxyUnreachable.title'), {
+            id: 'download-failed',
+            description: t(
+              'common:toast.downloadProxyUnreachable.description',
+              {
+                proxyUrl: useProxyConfig.getState().proxyUrl,
+              }
+            ),
+            duration: 30000,
+            action: {
+              label: t('common:toast.downloadProxyUnreachable.action'),
+              onClick: () => navigate({ to: route.settings.https_proxy }),
+            },
+          })
+        } else {
+          toast.error(t('common:toast.downloadNetworkUnreachable.title'), {
+            id: 'download-failed',
+            description: t(
+              'common:toast.downloadNetworkUnreachable.description'
+            ),
+            duration: 30000,
+          })
+        }
+        return
+      }
+
       markResumableDownload(state.modelId)
       toast.error(t('common:toast.downloadFailed.title'), {
         id: 'download-failed',
@@ -369,6 +514,33 @@ export function DownloadManagement() {
     (event: { modelId: string; downloadType: string }) => {
       console.debug('onModelValidationStarted', event)
 
+      const diffusion = describeDiffusionDownloadToast(
+        event.modelId,
+        imageCatalog,
+        t
+      )
+      if (diffusion) {
+        const description =
+          diffusion.kind === 'model' ? (
+            <span className="block">
+              <span className="block">
+                {t('images:download.checkingFiles')}
+              </span>
+              <span className="block whitespace-nowrap">
+                {t('images:download.readyAfterCheck')}
+              </span>
+            </span>
+          ) : (
+            t('images:download.checkingFiles')
+          )
+        toast.loading(diffusion.finishing, {
+          id: `model-validation-started-${event.modelId}`,
+          description,
+          duration: Infinity,
+        })
+        return
+      }
+
       // Show validation in progress toast
       toast.info(t('common:toast.modelValidationStarted.title'), {
         id: `model-validation-started-${event.modelId}`,
@@ -378,7 +550,7 @@ export function DownloadManagement() {
         duration: Infinity,
       })
     },
-    [t]
+    [t, imageCatalog]
   )
 
   const onModelValidationFailed = useCallback(
@@ -391,6 +563,11 @@ export function DownloadManagement() {
       captureDownloadTerminal('failed', event.modelId, {
         downloadType: 'Model',
         error: event.error || event.reason,
+        // The only terminal site that reported no size, so every
+        // validation failure landed in `size_bucket: 'unknown'` — and size is
+        // exactly what a hash/size mismatch is about. The transfer finished
+        // before validation ran, so the store still has the total.
+        totalBytes: useDownloadStore.getState().downloads[event.modelId]?.total,
       })
 
       clearResumableDownload(event.modelId)
@@ -422,6 +599,8 @@ export function DownloadManagement() {
   const onFileDownloadStopped = useCallback(
     (state: DownloadState) => {
       console.debug('onFileDownloadStopped', state)
+
+      toast.dismiss(`model-validation-started-${state.modelId}`)
 
       // ATO-154: a paused download stops the transfer but is not a terminal
       // event. Keep the `downloads[modelId]` entry (so the popover row survives
@@ -471,6 +650,7 @@ export function DownloadManagement() {
     async (state: DownloadState) => {
       console.debug('onFileDownloadSuccess', state)
 
+      notifyDownloadFinished(state, imageCatalog, t)
       captureDownloadTerminal('completed', state.modelId, {
         downloadType: (state as unknown as { downloadType?: string })
           ?.downloadType,
@@ -487,12 +667,22 @@ export function DownloadManagement() {
       removeDownload(state.modelId)
       removeLocalDownloadingModel(state.modelId)
       clearDownloadOrigin(state.modelId)
-      toast.success(t('common:toast.downloadComplete.title'), {
-        id: 'download-complete',
-        description: t('common:toast.downloadComplete.description', {
-          item: state.modelId,
-        }),
-      })
+      const diffusion = describeDiffusionDownloadToast(
+        state.modelId,
+        imageCatalog,
+        t
+      )
+      toast.success(
+        diffusion ? diffusion.ready : t('common:toast.downloadComplete.title'),
+        {
+          id: 'download-complete',
+          description: diffusion
+            ? undefined
+            : t('common:toast.downloadComplete.description', {
+                item: state.modelId,
+              }),
+        }
+      )
     },
     [
       removeDownload,
@@ -501,6 +691,7 @@ export function DownloadManagement() {
       clearPausedDownload,
       clearResumeParams,
       clearDownloadOrigin,
+      imageCatalog,
       t,
     ]
   )
@@ -509,6 +700,7 @@ export function DownloadManagement() {
     async (state: DownloadState) => {
       console.debug('onFileDownloadAndVerificationSuccess', state)
 
+      notifyDownloadFinished(state, imageCatalog, t)
       captureDownloadTerminal('completed', state.modelId, {
         downloadType: (state as unknown as { downloadType?: string })
           ?.downloadType,
@@ -525,15 +717,24 @@ export function DownloadManagement() {
       removeDownload(state.modelId)
       removeLocalDownloadingModel(state.modelId)
       clearDownloadOrigin(state.modelId)
-      toast.success(t('common:toast.downloadAndVerificationComplete.title'), {
-        id: 'download-complete',
-        description: t(
-          'common:toast.downloadAndVerificationComplete.description',
-          {
-            item: state.modelId,
-          }
-        ),
-      })
+      const diffusion = describeDiffusionDownloadToast(
+        state.modelId,
+        imageCatalog,
+        t
+      )
+      toast.success(
+        diffusion
+          ? diffusion.ready
+          : t('common:toast.downloadAndVerificationComplete.title'),
+        {
+          id: 'download-complete',
+          description: diffusion
+            ? undefined
+            : t('common:toast.downloadAndVerificationComplete.description', {
+                item: state.modelId,
+              }),
+        }
+      )
     },
     [
       removeDownload,
@@ -542,6 +743,7 @@ export function DownloadManagement() {
       clearPausedDownload,
       clearResumeParams,
       clearDownloadOrigin,
+      imageCatalog,
       t,
     ]
   )
@@ -559,11 +761,6 @@ export function DownloadManagement() {
       onFileDownloadAndVerificationSuccess
     )
 
-    // Register app update event listeners
-    events.on(AppEvent.onAppUpdateDownloadUpdate, onAppUpdateDownloadUpdate)
-    events.on(AppEvent.onAppUpdateDownloadSuccess, onAppUpdateDownloadSuccess)
-    events.on(AppEvent.onAppUpdateDownloadError, onAppUpdateDownloadError)
-
     return () => {
       console.debug('DownloadListener: unregistering event listeners...')
       events.off(DownloadEvent.onFileDownloadUpdate, onFileDownloadUpdate)
@@ -579,14 +776,6 @@ export function DownloadManagement() {
         DownloadEvent.onFileDownloadAndVerificationSuccess,
         onFileDownloadAndVerificationSuccess
       )
-
-      // Unregister app update event listeners
-      events.off(AppEvent.onAppUpdateDownloadUpdate, onAppUpdateDownloadUpdate)
-      events.off(
-        AppEvent.onAppUpdateDownloadSuccess,
-        onAppUpdateDownloadSuccess
-      )
-      events.off(AppEvent.onAppUpdateDownloadError, onAppUpdateDownloadError)
     }
   }, [
     onFileDownloadUpdate,
@@ -596,21 +785,27 @@ export function DownloadManagement() {
     onModelValidationStarted,
     onModelValidationFailed,
     onFileDownloadAndVerificationSuccess,
-    onAppUpdateDownloadUpdate,
-    onAppUpdateDownloadSuccess,
-    onAppUpdateDownloadError,
   ])
-
-  function renderGB(bytes: number): string {
-    const gb = bytes / 1024 ** 3
-    return ((gb * 100) / 100).toFixed(2)
-  }
 
   // ATO-154: pause/resume is only offered for resumable model (GGUF) downloads.
   // Backend-binary downloads (`llamacpp*`) and MLX repos (`mlx-community/*`,
   // which start with `mlx`) get cancel-only, matching Jan's gating.
+  // Decision and embedding models resume from their Hub or settings card,
+  // not from here.
+  // Engine updates (`engine-update-*`) are the core's to stop, cancel-only.
+  // Managed models are cancel-only too: Download again in the Hub resumes
+  // from the files on disk (change add-tensorrt-llm-model-hub, design D6);
+  // so are Foundry Local variants (change add-foundry-local).
   const isPausableDownload = (id: string): boolean =>
-    !id.startsWith('llamacpp') && !id.startsWith('mlx')
+    !id.startsWith('llamacpp') &&
+    !isDiffusionEngineTaskId(id) &&
+    !isEngineBuildTaskId(id) &&
+    !isEngineUpdateTaskId(id) &&
+    !id.startsWith('mlx') &&
+    !isDecisionDownloadTaskId(id) &&
+    !isEmbeddingDownloadTaskId(id) &&
+    !isManagedDownloadId(id) &&
+    !isFoundryLocalDownloadId(id)
 
   const handlePauseDownload = useCallback(
     (download: { id: string; name: string }) => {
@@ -620,13 +815,57 @@ export function DownloadManagement() {
         markPausedDownload(download.name)
         markResumableDownload(download.name)
       }
-      void serviceHub.models().abortDownload(download.name)
+      if (isDiffusionModelDownloadTaskId(download.id)) {
+        void cancelTransfer(download.id)
+      } else {
+        void serviceHub.models().abortDownload(download.name)
+      }
     },
     [markPausedDownload, markResumableDownload, serviceHub]
   )
 
   const handleResumeDownload = useCallback(
     (download: { id: string; name: string }) => {
+      const diffusionTarget = imageCatalog
+        ? resolveDiffusionDownloadTaskId(imageCatalog, download.id)
+        : null
+      if (diffusionTarget) {
+        clearPausedDownload(download.id)
+        if (download.id !== download.name) clearPausedDownload(download.name)
+        markResumableDownload(download.id)
+        toast.success(t('common:toast.downloadResumed.title'), {
+          icon: (
+            <IconCheck
+              size={16}
+              className="text-blue-500 dark:text-blue-400"
+              aria-hidden
+            />
+          ),
+          duration: 2500,
+        })
+        void downloadArtifact(
+          diffusionTarget.family,
+          diffusionTarget.quant.id,
+          {
+            resume: true,
+            hfToken: huggingfaceToken,
+            workflow: useImageForm.getState().workflow,
+          }
+        )
+          // Nothing else re-lists the models folder for a resume started
+          // here, so the finished model kept reading as "not downloaded".
+          .then(() => useImageGenerationStore.getState().refreshModelFiles())
+          .catch((error) => {
+            // downloadArtifact emits the ordinary transfer-error event first;
+            // that listener owns the existing user-facing failure path.
+            console.error(
+              '[DownloadManagement] diffusion resume failed:',
+              error
+            )
+          })
+        return
+      }
+
       const params = resumeParams[download.id] ?? resumeParams[download.name]
       if (!params) {
         // No stored params (e.g. resumed after an app restart). Fall back to
@@ -642,21 +881,46 @@ export function DownloadManagement() {
       clearPausedDownload(download.id)
       if (download.id !== download.name) clearPausedDownload(download.name)
       markResumableDownload(download.id)
+      const {
+        modelPath,
+        mmprojPath,
+        hfToken,
+        skipVerification,
+        ...pullOptions
+      } = params
       void serviceHub
         .models()
         .pullModelWithMetadata(
           download.id,
-          params.modelPath,
-          params.mmprojPath,
-          params.hfToken,
-          params.skipVerification ?? true,
-          true
+          modelPath,
+          mmprojPath,
+          hfToken,
+          skipVerification ?? true,
+          true,
+          pullOptions
         )
+        .then(async (refusal) => {
+          // A Bonsai file ends as the Hub's download does: kept only if the
+          // core says PrismML runs the file now on disk.
+          if (pullOptions.provider !== PRISM_PROVIDER || refusal) return
+          if (useDownloadStore.getState().pausedDownloads.has(download.id))
+            return
+          const result = await verifyPrismDownload(
+            download.id,
+            prismSetupDeps(serviceHub)
+          )
+          if (result.outcome === 'rejected')
+            toast.error(t('hub:prismModelRejected'), {
+              description: result.reason,
+            })
+        })
         .catch((error) => {
           console.error('[DownloadManagement] resume failed:', error)
         })
     },
     [
+      imageCatalog,
+      huggingfaceToken,
       resumeParams,
       clearPausedDownload,
       markResumableDownload,
@@ -665,188 +929,41 @@ export function DownloadManagement() {
     ]
   )
 
-  return (
-    <>
-      <Popover open={isPopoverOpen} onOpenChange={setIsPopoverOpen}>
-        <PopoverTrigger asChild>
-          <Button
-            variant="ghost"
-            size="icon"
-            className="text-muted-foreground z-50 rounded-full hover:bg-sidebar-foreground/8! -mt-0.5 size-7 relative"
-          >
-            <DownloadIcon className="text-muted-foreground size-4" />
-            {downloadCount > 0 && (
-              <svg
-                className="absolute inset-0 size-7 -rotate-90"
-                viewBox="0 0 36 36"
-              >
-                <path
-                  className="text-primary/30"
-                  stroke="currentColor"
-                  strokeWidth="2"
-                  fill="none"
-                  d="M18 2.0845 a 15.9155 15.9155 0 0 1 0 31.831 a 15.9155 15.9155 0 0 1 0 -31.831"
-                />
-                <path
-                  className="text-primary"
-                  stroke="currentColor"
-                  strokeWidth="2"
-                  fill="none"
-                  strokeLinecap="round"
-                  strokeDasharray={`${overallProgress * 100}, 100`}
-                  d="M18 2.0845 a 15.9155 15.9155 0 0 1 0 31.831 a 15.9155 15.9155 0 0 1 0 -31.831"
-                />
-              </svg>
-            )}
-          </Button>
-        </PopoverTrigger>
+  // Shared with the composer's reply widget, which offers the same Cancel on
+  // the download it lists.
+  const handleCancelDownload = useCallback(
+    (download: { id: string; name: string }) =>
+      cancelDownload(download, serviceHub),
+    [serviceHub]
+  )
 
-        <PopoverContent
-          side="bottom"
-          align="start"
-          className="p-0 overflow-hidden text-sm select-none rounded-2xl"
-          sideOffset={6}
-          collisionPadding={8}
-          onOpenAutoFocus={(e) => e.preventDefault()}
-        >
-          <div className="flex flex-col">
-            {appUpdateState.isDownloading || downloadProcesses.length > 0 ? (
-              <>
-                <div className="px-3 pt-2 flex items-center justify-between">
-                  <p>{t('downloading')}</p>
-                </div>
-                <div className="p-2 max-h-[300px] overflow-y-auto space-y-2">
-                  {appUpdateState.isDownloading && (
-                    <div className="rounded-lg p-2 bg-secondary">
-                      <div className="flex items-center justify-between">
-                        <p className="truncate">App Update</p>
-                      </div>
-                      <div className="relative z-40 my-2 h-6">
-                        <Progress
-                          value={appUpdateState.downloadProgress * 100}
-                          indicatorClassName={DOWNLOAD_PROGRESS_INDICATOR}
-                          className="absolute inset-0 h-full bg-muted-foreground/15 dark:bg-muted-foreground/20 rounded-md"
-                        />
-                        <div className="pointer-events-none absolute inset-0 z-1 flex items-center justify-between px-2">
-                          <p className="text-xs font-medium tabular-nums text-foreground">
-                            {Math.round(appUpdateState.downloadProgress * 100)}%
-                          </p>
-                          <p className="text-xs font-medium tabular-nums text-foreground">
-                            {`${renderGB(appUpdateState.downloadedBytes)} / ${renderGB(appUpdateState.totalBytes)}`}{' '}
-                            GB
-                          </p>
-                        </div>
-                      </div>
-                    </div>
-                  )}
-                  {downloadProcesses.map((download) => (
-                    <div
-                      key={download.id}
-                      className="rounded-lg p-2 bg-secondary"
-                    >
-                      <div className="flex items-center justify-between gap-2">
-                        <p className="truncate">{download.name}</p>
-                        <div className="shrink-0 flex items-center space-x-0.5">
-                          {isPausableDownload(download.id) &&
-                            (pausedDownloads.has(download.id) ? (
-                              <Button
-                                variant="secondary"
-                                size="icon-xs"
-                                onClick={() => handleResumeDownload(download)}
-                              >
-                                <IconPlayerPlay
-                                  size={16}
-                                  className="text-muted-foreground cursor-pointer"
-                                  title={t('resumeDownload')}
-                                />
-                              </Button>
-                            ) : (
-                              <Button
-                                variant="secondary"
-                                size="icon-xs"
-                                onClick={() => handlePauseDownload(download)}
-                              >
-                                <IconPlayerPause
-                                  size={16}
-                                  className="text-muted-foreground cursor-pointer"
-                                  title={t('pauseDownload')}
-                                />
-                              </Button>
-                            ))}
-                          <Button
-                            variant="secondary"
-                            size="icon-xs"
-                            onClick={() => {
-                              markDownloadCancellationRequested(download.name)
-                              markResumableDownload(download.name)
-                              clearPausedDownload(download.name)
-                              clearResumeParams(download.name)
-                              if (download.id !== download.name) {
-                                markDownloadCancellationRequested(download.id)
-                                markResumableDownload(download.id)
-                                clearPausedDownload(download.id)
-                                clearResumeParams(download.id)
-                              }
-                              if (
-                                download.id.startsWith('llamacpp') ||
-                                download.id.startsWith('mlx')
-                              ) {
-                                const downloadManager =
-                                  window.core.extensionManager.getByName(
-                                    '@janhq/download-extension'
-                                  )
-                                downloadManager.cancelDownload(download.id)
-                              } else {
-                                serviceHub.models().abortDownload(download.name)
-                                if (downloadProcesses.length === 0) {
-                                  setIsPopoverOpen(false)
-                                }
-                              }
-                              setIsPopoverOpen(false)
-                            }}
-                          >
-                            <IconX
-                              size={16}
-                              className="text-muted-foreground cursor-pointer"
-                              title={t('cancelDownload')}
-                            />
-                          </Button>
-                        </div>
-                      </div>
-                      <div className="relative z-40 my-2 h-6">
-                        <Progress
-                          value={download.progress * 100}
-                          indicatorClassName={DOWNLOAD_PROGRESS_INDICATOR}
-                          className="absolute inset-0 h-full bg-muted-foreground/15 dark:bg-muted-foreground/20 rounded-md"
-                        />
-                        <div className="pointer-events-none absolute inset-0 z-1 flex items-center justify-between px-2">
-                          <p className="text-xs font-medium tabular-nums text-foreground">
-                            {download.total > 0
-                              ? `${Math.round(download.progress * 100)}%`
-                              : 'Initializing download...'}
-                          </p>
-                          <p className="text-xs font-medium tabular-nums text-foreground">
-                            {download.total > 0
-                              ? `${renderGB(download.current)} / ${renderGB(download.total)} GB`
-                              : ''}
-                          </p>
-                        </div>
-                      </div>
-                    </div>
-                  ))}
-                </div>
-              </>
-            ) : (
-              <div className="px-3 py-8 flex flex-col items-center justify-center text-center space-y-2">
-                <DownloadIcon className="text-muted-foreground/50 size-6" />
-                <p className="text-muted-foreground leading-normal">
-                  Your download progress <br /> will appear here
-                </p>
-              </div>
-            )}
-          </div>
-        </PopoverContent>
-      </Popover>
-    </>
+  const panelItems = useMemo<DownloadRowProps[]>(() => {
+    const rows: DownloadRowProps[] = []
+
+    for (const download of downloadProcesses) {
+      rows.push({
+        ...download,
+        paused: pausedDownloads.has(download.id),
+        pausable: isPausableDownload(download.id),
+        onPause: () => handlePauseDownload(download),
+        onResume: () => handleResumeDownload(download),
+        onCancel: () => handleCancelDownload(download),
+      })
+    }
+
+    return rows
+  }, [
+    downloadProcesses,
+    pausedDownloads,
+    handlePauseDownload,
+    handleResumeDownload,
+    handleCancelDownload,
+  ])
+
+  return (
+    <DownloadPanel
+      items={panelItems}
+      onCollapsedChange={onPanelCollapsedChange}
+    />
   )
 }

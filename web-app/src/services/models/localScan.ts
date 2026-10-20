@@ -1,12 +1,19 @@
 /**
- * Local model scanner: detects models already downloaded by other apps
- * (LM Studio / Hugging Face cache / Unsloth / Ollama) so the user can run them
- * in Atomic Chat WITHOUT re-downloading. The engine `import()` already accepts
- * an absolute path and skips the download (it writes a `model.yml` pointing at
- * the existing file); this module only finds the candidates.
+ * Local model scanner: detects models already downloaded by other apps so the
+ * user can run them in Atomic Chat WITHOUT re-downloading. The engine
+ * `import()` already accepts an absolute path and skips the download (it
+ * writes a `model.yml` pointing at the existing file); this module only finds
+ * the candidates.
  *
- * Scope: LM Studio, HF cache, Unsloth (exports/ runnable + outputs/ marked),
- * and Ollama (manifest → blob, exposed as a `.gguf` symlink without copying).
+ * Scope: LM Studio, the Hugging Face cache, Unsloth (exports/ runnable +
+ * outputs/ marked), Ollama (manifest → blob, exposed as a `.gguf` symlink
+ * without copying), GPT4All, Jan, Msty and llama.cpp's own `-hf` cache. Each
+ * store's location honours the environment variable that relocates it
+ * (`OLLAMA_MODELS`, `HF_HOME`, …) — read through the `get_env_vars` command,
+ * since the renderer cannot see the process environment — and the per-OS
+ * app-data folder (`%LOCALAPPDATA%`, `~/Library/Application Support`, XDG).
+ * Only text-generation models are returned — embedding/reranker weights live in
+ * the same caches but crash `llama-server` when loaded as a chat model.
  *
  * All filesystem access goes through the existing unscoped Tauri commands
  * (`readdir_sync` / `read_file_sync` / `exists_sync` / `file_stat`) which accept
@@ -15,6 +22,7 @@
  * yields no candidates rather than throwing.
  */
 import { getServiceHub } from '@/hooks/useServiceHub'
+import { groupGgufShards, isNonWeightGgufFile } from '@/lib/models'
 
 export type LocalScanFormat = 'gguf' | 'mlx' | 'adapter'
 
@@ -45,6 +53,46 @@ const MAX_WALK_DEPTH = 6
 
 function core() {
   return getServiceHub().core()
+}
+
+/**
+ * The environment variables the scanner honours. Mirrors the allow-list in
+ * `src-tauri/src/core/filesystem/commands.rs` (`SCAN_ENV_KEYS`); a key missing
+ * from either side simply reads as unset.
+ */
+export const SCAN_ENV_KEYS = [
+  'OLLAMA_MODELS',
+  'HF_HOME',
+  'HF_HUB_CACHE',
+  'TRANSFORMERS_CACHE',
+  'UNSLOTH_STUDIO_HOME',
+  'STUDIO_HOME',
+  'LLAMA_CACHE',
+  'LOCALAPPDATA',
+  'APPDATA',
+  'XDG_DATA_HOME',
+  'XDG_CONFIG_HOME',
+  'XDG_CACHE_HOME',
+] as const
+
+export type ScanEnvKey = (typeof SCAN_ENV_KEYS)[number]
+export type ScanEnv = Partial<Record<ScanEnvKey, string>>
+
+/** The host OS, as the root resolvers see it. */
+export type ScanOs = 'macos' | 'windows' | 'linux'
+
+const currentScanOs = (): ScanOs =>
+  IS_MACOS ? 'macos' : IS_WINDOWS ? 'windows' : 'linux'
+
+async function scanEnv(): Promise<ScanEnv> {
+  try {
+    const env = await core().invoke<Record<string, string>>('get_env_vars', {
+      keys: [...SCAN_ENV_KEYS],
+    })
+    return env ?? {}
+  } catch {
+    return {}
+  }
 }
 
 async function osHomeDir(): Promise<string | null> {
@@ -173,7 +221,10 @@ async function collectGgufFiles(
       mmprojs.push(...nested.mmprojs)
     } else if (name.toLowerCase().endsWith('.gguf')) {
       if (looksLikeMmproj(name)) mmprojs.push(child)
-      else models.push(child)
+      // An imatrix, MTP head or DFlash draft sitting in someone's cache is not
+      // a model — listing it only offers a run that cannot start. Same rule as
+      // the Hub listing (ATO-523).
+      else if (!isNonWeightGgufFile(name)) models.push(child)
     }
   }
   return { models, mmprojs }
@@ -198,6 +249,37 @@ async function isAdapterDir(dir: string): Promise<boolean> {
     if (basename(child).toLowerCase() === 'adapter_config.json') return true
   }
   return false
+}
+
+/**
+ * Collapse multi-part GGUFs to the one file that can actually be loaded.
+ *
+ * A cache holding `M-00001-of-00003.gguf` … `M-00003-of-00003.gguf` describes a
+ * single model, but taken file by file it offered three, two of which llama.cpp
+ * refuses outright ("model must be loaded with the first split"). Each set
+ * yields its first shard, sized as the whole set rather than as the few-megabyte
+ * header the first shard usually is.
+ */
+async function foldGgufShardSets(
+  files: string[]
+): Promise<Array<{ path: string; sizeBytes?: number }>> {
+  const out: Array<{ path: string; sizeBytes?: number }> = []
+  for (const group of groupGgufShards(files.map((rfilename) => ({ rfilename })))) {
+    let total = 0
+    let sized = false
+    for (const { rfilename } of group) {
+      const st = await statOf(rfilename)
+      if (typeof st?.size === 'number') {
+        total += st.size
+        sized = true
+      }
+    }
+    out.push({
+      path: group[0].rfilename,
+      sizeBytes: sized ? total : undefined,
+    })
+  }
+  return out
 }
 
 function ggufCandidate(
@@ -252,10 +334,9 @@ async function scanGenericRoot(
   const { models, mmprojs } = await collectGgufFiles(root)
   const mmprojByDir = new Map<string, string>()
   for (const m of mmprojs) mmprojByDir.set(dirOf(m), m)
-  for (const file of models) {
-    const st = await statOf(file)
+  for (const { path, sizeBytes } of await foldGgufShardSets(models)) {
     out.push(
-      ggufCandidate(file, source, mmprojByDir.get(dirOf(file)), st?.size)
+      ggufCandidate(path, source, mmprojByDir.get(dirOf(path)), sizeBytes)
     )
   }
 
@@ -285,6 +366,114 @@ function dirOf(path: string): string {
   const parts = path.split(/[\\/]/)
   parts.pop()
   return parts.join(SEP)
+}
+
+// --- Where each app keeps its models ---------------------------------------
+//
+// Pure functions of (home, env, os) so the locations can be tested without a
+// filesystem. An env override always comes first; the platform default follows
+// so a user who set the variable *and* left files at the default still sees
+// both.
+
+/** `%LOCALAPPDATA%` / `~/Library/Application Support` / `$XDG_DATA_HOME`. */
+function appDataDir(home: string, env: ScanEnv, os: ScanOs): string {
+  if (os === 'windows') {
+    return env.LOCALAPPDATA ?? joinPath(home, 'AppData', 'Local')
+  }
+  if (os === 'macos') return joinPath(home, 'Library', 'Application Support')
+  return env.XDG_DATA_HOME ?? joinPath(home, '.local', 'share')
+}
+
+/** `%APPDATA%` / `~/Library/Application Support` / `$XDG_CONFIG_HOME`. */
+function configDir(home: string, env: ScanEnv, os: ScanOs): string {
+  if (os === 'windows') {
+    return env.APPDATA ?? joinPath(home, 'AppData', 'Roaming')
+  }
+  if (os === 'macos') return joinPath(home, 'Library', 'Application Support')
+  return env.XDG_CONFIG_HOME ?? joinPath(home, '.config')
+}
+
+/** `%LOCALAPPDATA%` / `~/Library/Caches` / `$XDG_CACHE_HOME`. */
+function cacheDir(home: string, env: ScanEnv, os: ScanOs): string {
+  if (os === 'windows') {
+    return env.LOCALAPPDATA ?? joinPath(home, 'AppData', 'Local')
+  }
+  if (os === 'macos') return joinPath(home, 'Library', 'Caches')
+  return env.XDG_CACHE_HOME ?? joinPath(home, '.cache')
+}
+
+const unique = (paths: string[]): string[] => [
+  ...new Set(paths.filter((p) => p.length > 0)),
+]
+
+/**
+ * Hugging Face hub caches. `HF_HUB_CACHE` names the hub directly, `HF_HOME`
+ * its parent; `TRANSFORMERS_CACHE` is the pre-2023 spelling of the hub and is
+ * still set in plenty of shells.
+ */
+export function hfCacheRoots(home: string, env: ScanEnv): string[] {
+  return unique([
+    env.HF_HUB_CACHE ?? '',
+    env.HF_HOME ? joinPath(env.HF_HOME, 'hub') : '',
+    env.TRANSFORMERS_CACHE ?? '',
+    joinPath(home, '.cache', 'huggingface', 'hub'),
+  ])
+}
+
+export function unslothRoot(home: string, env: ScanEnv): string {
+  return (
+    env.UNSLOTH_STUDIO_HOME ?? env.STUDIO_HOME ?? joinPath(home, '.unsloth', 'studio')
+  )
+}
+
+export function ollamaRoot(home: string, env: ScanEnv): string {
+  return env.OLLAMA_MODELS ?? joinPath(home, '.ollama', 'models')
+}
+
+/** GPT4All keeps downloads under its app-data folder on every OS. */
+export function gpt4allRoots(home: string, env: ScanEnv, os: ScanOs): string[] {
+  return unique([joinPath(appDataDir(home, env, os), 'nomic.ai', 'GPT4All')])
+}
+
+/**
+ * Jan defaults its data folder to `~/jan`; older builds and some installs use
+ * the app-data folder instead. Both are checked.
+ */
+export function janRoots(home: string, env: ScanEnv, os: ScanOs): string[] {
+  return unique([
+    joinPath(home, 'jan', 'models'),
+    joinPath(configDir(home, env, os), 'Jan', 'data', 'models'),
+  ])
+}
+
+export function mstyRoots(home: string, env: ScanEnv, os: ScanOs): string[] {
+  return unique([joinPath(configDir(home, env, os), 'Msty', 'models')])
+}
+
+/** Where `llama-cli -hf …` and `llama-server -hf …` put what they fetch. */
+export function llamaCppCacheRoots(
+  home: string,
+  env: ScanEnv,
+  os: ScanOs
+): string[] {
+  return unique([
+    env.LLAMA_CACHE ?? '',
+    joinPath(cacheDir(home, env, os), 'llama.cpp'),
+    // llama.cpp on Linux/macOS writes to ~/.cache regardless of XDG_CACHE_HOME
+    // in older builds; keep the plain default too.
+    os === 'windows' ? '' : joinPath(home, '.cache', 'llama.cpp'),
+  ])
+}
+
+async function scanRoots(
+  roots: string[],
+  source: LocalModelSource
+): Promise<LocalModelCandidate[]> {
+  const out: LocalModelCandidate[] = []
+  for (const root of roots) {
+    out.push(...(await scanGenericRoot(root, source, IS_MACOS)))
+  }
+  return out
 }
 
 // --- LM Studio ------------------------------------------------------------
@@ -355,15 +544,14 @@ async function scanHfCacheRoot(
     const { models, mmprojs } = await collectGgufFiles(snapshot)
     const mmprojByDir = new Map<string, string>()
     for (const m of mmprojs) mmprojByDir.set(dirOf(m), m)
-    for (const file of models) {
-      const fst = await statOf(file)
+    for (const { path, sizeBytes } of await foldGgufShardSets(models)) {
       const cand = ggufCandidate(
-        file,
+        path,
         source,
-        mmprojByDir.get(dirOf(file)),
-        fst?.size
+        mmprojByDir.get(dirOf(path)),
+        sizeBytes
       )
-      cand.id = sanitizeGgufId(`${repoId}/${basename(file)}`)
+      cand.id = sanitizeGgufId(`${repoId}/${basename(path)}`)
       out.push(cand)
     }
 
@@ -378,23 +566,24 @@ async function scanHfCacheRoot(
   return out
 }
 
-async function scanHfCache(home: string): Promise<LocalModelCandidate[]> {
-  return scanHfCacheRoot(
-    joinPath(home, '.cache', 'huggingface', 'hub'),
-    'huggingface-cache'
-  )
+async function scanHfCache(
+  home: string,
+  env: ScanEnv
+): Promise<LocalModelCandidate[]> {
+  const out: LocalModelCandidate[] = []
+  for (const hub of hfCacheRoots(home, env)) {
+    out.push(...(await scanHfCacheRoot(hub, 'huggingface-cache')))
+  }
+  return out
 }
 
 // --- Unsloth --------------------------------------------------------------
 
-function unslothRoot(home: string): string {
-  // Env override (UNSLOTH_STUDIO_HOME / STUDIO_HOME) is a phase-2 nicety; the
-  // renderer can't read arbitrary env, so MVP uses the default location.
-  return joinPath(home, '.unsloth', 'studio')
-}
-
-async function scanUnsloth(home: string): Promise<LocalModelCandidate[]> {
-  const root = unslothRoot(home)
+async function scanUnsloth(
+  home: string,
+  env: ScanEnv
+): Promise<LocalModelCandidate[]> {
+  const root = unslothRoot(home, env)
   if (!(await pathExists(root))) return []
   const out: LocalModelCandidate[] = []
 
@@ -473,9 +662,11 @@ function digestToBlobPath(blobsDir: string, digest: string): string {
  * expose it as a runnable `*.gguf` via a symlink in `<ollama>/.studio_links/`
  * (never copying the blob). Models whose link can't be created are skipped.
  */
-async function scanOllama(home: string): Promise<LocalModelCandidate[]> {
-  // Default store; OLLAMA_MODELS env override is phase 2 (no renderer env).
-  const root = joinPath(home, '.ollama', 'models')
+async function scanOllama(
+  home: string,
+  env: ScanEnv
+): Promise<LocalModelCandidate[]> {
+  const root = ollamaRoot(home, env)
   const manifestsDir = joinPath(root, 'manifests')
   const blobsDir = joinPath(root, 'blobs')
   const linksDir = joinPath(root, '.studio_links')
@@ -541,6 +732,170 @@ async function scanOllama(home: string): Promise<LocalModelCandidate[]> {
   return out
 }
 
+// --- Model kind -----------------------------------------------------------
+
+/**
+ * llama.cpp architectures that cannot generate text: encoder-only embedding
+ * backbones and the projector/audio side-models. Loading one as a chat model
+ * trips a GGML assert and kills the server process, so they must never reach
+ * onboarding.
+ */
+const NON_TEXT_GGUF_ARCHITECTURES = new Set([
+  'bert',
+  'modern-bert',
+  'nomic-bert',
+  'nomic-bert-moe',
+  'neo-bert',
+  'jina-bert-v2',
+  'jina-bert-v3',
+  'eurobert',
+  'gemma-embedding',
+  'llama-embed',
+  't5encoder',
+  'clip',
+  'wavtokenizer-dec',
+  // Speculative-decoding heads. They only run as `--model-draft` beside a
+  // target; alone, llama-server dies creating the context ("Gemma4Assistant
+  // requires ctx_other to be set"). The file name rule catches the published
+  // names — this catches a head whatever it was renamed to (ATO-523).
+  'gemma4-assistant',
+  'dflash',
+  'eagle3',
+])
+
+/** Transformers heads that are classifiers, not decoders. */
+const NON_TEXT_HF_ARCHITECTURE_SUFFIXES = [
+  'formaskedlm',
+  'forsequenceclassification',
+  'fortokenclassification',
+]
+
+/** `config.json` `model_type` values of encoder-only / non-LLM families. */
+const NON_TEXT_HF_MODEL_TYPES = new Set([
+  'bert',
+  'roberta',
+  'xlm-roberta',
+  'xlm_roberta',
+  'distilbert',
+  'albert',
+  'electra',
+  'camembert',
+  'deberta',
+  'deberta-v2',
+  'mpnet',
+  'modernbert',
+  'nomic_bert',
+  'jina_bert',
+  'clip',
+  'siglip',
+  'whisper',
+])
+
+/**
+ * Decide from GGUF metadata whether a file is a text generator. Unknown
+ * architectures pass: hiding a usable model is worse than listing an exotic one.
+ */
+export function isTextGenerationGguf(
+  metadata: Record<string, string>
+): boolean {
+  const arch = metadata['general.architecture']?.trim().toLowerCase()
+  if (!arch) return true
+  if (NON_TEXT_GGUF_ARCHITECTURES.has(arch)) return false
+
+  // Embedding/reranker conversions of a generative architecture (Qwen3-Embedding
+  // and friends) keep the arch name but carry a pooling type or a classifier
+  // head. Pooling type 0 is NONE, i.e. a plain decoder.
+  const pooling = metadata[`${arch}.pooling_type`]?.trim()
+  if (pooling !== undefined && pooling !== '' && pooling !== '0') return false
+  return metadata[`${arch}.classifier.output_labels`] === undefined
+}
+
+/** Same decision for a safetensors/MLX folder, from its `config.json`. */
+export function isTextGenerationHfConfig(rawConfig: string | null): boolean {
+  if (!rawConfig) return true
+  let parsed: { architectures?: unknown; model_type?: unknown }
+  try {
+    parsed = JSON.parse(rawConfig)
+  } catch {
+    return true
+  }
+
+  const architectures = (
+    Array.isArray(parsed.architectures) ? parsed.architectures : []
+  )
+    .filter((a): a is string => typeof a === 'string')
+    .map((a) => a.toLowerCase())
+  if (
+    architectures.some((a) =>
+      NON_TEXT_HF_ARCHITECTURE_SUFFIXES.some((suffix) => a.endsWith(suffix))
+    )
+  ) {
+    return false
+  }
+
+  const modelType =
+    typeof parsed.model_type === 'string'
+      ? parsed.model_type.trim().toLowerCase()
+      : ''
+  return !(modelType && NON_TEXT_HF_MODEL_TYPES.has(modelType))
+}
+
+/** GGUF key/value header of a local file (null when it can't be parsed). */
+async function readGgufMetadata(
+  path: string
+): Promise<Record<string, string> | null> {
+  try {
+    const result = await core().invoke<{ metadata?: Record<string, string> }>(
+      'plugin:llamacpp|read_gguf_metadata',
+      { path }
+    )
+    return result?.metadata ?? null
+  } catch {
+    return null
+  }
+}
+
+async function isTextGenerationCandidate(
+  cand: LocalModelCandidate
+): Promise<boolean> {
+  if (cand.format === 'gguf') {
+    const metadata = await readGgufMetadata(cand.path)
+    return metadata ? isTextGenerationGguf(metadata) : true
+  }
+  if (cand.format === 'mlx') {
+    return isTextGenerationHfConfig(
+      await readText(joinPath(cand.path, 'config.json'))
+    )
+  }
+  return true
+}
+
+// Each probe reads a file header; a handful in flight keeps the scan snappy on
+// a cache with dozens of models without hammering a spinning disk.
+const KIND_PROBE_CONCURRENCY = 4
+
+async function keepTextGenerationOnly(
+  cands: LocalModelCandidate[]
+): Promise<LocalModelCandidate[]> {
+  const keep = new Array<boolean>(cands.length).fill(true)
+  let next = 0
+
+  const worker = async () => {
+    while (next < cands.length) {
+      const index = next++
+      keep[index] = await isTextGenerationCandidate(cands[index])
+    }
+  }
+
+  await Promise.all(
+    Array.from({ length: Math.min(KIND_PROBE_CONCURRENCY, cands.length) }, () =>
+      worker()
+    )
+  )
+
+  return cands.filter((_, index) => keep[index])
+}
+
 export interface ScanLocalModelsOptions {
   // When false, scanning is disabled and an empty list is returned.
   enabled?: boolean
@@ -555,7 +910,8 @@ function normalizePathKey(path: string): string {
   return path.replace(/[\\/]+$/g, '').replace(/[\\/]+/g, SEP)
 }
 
-// Scan every source and return de-duplicated candidates, minus already-imported ones.
+// Scan every source and return de-duplicated text-generation candidates, minus
+// already-imported ones.
 export async function scanLocalModels(
   options: ScanLocalModelsOptions = {}
 ): Promise<LocalModelCandidate[]> {
@@ -564,6 +920,8 @@ export async function scanLocalModels(
 
   const home = await osHomeDir()
   if (!home) return []
+  const env = await scanEnv()
+  const os = currentScanOs()
 
   // Custom folders are scanned as generic roots (GGUF + MLX), labeled 'local'.
   const customGroups = await Promise.all(
@@ -574,9 +932,15 @@ export async function scanLocalModels(
 
   const groups = await Promise.all([
     scanLmStudio(home).catch(() => []),
-    scanHfCache(home).catch(() => []),
-    scanUnsloth(home).catch(() => []),
-    scanOllama(home).catch(() => []),
+    scanHfCache(home, env).catch(() => []),
+    scanUnsloth(home, env).catch(() => []),
+    scanOllama(home, env).catch(() => []),
+    scanRoots(gpt4allRoots(home, env, os), 'gpt4all').catch(() => []),
+    scanRoots(janRoots(home, env, os), 'jan').catch(() => []),
+    scanRoots(mstyRoots(home, env, os), 'msty').catch(() => []),
+    scanRoots(llamaCppCacheRoots(home, env, os), 'llamacpp-cache').catch(
+      () => []
+    ),
   ])
 
   const importedKeys = new Set<string>()
@@ -607,14 +971,19 @@ export async function scanLocalModels(
     result.push({ ...cand, id })
   }
 
-  return result
+  return keepTextGenerationOnly(result)
 }
 
 // Absolute weights paths of locally-imported models, for deduping scan candidates.
 export function collectImportedModelPaths(
   providers: Array<{ provider: string; models: Array<{ path?: string }> }>
 ): string[] {
-  const localProviders = new Set(['llamacpp', 'llamacpp-upstream', 'mlx'])
+  const localProviders = new Set([
+    'llamacpp',
+    'llamacpp-upstream',
+    'atomic-prism',
+    'mlx',
+  ])
   const paths: string[] = []
 
   for (const p of providers) {

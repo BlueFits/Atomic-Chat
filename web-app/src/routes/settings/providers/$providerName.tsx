@@ -1,8 +1,35 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
 import { Card, CardItem } from '@/containers/Card'
+import { DecisionModelsSection } from '@/containers/DecisionModelsSection'
+import { EmbeddingModelsSection } from '@/containers/EmbeddingModelsSection'
 import HeaderPage from '@/containers/HeaderPage'
+import { ManagedEngineSetupPanel } from '@/containers/managed-engine/ManagedEngineSetupPanel'
+import { FoundryLocalAccelerators } from '@/containers/foundry-local/FoundryLocalAccelerators'
+import { FoundryLocalEnginePanel } from '@/containers/foundry-local/FoundryLocalEnginePanel'
+import { useEngineVersionsStore } from '@/stores/engine-versions-store'
+import { ManagedEngineHubLink } from '@/containers/managed-engine/ManagedEngineHubLink'
+import { ManagedEngineSettingsCard } from '@/containers/managed-engine/ManagedEngineSettingsCard'
+import { ManagedEngineTroubleshooting } from '@/containers/managed-engine/ManagedEngineTroubleshooting'
+import { managedEngine } from '@/lib/managed-engines'
+import {
+  PrismEngineInstallButton,
+  PrismEngineSetupCard,
+} from '@/containers/atomic-prism/PrismEngineSetupCard'
+import { usePrismEngine } from '@/hooks/usePrismEngine'
+import {
+  selectInstallation,
+  useManagedEnvironmentStore,
+} from '@/stores/managed-environment-store'
 import SettingsMenu from '@/containers/SettingsMenu'
 import { useModelProvider } from '@/hooks/useModelProvider'
+import { isOnboardingPending } from '@/lib/onboarding'
+import { captureProviderKeyConfigured } from '@/lib/onboarding-telemetry'
+import { buildApiKeyUpdate } from '@/lib/provider-api-key'
+import { isLocalEngineProvider } from '@/lib/cloud-providers'
+import {
+  deletedModelIds,
+  refreshProviderModels,
+} from '@/lib/refresh-provider-models'
 import {
   cn,
   getProviderTitle,
@@ -12,10 +39,24 @@ import {
 import {
   createFileRoute,
   Link,
+  redirect,
   useNavigate,
   useParams,
+  useSearch,
 } from '@tanstack/react-router'
 import { useTranslation } from '@/i18n/react-i18next-compat'
+import {
+  describeMlxBuild,
+  useMlxEngineUpdateCheck,
+} from '@/hooks/useMlxEngineUpdateCheck'
+import {
+  activateInstalledBuild,
+  isLlamacppProvider,
+  useClearDeviceAfterSwitch,
+} from '@/hooks/useEngineBuildSwitch'
+import { InstallOtherBuild } from '@/containers/engines/InstallOtherBuild'
+import type { EngineId } from '@/services/engines/types'
+import { InstalledEngineBuilds } from '@/containers/engines/InstalledEngineBuilds'
 import Capabilities from '@/containers/Capabilities'
 import {
   ModelSourceBadge,
@@ -40,6 +81,12 @@ import { DialogDeleteModel } from '@/containers/dialogs/DeleteModel'
 import { FavoriteModelAction } from '@/containers/FavoriteModelAction'
 import { route } from '@/constants/routes'
 import DeleteProvider from '@/containers/dialogs/DeleteProvider'
+import { ResetEngineSettings } from '@/containers/dialogs/ResetEngineSettings'
+import {
+  customEngineSettingKeys,
+  hasEngineSettingDefaults,
+  withDefaultEngineSettings,
+} from '@/lib/engine-settings-defaults'
 import { useServiceHub } from '@/hooks/useServiceHub'
 import { Button } from '@/components/ui/button'
 import { Switch } from '@/components/ui/switch'
@@ -52,10 +99,12 @@ import {
   isKeylessRemoteProvider,
   isLocalProvider,
   isLoopbackUrl,
+  isSubscriptionProvider,
   unregisterRemoteProvider,
 } from '@/utils/registerRemoteProvider'
 import { syncActiveModelsFromEngines } from '@/utils/activeModelsSync'
 import {
+  IconAlertTriangle,
   IconFolderPlus,
   IconLoader,
   IconRefresh,
@@ -63,16 +112,14 @@ import {
   IconSearch,
   IconUpload,
 } from '@tabler/icons-react'
+import { useBackendMismatch } from '@/hooks/useBackendMismatch'
 import { toast } from 'sonner'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import {
-  isKnownProvider,
-  useProviderRegistryStore,
-} from '@/stores/provider-registry-store'
+import { isKnownProvider } from '@/stores/provider-registry-store'
 import { EMBEDDING_MODEL_ID } from '@/constants/models'
 import { getModelCapabilities } from '@/lib/models'
 import { useModelLoad } from '@/hooks/useModelLoad'
-import { switchToModel } from '@/utils/switchModel'
+import { stopAllLocalModelsByUser, switchToModel } from '@/utils/switchModel'
 import { useLlamacppDevices } from '@/hooks/useLlamacppDevices'
 import {
   useBackendUpdater,
@@ -82,62 +129,84 @@ import { basenameNoExt } from '@/lib/utils'
 import { useAppState } from '@/hooks/useAppState'
 import { useShallow } from 'zustand/shallow'
 import { DialogAddModel } from '@/containers/dialogs/AddModel'
-import { AppEvent, EngineManager, events } from '@janhq/core'
+import { EngineManager } from '@janhq/core'
+import debounce from 'lodash.debounce'
+import { restartLocalModel } from '@/utils/restartLocalModel'
+
+/** Start, Stop and their spinner share one width, so a row does not jump between states; it fits
+ *  the longest translation ("Остановить"). */
+const MODEL_ACTION_BUTTON_CLASS = 'w-28'
 
 // as route.threadsDetail
 export const Route = createFileRoute('/settings/providers/$providerName')({
+  /**
+   * Cloud providers are configured on `/cloud` now. The route stays alive
+   * because bookmarks, the model picker's gear and `DeleteProvider` all point
+   * at it; it just forwards.
+   *
+   * `beforeLoad` rather than a redirect inside the component: it runs outside
+   * React, so it cannot disturb the hook order of a 2800-line component. An
+   * unresolved provider (zustand-persist not rehydrated yet on a cold start)
+   * falls through to the page's own "no provider" render instead of bouncing.
+   */
+  beforeLoad: ({ params }) => {
+    const provider = useModelProvider
+      .getState()
+      .getProviderByName(params.providerName)
+    if (provider && !isLocalEngineProvider(provider)) {
+      throw redirect({
+        to: route.cloud.index,
+        search: { provider: params.providerName },
+      })
+    }
+  },
   component: ProviderDetail,
-  validateSearch: (search: Record<string, unknown>): { step?: string } => {
+  validateSearch: (
+    search: Record<string, unknown>
+  ): { step?: string; engineUpdate?: boolean } => {
     // validate and parse the search params into a typed state
     return {
       step: String(search?.step),
+      // The engine update banner's "Update" for a managed engine: its card
+      // asks to confirm the reinstall.
+      ...(search?.engineUpdate === true || search?.engineUpdate === 'true'
+        ? { engineUpdate: true }
+        : {}),
     }
   },
 })
 
 function ProviderDetail() {
   const { t } = useTranslation()
+  const { providerName } = useParams({ from: Route.id })
+  /// The engine update banner's "Update" for a managed engine lands here.
+  const { engineUpdate } = useSearch({ from: Route.id })
   const serviceHub = useServiceHub()
   const { setModelLoadError } = useModelLoad()
   const [activeModels, setActiveModels] = useAppState(
     useShallow((state) => [state.activeModels, state.setActiveModels])
   )
   const [loadingModels, setLoadingModels] = useState<string[]>([])
+  const [stoppingModels, setStoppingModels] = useState<string[]>([])
   const [refreshingModels, setRefreshingModels] = useState(false)
   const [isInstallingBackend, setIsInstallingBackend] = useState(false)
   const [isRecheckingBackend, setIsRecheckingBackend] = useState(false)
-  /// Mirrors `localStorage.llama_cpp_pending_backend` so the provider
-  /// settings page can surface a "restart to activate" pill next to
-  /// the (still-old) `version_backend` value once a recommended GPU
-  /// backend has finished downloading. Updated reactively via
-  /// `AppEvent.onBackendDownloadFinished` so the user gets feedback
-  /// without having to refresh.
-  const [pendingBackend, setPendingBackend] = useState<string | null>(() => {
-    if (typeof window === 'undefined') return null
-    const raw = localStorage.getItem('llama_cpp_pending_backend')
-    return raw ? raw.replace(/\uFEFF/g, '').trim() : null
-  })
-
+  const [isCheckingEngineUpdate, setIsCheckingEngineUpdate] = useState(false)
+  const mlxEngineCheck = useMlxEngineUpdateCheck()
+  const clearDeviceAfterSwitch = useClearDeviceAfterSwitch(providerName)
+  /// A switch the core made (an update, an activation, another client's) is
+  /// announced as `app:backend-hotswapped`: pull fresh provider settings so the
+  /// `version_backend` row reflects the new value without a tab refresh.
+  ///
+  /// We deliberately read `setProviders` from the Zustand store via
+  /// `getState()` instead of capturing the destructured binding from
+  /// `useModelProvider()` — that destructuring happens later in the
+  /// component body, so referencing it here would hit a TDZ
+  /// `ReferenceError` on the very first render.
   useEffect(() => {
-    const refresh = () => {
-      const raw = localStorage.getItem('llama_cpp_pending_backend')
-      setPendingBackend(raw ? raw.replace(/\uFEFF/g, '').trim() : null)
-    }
-    const onFinished = (payload: { status: string }) => {
-      if (payload?.status === 'completed') refresh()
-    }
-    /// Hot-swap path: the extension already cleared
-    /// `llama_cpp_pending_backend` and updated `version_backend` settings.
-    /// Drop the pill immediately and pull fresh provider settings so the
-    /// `version_backend` row reflects the new value without a tab refresh.
-    ///
-    /// We deliberately read `setProviders` from the Zustand store via
-    /// `getState()` instead of capturing the destructured binding from
-    /// `useModelProvider()` — that destructuring happens later in the
-    /// component body, so referencing it here would hit a TDZ
-    /// `ReferenceError` on the very first render.
-    const onHotswapped = () => {
-      setPendingBackend(null)
+    const onHotswapped = (event: Event) => {
+      const detail = (event as CustomEvent<{ provider?: string }>).detail
+      if ((detail?.provider ?? LOCAL_LLAMACPP_PROVIDER) !== providerName) return
       void serviceHub
         .providers()
         .getProviders()
@@ -148,23 +217,11 @@ function ProviderDetail() {
           console.warn('Failed to refresh providers after hot-swap:', err)
         })
     }
-    events.on(AppEvent.onBackendDownloadFinished, onFinished)
-    window.addEventListener('storage', refresh)
     window.addEventListener('app:backend-hotswapped', onHotswapped)
     return () => {
-      events.off(AppEvent.onBackendDownloadFinished, onFinished)
-      window.removeEventListener('storage', refresh)
       window.removeEventListener('app:backend-hotswapped', onHotswapped)
     }
-  }, [serviceHub])
-
-  const handleRestartForPendingBackend = useCallback(async () => {
-    try {
-      await window.core?.api?.relaunch()
-    } catch (err) {
-      console.error('Failed to relaunch for pending backend:', err)
-    }
-  }, [])
+  }, [serviceHub, providerName])
   const [importingModel, setImportingModel] = useState<string | null>(null)
   const [isTogglingDflash, setIsTogglingDflash] = useState(false)
   /// `isTogglingDflash` covers fast operations (lookup + MLX reload) and
@@ -209,13 +266,16 @@ function ProviderDetail() {
       modelId: string
       options: LlamacppDflashDraftOption[]
     } | null>(null)
-  const { providerName } = useParams({ from: Route.id })
   /// The turboquant provider (`llamacpp`) ships alongside upstream on
   /// Windows/Linux. Each owns its own backend tree + localStorage keys, so
   /// the updater must be configured per-provider to avoid cross-contamination
   /// (see the 2026-06-23 turboquant-on-Win/Linux ADR). macOS turboquant has a
   /// single backend and never reaches the optimal-backend UI.
   const isTurboquantProvider = providerName === 'llamacpp'
+  /// PrismML keeps its own packs under `atomic-prism/backends`, so it gets its
+  /// own updater configuration for the same reason.
+  const isPrismProvider = providerName === 'atomic-prism'
+  const prismEngine = usePrismEngine(isPrismProvider)
   const backendUpdaterConfig = useMemo<UseBackendUpdaterConfig>(
     () =>
       isTurboquantProvider
@@ -225,19 +285,118 @@ function ProviderDetail() {
             recommendationKey: 'turboquant_better_backend_recommendation',
             postUpgradeRecheckEnabled: false,
           }
-        : {},
-    [isTurboquantProvider]
+        : isPrismProvider
+          ? {
+              extensionName: '@janhq/atomic-prism-extension',
+              providerId: 'atomic-prism',
+              recommendationKey: 'atomic_prism_better_backend_recommendation',
+              postUpgradeRecheckEnabled: false,
+            }
+          : {},
+    [isTurboquantProvider, isPrismProvider]
   )
   const {
     installBackend,
     recheckOptimalBackend,
+    checkForEngineUpdate,
+    refreshBackendCatalog,
     downloadRecommendedBackend,
     recommendationPhase,
     selectManualBackend,
   } = useBackendUpdater(backendUpdaterConfig)
+  /// The last load may have run on a backend other than the one selected here
+  /// (a silent in-memory swap, or a GPU build that fell back to the CPU). Show
+  /// that truth next to the dropdown instead of letting the stale selection
+  /// speak for the running process.
+  const { pending: backendMismatch } = useBackendMismatch()
+  const runningBackendNotice = useMemo(() => {
+    if (!backendMismatch || backendMismatch.provider !== providerName) {
+      return null
+    }
+    const { mismatch } = backendMismatch
+    if (mismatch.kind === 'silent-fallback') {
+      return t('settings:backendMismatch.actuallyRunning', {
+        backend: mismatch.effective,
+      })
+    }
+    if (mismatch.kind === 'runtime-cpu') {
+      return mismatch.total
+        ? t('settings:backendMismatch.actuallyRunningCpuLayers', {
+            offloaded: mismatch.offloaded ?? 0,
+            total: mismatch.total,
+          })
+        : t('settings:backendMismatch.actuallyRunningDevice', {
+            device: mismatch.primaryDevice,
+          })
+    }
+    return null
+  }, [backendMismatch, providerName, t])
   const navigate = useNavigate()
   const { getProviderByName, setProviders, updateProvider } = useModelProvider()
+  // A managed engine's models can be chosen once the engine is installed.
+  const managed = managedEngine(providerName)
+  const foundryLocalBuild = useEngineVersionsStore((state) => {
+    const active = state.engines['foundry-local']?.active
+    return active ? `${active.version}/${active.variant}` : null
+  })
+  const managedInstalled = useManagedEnvironmentStore(
+    (state) => managed !== undefined && selectInstallation(state, managed.id)?.status === 'ready'
+  )
   const provider = getProviderByName(providerName)
+  const providerSettingsWriteRef = useRef<Promise<void>>(Promise.resolve())
+  const debouncedRestartLlamacppModel = useMemo(
+    () =>
+      debounce(async (targetProvider: string) => {
+        try {
+          await providerSettingsWriteRef.current
+          const loadedModels = await serviceHub
+            .models()
+            .getActiveModels(targetProvider)
+          const activeModel = loadedModels[0]
+          if (activeModel) {
+            await restartLocalModel(serviceHub, targetProvider, activeModel)
+          }
+        } catch (error) {
+          console.error(
+            'Failed to apply provider settings to the running model:',
+            error
+          )
+        }
+      }, 500),
+    [serviceHub]
+  )
+
+  useEffect(
+    () => () => {
+      debouncedRestartLlamacppModel.cancel()
+    },
+    [debouncedRestartLlamacppModel]
+  )
+
+  // "Reset settings" for a local engine (see `engine-settings-defaults`),
+  // written like any other change here: queued behind earlier writes, then a
+  // loaded model restarts to pick the values up.
+  const customEngineKeys = provider
+    ? customEngineSettingKeys(provider.provider, provider.settings)
+    : []
+  const handleResetEngineSettings = () => {
+    if (!provider || customEngineKeys.length === 0) return
+    const settings = withDefaultEngineSettings(
+      provider.provider,
+      provider.settings
+    )
+    updateProvider(provider.provider, { settings })
+    providerSettingsWriteRef.current = providerSettingsWriteRef.current
+      .catch((error) => {
+        console.error('Previous provider settings update failed:', error)
+      })
+      .then(() =>
+        serviceHub.providers().updateSettings(provider.provider, settings)
+      )
+    debouncedRestartLlamacppModel(provider.provider)
+    toast.success(t('providers:resetEngineSettings.success'))
+  }
+
   const hasDownloadedModels =
     (provider?.models.filter((m) => m.id !== EMBEDDING_MODEL_ID).length ?? 0) >
     0
@@ -246,6 +405,7 @@ function ProviderDetail() {
   const needsBackendConfig =
     (provider?.provider === 'llamacpp' ||
       provider?.provider === 'llamacpp-upstream' ||
+      provider?.provider === 'atomic-prism' ||
       provider?.provider === 'mlx') &&
     provider.settings?.some(
       (setting) =>
@@ -254,6 +414,17 @@ function ProviderDetail() {
           setting.controller_props.value === '' ||
           !setting.controller_props.value)
     )
+
+  const prismVersionBackend = String(
+    provider?.settings.find((s) => s.key === 'version_backend')
+      ?.controller_props.value ?? ''
+  )
+  /// Before the core answers, a configured build is taken to be on disk.
+  const prismEngineMissing =
+    prismEngine.present &&
+    (prismEngine.status
+      ? !prismEngine.status.installed
+      : !prismVersionBackend || prismVersionBackend === 'none')
 
   const handleModelImportSuccess = async (importedModelName?: string) => {
     if (importedModelName) {
@@ -532,9 +703,11 @@ function ProviderDetail() {
     }
   }, [provider, serviceHub, setProviders])
 
-  // Auto-refresh settings when provider changes or when llamacpp needs backend config
+  // Auto-refresh settings when provider changes or when llamacpp needs backend config.
+  // PrismML's `none` is a state, not a wait: no build is bundled, so nothing would
+  // ever arrive, and the page would re-read every provider every 3 s.
   useEffect(() => {
-    if (provider && needsBackendConfig) {
+    if (provider && needsBackendConfig && provider.provider !== 'atomic-prism') {
       // Auto-refresh every 3 seconds when backend is being configured
       const intervalId = setInterval(refreshSettings, 3000)
       return () => clearInterval(intervalId)
@@ -579,21 +752,26 @@ function ProviderDetail() {
             .fetchModelsFromProvider(prov)
           if (cancelled) return
 
-          const existing = new Set(prov.models.map((m) => m.id))
+          // The provider as it is now, not as it was before the request: the
+          // key or a setting may have been edited while it ran, and writing the
+          // earlier snapshot back would undo that. Only `models` is written.
+          const current =
+            useModelProvider.getState().getProviderByName(providerName) ?? prov
+          const existing = new Set(current.models.map((m) => m.id))
+          const deleted = deletedModelIds()
           const newModels = liveIds
-            .filter((id) => !existing.has(id))
+            .filter((id) => !existing.has(id) && !deleted.has(id))
             .map((id) => ({
               id,
               model: id,
               name: id,
-              capabilities: getModelCapabilities(prov.provider, id),
+              capabilities: getModelCapabilities(current.provider, id),
               version: '1.0',
             }))
 
           if (newModels.length > 0) {
-            updateProvider(prov.provider, {
-              ...prov,
-              models: [...prov.models, ...newModels],
+            updateProvider(current.provider, {
+              models: [...current.models, ...newModels],
             })
           }
         } catch (err) {
@@ -620,158 +798,12 @@ function ProviderDetail() {
 
     setRefreshingModels(true)
     try {
-      // Step 1 — Pull the latest manifest from our remote registry on GitHub
-      // (the curated source for known cloud providers).
-      try {
-        await useProviderRegistryStore.getState().refresh({ force: true })
-      } catch (err) {
-        console.warn(
-          `[providers:${provider.provider}] registry refresh failed:`,
-          err
-        )
-      }
-
-      const state = useProviderRegistryStore.getState()
-      if (state.error) {
-        toast.error(t('providers:models'), {
-          description: state.error,
-        })
-        return
-      }
-
-      // Count models that will newly appear on this provider after the
-      // registry merge — for the success toast.
-      const fresh = await serviceHub.providers().getProviders()
-      const registryProvider = fresh.find(
-        (p) => p.provider === provider.provider
-      )
-      const existingIds = new Set(provider.models.map((m) => m.id))
-      let newCount = registryProvider
-        ? registryProvider.models.filter((m) => !existingIds.has(m.id)).length
-        : 0
-
-      // Step 2 — Hybrid: also query the provider's live /v1/models endpoint
-      // (ATO-209). The registry only covers known cloud providers; custom /
-      // self-hosted providers (vLLM, llama-server, LM Studio, etc.) are
-      // invisible to the registry, so this is the only path that surfaces
-      // their actual model list. We do it for all non-local providers that
-      // have a base_url configured. Errors are non-fatal — if the live
-      // endpoint is unavailable we still apply the registry results, but we
-      // remember the error so the toast can warn instead of falsely claiming
-      // "no new models" (ATO-210).
-      //
-      // P2 (ATO — registry-driven behavior): a registry provider may opt out
-      // of live model listing via `supports_model_listing: false` (some clouds
-      // expose hundreds of junk/internal IDs at /v1/models). When the flag is
-      // explicitly false we show the curated registry list only and skip the
-      // live probe. Missing/true keeps the hybrid behavior.
-      let liveNewModels: Model[] = []
-      let liveFetchError: Error | null = null
-      const registrySupportsListing =
-        registryProvider?.supports_model_listing !== false
-      if (
-        provider.base_url &&
-        !isLocalProvider(provider.provider) &&
-        registrySupportsListing
-      ) {
-        try {
-          const liveModelIds = await serviceHub
-            .providers()
-            .fetchModelsFromProvider(provider)
-
-          // Collect IDs already present after the registry pass so we only
-          // add genuinely new entries.
-          const afterRegistryIds = new Set([
-            ...existingIds,
-            ...(registryProvider?.models ?? []).map((m) => m.id),
-          ])
-          liveNewModels = liveModelIds
-            .filter((id) => !afterRegistryIds.has(id))
-            .map((id) => ({
-              id,
-              model: id,
-              name: id,
-              capabilities: getModelCapabilities(provider.provider, id),
-              version: '1.0',
-            }))
-
-          if (liveNewModels.length > 0) newCount += liveNewModels.length
-
-          console.info(
-            `[providers:${provider.provider}] live /models: ${liveModelIds.length} total, ${liveNewModels.length} new`
-          )
-        } catch (liveErr) {
-          // Non-fatal: registry results still apply even if the live
-          // endpoint is unreachable or returns an error. We surface the error
-          // in the toast below so the user knows the list may be incomplete.
-          liveFetchError =
-            liveErr instanceof Error ? liveErr : new Error(String(liveErr))
-          console.warn(
-            `[providers:${provider.provider}] live /models fetch failed (non-fatal):`,
-            liveErr
-          )
-        }
-      }
-
-      // Apply the registry refresh. `setProviders` merges catalog updates while
-      // preserving API keys, base URLs, and user-tweaked settings per provider,
-      // and never removes existing models.
-      setProviders(fresh)
-
-      // Persist the live-discovered models onto THIS provider. We cannot inject
-      // into `fresh` because custom / self-hosted providers (AIML, Cerebras,
-      // LM Studio, vLLM, …) are NOT part of getProviders() output — they live
-      // only in useModelProvider state, so the old `fresh.map()` injection
-      // silently dropped them (toast said "Added N" but the list stayed empty).
-      // updateProvider operates on current state and works for both registry
-      // and custom providers.
-      if (liveNewModels.length > 0) {
-        const current =
-          useModelProvider.getState().getProviderByName(provider.provider) ??
-          provider
-        // Dedupe by id (first-seen wins) so both newly fetched duplicates and
-        // any duplicates already persisted from an earlier refresh collapse to
-        // a single row.
-        const byId = new Map<string, Model>()
-        for (const m of [...current.models, ...liveNewModels]) {
-          if (m.id && !byId.has(m.id)) byId.set(m.id, m)
-        }
-        updateProvider(provider.provider, { models: Array.from(byId.values()) })
-      }
-
-      if (newCount > 0) {
-        toast.success(t('providers:models'), {
-          description: t('providers:refreshModelsSuccess', {
-            count: newCount,
-            provider: provider.provider,
-          }),
-        })
-      } else if (liveFetchError) {
-        // Live fetch failed, so the "no new models" result may be incomplete —
-        // warn with the underlying error instead of a misleading success.
-        toast.warning(t('providers:models'), {
-          description: t('providers:refreshModelsLiveFailed', {
-            provider: provider.provider,
-            error:
-              liveFetchError.message ||
-              t('providers:refreshModelsFailed', {
-                provider: provider.provider,
-              }),
-          }),
-        })
-      } else {
-        toast.success(t('providers:models'), {
-          description: t('providers:noNewModels'),
-        })
-      }
-    } catch (err) {
-      console.error(`[providers:${provider.provider}] refresh failed:`, err)
-      const detail =
-        err instanceof Error && err.message
-          ? err.message
-          : t('providers:refreshModelsFailed', { provider: provider.provider })
-      toast.error(t('providers:models'), {
-        description: detail,
+      await refreshProviderModels({
+        provider,
+        serviceHub,
+        setProviders,
+        updateProvider,
+        t,
       })
     } finally {
       setRefreshingModels(false)
@@ -796,12 +828,17 @@ function ProviderDetail() {
     }
   }
 
-  const handleStopModel = async () => {
+  const handleStopModel = async (modelId: string) => {
     if (!provider) return
+    // The unload waits for the engine process to exit; without a pending
+    // state the button looked dead and a second click queued behind the first.
+    setStoppingModels((prev) => [...prev, modelId])
+    const isLocalEngine = isLocalProvider(provider.provider)
     try {
-      const isLocalEngine = isLocalProvider(provider.provider)
       if (isLocalEngine) {
-        await serviceHub.models().stopAllModels()
+        // Recorded as a user stop, so the composer's auto-start does not load
+        // the model straight back when a chat is opened.
+        await stopAllLocalModelsByUser(serviceHub)
       } else {
         // Cloud "stop": drop the proxy registration so incoming chat requests
         // for this provider's models stop being routed upstream. Local engines
@@ -810,12 +847,7 @@ function ProviderDetail() {
       }
       await window.core?.api?.stopServer()
       useAppState.getState().setServerStatus('stopped')
-      if (isLocalEngine) {
-        const models = await serviceHub
-          .models()
-          .getActiveModels(provider.provider)
-        syncActiveModelsFromEngines(models || [])
-      } else {
+      if (!isLocalEngine) {
         // Remove any of this cloud provider's models from the active list
         // while leaving other providers' active entries intact.
         const providerModelIds = new Set(provider.models.map((m) => m.id))
@@ -826,6 +858,21 @@ function ProviderDetail() {
       }
     } catch (error) {
       console.error('Error stopping model:', error)
+      toast.error(
+        t('providers:stopFailed', { defaultValue: 'Could not stop the model' }),
+        { description: error instanceof Error ? error.message : String(error) }
+      )
+    } finally {
+      // Re-read the engines whatever happened above: a failure halfway through
+      // used to leave the row on "Stop" for a model that was already gone.
+      if (isLocalEngine) {
+        const models = await serviceHub
+          .models()
+          .getActiveModels()
+          .catch(() => null)
+        if (models) syncActiveModelsFromEngines(models)
+      }
+      setStoppingModels((prev) => prev.filter((id) => id !== modelId))
     }
   }
 
@@ -1427,7 +1474,7 @@ function ProviderDetail() {
     ]
   )
 
-  /// Toggle the upstream-llama MTP flag (`--spec-type draft-mtp`). Qwen
+  /// Toggle the upstream-llama MTP flag (`--spec-type draft-mtp`). Embedded
   /// capability is read from canonical GGUF metadata; Gemma 4 uses a separate
   /// draft head downloaded by the extension.
   ///
@@ -1440,7 +1487,7 @@ function ProviderDetail() {
       if (provider?.provider !== 'llamacpp-upstream' || !provider) return
       if (isTogglingLlamacppMtp) return
 
-      const writeSetting = (key: string, value: unknown) => {
+      const writeSetting = async (key: string, value: unknown) => {
         const next = provider.settings.map((s) =>
           s.key === key
             ? {
@@ -1452,7 +1499,7 @@ function ProviderDetail() {
               }
             : s
         )
-        serviceHub.providers().updateSettings(providerName, next)
+        await serviceHub.providers().updateSettings(providerName, next)
         updateProvider(providerName, { ...provider, settings: next })
       }
 
@@ -1477,16 +1524,17 @@ function ProviderDetail() {
       try {
         if (nextEnabled) {
           /// Capability check. Two MTP shapes are supported:
-          ///  - Qwen built-in MTP: canonical GGUF metadata reports the embedded
-          ///    NextN layers (head inside the same GGUF).
+          ///  - Built-in MTP (Qwen3.5/3.6, Qwen3-Next, GLM, DeepSeek and every
+          ///    other upstream MTP architecture): canonical GGUF metadata
+          ///    reports the embedded NextN layers (head inside the same GGUF).
           ///  - Gemma 4 MTP (31B / 26B-A4B): needs a SEPARATE draft head GGUF
           ///    downloaded next to the model (PR #23398).
           /// If the loaded model id is neither, refuse the toggle and surface
           /// the popup — don't write the setting (the Switch stays off).
           if (activeModel) {
-            const isQwenMtp =
+            const isEmbeddedMtp =
               (await engine.checkEmbeddedMtpSupport?.(activeModel)) ?? false
-            if (!isQwenMtp) {
+            if (!isEmbeddedMtp) {
               const isGemmaMtp =
                 (await engine.checkGemmaMtpSupport?.(activeModel)) ?? false
               if (!isGemmaMtp) {
@@ -1503,9 +1551,9 @@ function ProviderDetail() {
               await engine.ensureGemmaMtpDraft?.(activeModel)
             }
           }
-          writeSetting('mtp', true)
+          await writeSetting('mtp', true)
         } else {
-          writeSetting('mtp', false)
+          await writeSetting('mtp', false)
         }
 
         /// Auto-restart the live session so the new --spec-type draft-mtp
@@ -1513,12 +1561,7 @@ function ProviderDetail() {
         /// running — the next manual start will pick up the flag.
         if (activeModel) {
           try {
-            await engine.unload?.(activeModel)
-          } catch (e) {
-            console.warn('Failed to unload before MTP restart:', e)
-          }
-          try {
-            await engine.load?.(activeModel)
+            await restartLocalModel(serviceHub, providerName, activeModel)
           } catch (e) {
             console.error('Failed to reload after MTP toggle:', e)
             toast.error(errTitle, {
@@ -1728,8 +1771,24 @@ function ProviderDetail() {
       if (selectedFile && typeof selectedFile === 'string') {
         // Process the file path: replace spaces with dashes and convert to lowercase
 
-        // Install the backend using the llamacpp extension
-        await installBackend(selectedFile)
+        // The extension unpacks it; the core makes it active (and unloads
+        // this provider's models), as "Make active" does.
+        const installed = await installBackend(selectedFile)
+        if (isLlamacppProvider(provider.provider)) {
+          try {
+            const result = await activateInstalledBuild(
+              provider.provider as EngineId,
+              installed
+            )
+            if (result?.activated) clearDeviceAfterSwitch()
+          } catch (error) {
+            const message = (error as { message?: unknown } | null)?.message
+            toast.error(t('settings:backendUpdater.activateFailed'), {
+              description:
+                typeof message === 'string' ? message : String(error),
+            })
+          }
+        }
 
         // Extract filename from the selected file path and replace spaces with dashes
         const fileName = basenameNoExt(selectedFile).replace(/\s+/g, '-')
@@ -1754,7 +1813,86 @@ function ProviderDetail() {
     } finally {
       setIsInstallingBackend(false)
     }
-  }, [provider, serviceHub, refreshSettings, t, installBackend])
+  }, [
+    provider,
+    serviceHub,
+    refreshSettings,
+    t,
+    installBackend,
+    clearDeviceAfterSwitch,
+  ])
+
+  /// The version list and the release index are both fetched during the
+  /// extension's `onLoad()`, so a fork release published while the app was
+  /// open stays invisible until a restart. This button refetches the index and
+  /// installs the newest stable release of the backend type in use.
+  ///
+  /// Shaped like `handleFindOptimalBackend`: the awaited part is only the
+  /// bounded check, and the download runs detached. Awaiting the transfer here
+  /// would pin the button in its loading state for the whole archive.
+  const handleCheckEngineUpdate = useCallback(async () => {
+    if (
+      provider?.provider !== 'llamacpp' &&
+      provider?.provider !== LOCAL_LLAMACPP_PROVIDER &&
+      provider?.provider !== 'atomic-prism'
+    )
+      return
+
+    setIsCheckingEngineUpdate(true)
+    try {
+      const { updateAvailable, targetBackend } = await checkForEngineUpdate()
+      if (!updateAvailable || !targetBackend) {
+        toast.success(t('settings:noBackendUpdateAvailable'))
+        return
+      }
+
+      toast.info(t('settings:backendUpdater.downloadingBackend'), {
+        description: targetBackend,
+      })
+      void downloadRecommendedBackend(targetBackend)
+        .then(async () => {
+          // Report the outcome off the extension's own state. A successful
+          // hot-swap has already appended the new option and announced the new
+          // value, so re-reading the provider is all this needs — rebuilding the
+          // whole catalog first (a full `configureBackends()`: manifest refetch
+          // plus a device probe) used to hold the confirmation back by about
+          // ten seconds after the transfer had finished, which read as "it
+          // downloaded but did not switch".
+          await refreshSettings()
+          toast.success(t('settings:backendUpdater.updateSuccess'), {
+            description: targetBackend,
+          })
+
+          // Still rebuild the catalog, just not on the critical path: when the
+          // hot-swap fell back to the pending-restart flow, this is what makes
+          // the freshly installed release selectable in the dropdown.
+          void refreshBackendCatalog()
+            .then(() => refreshSettings())
+            .catch((err) => {
+              console.warn('Backend catalog refresh failed:', err)
+            })
+        })
+        .catch((err) => {
+          console.error('Engine update download failed:', err)
+          toast.error(t('settings:backendUpdater.downloadFailed'))
+        })
+    } catch (error) {
+      console.error('Failed to check for engine updates:', error)
+      toast.error(t('settings:backendUpdateError'), {
+        description:
+          error instanceof Error ? error.message : 'Unknown error occurred',
+      })
+    } finally {
+      setIsCheckingEngineUpdate(false)
+    }
+  }, [
+    provider,
+    checkForEngineUpdate,
+    downloadRecommendedBackend,
+    refreshBackendCatalog,
+    refreshSettings,
+    t,
+  ])
 
   /// Manual replacement for the legacy auto-popup: re-runs hardware
   /// detection on demand and, when a better backend is available,
@@ -1867,35 +2005,93 @@ function ProviderDetail() {
               />
             </div>
 
+            {/* A managed engine: setting it up comes before its settings and models. */}
+            {managed && (
+              <ManagedEngineSetupPanel
+                engine={managed}
+                askToUpdate={engineUpdate === true}
+              />
+            )}
+            {managed && <ManagedEngineTroubleshooting engine={managed} />}
+            {/* Foundry Local: the runtime and its accelerators come before its settings and models. */}
+            {providerName === 'foundry-local' && <FoundryLocalEnginePanel />}
+            {providerName === 'foundry-local' && (
+              // Read again when the active build changes: a new build is probed afresh.
+              <FoundryLocalAccelerators key={foundryLocalBuild ?? 'none'} />
+            )}
+            {managed && provider && (
+              <ManagedEngineSettingsCard
+                engine={managed}
+                settings={provider.settings}
+                models={provider.models.map((model) => model.id)}
+                onChange={(key, value) => {
+                  // Applies from the next load: the extension hands the settings to the core then.
+                  const next = provider.settings.map((setting) =>
+                    setting.key === key
+                      ? {
+                          ...setting,
+                          controller_props: {
+                            ...setting.controller_props,
+                            value: value as never,
+                          },
+                        }
+                      : setting
+                  )
+                  serviceHub.providers().updateSettings(providerName, next)
+                  updateProvider(providerName, { ...provider, settings: next })
+                }}
+              />
+            )}
+            {managed && managedInstalled && <ManagedEngineHubLink engine={managed} />}
+            {/* PrismML: the engine is installed on demand, so say what it is for until it is. */}
+            {isPrismProvider && provider && (
+              <PrismEngineSetupCard
+                engine={prismEngine}
+                versionBackend={prismVersionBackend}
+              />
+            )}
+
+            {/* Local engines, managed ones included, show their models above the engine settings. */}
             <div
               className={cn(
                 'flex flex-col gap-3',
                 provider &&
                   (provider.provider === 'llamacpp' ||
                     provider.provider === 'llamacpp-upstream' ||
-                    provider.provider === 'mlx') &&
+                    provider.provider === 'atomic-prism' ||
+                    provider.provider === 'mlx' ||
+                    managed !== undefined) &&
                   'flex-col-reverse'
               )}
             >
               {/* Settings */}
-              <Card>
+              <Card
+                header={
+                  provider && hasEngineSettingDefaults(provider.provider) ? (
+                    <div className="flex items-center justify-between mb-4">
+                      <h1 className="text-foreground font-medium text-base">
+                        {t('providers:engineSettings')}
+                      </h1>
+                      <ResetEngineSettings
+                        disabled={customEngineKeys.length === 0}
+                        onReset={handleResetEngineSettings}
+                      />
+                    </div>
+                  ) : undefined
+                }
+              >
                 {provider?.settings.map((setting, settingIndex) => {
-                  // Concurrent Mode acts as a master toggle over `parallel`,
-                  // `cont_batching` and `expose_metrics`. When it's on, those
-                  // rows are visually dimmed to signal they're managed.
-                  const concurrentModeOn = !!(
-                    provider?.settings.find((s) => s.key === 'concurrent_mode')
-                      ?.controller_props as { value?: boolean } | undefined
-                  )?.value
-                  const isManagedByConcurrentMode =
-                    concurrentModeOn &&
-                    (setting.key === 'parallel' ||
-                      setting.key === 'cont_batching' ||
-                      setting.key === 'expose_metrics')
-                  // Concurrent Slots only makes sense when Concurrent Mode is
-                  // on; hide the row entirely otherwise to reduce clutter.
-                  const isHiddenByConcurrentMode =
-                    !concurrentModeOn && setting.key === 'concurrent_slots'
+                  // Concurrent Mode is not offered: its rows stay in the core's
+                  // schema, and both llama.cpp extensions switch a stored
+                  // `concurrent_mode: true` off on start
+                  // (migrateConcurrentModeOff).
+                  const isHiddenConcurrentMode =
+                    setting.key === 'concurrent_mode' ||
+                    setting.key === 'concurrent_slots'
+                  // A managed engine picks its card from the GPUs the core found,
+                  // in its own card above, rather than as a typed UUID.
+                  const isHiddenForManaged =
+                    managed !== undefined && setting.key === 'gpu_id'
 
                   // The DFlash speculative-decoding toggle is the master
                   // switch over `block_size`; the MTP toggle does the
@@ -1944,12 +2140,47 @@ function ProviderDetail() {
                   // Use the DynamicController component
                   const actionComponent = (
                     <div className="mt-2">
-                      {needsBackendConfig &&
-                      setting.key === 'version_backend' ? (
+                      {isPrismProvider &&
+                      setting.key === 'version_backend' &&
+                      prismEngineMissing ? (
+                        // No build is bundled: until one is installed the row
+                        // installs the one the core recommends.
+                        <PrismEngineInstallButton engine={prismEngine} />
+                      ) : needsBackendConfig &&
+                        setting.key === 'version_backend' ? (
                         <div className="flex items-center gap-1 text-sm">
                           <IconLoader size={16} className="animate-spin" />
                           <span>loading</span>
                         </div>
+                      ) : setting.key === 'version_backend' &&
+                        isLlamacppProvider(providerName) ? (
+                        // The installed builds list below switches and
+                        // removes; this row only installs what is not on
+                        // disk, through the core's update with a target.
+                        <InstallOtherBuild
+                          engine={providerName as EngineId}
+                          options={
+                            (setting.controller_props.options ?? []) as Array<{
+                              value: number | string
+                              name: string
+                            }>
+                          }
+                          onPick={(value) => {
+                            void selectManualBackend(value)
+                              .then((result) => {
+                                if (result?.updated) clearDeviceAfterSwitch()
+                              })
+                              .catch((err) => {
+                                console.error(
+                                  'Manual backend download failed:',
+                                  err
+                                )
+                                toast.error(
+                                  t('settings:backendUpdater.downloadFailed')
+                                )
+                              })
+                          }}
+                        />
                       ) : isDflashToggle ? (
                         <div className="flex items-center gap-2">
                           <Switch
@@ -2099,8 +2330,9 @@ function ProviderDetail() {
                           controllerProps={setting.controller_props}
                           className={cn(
                             setting.key === 'device' && 'hidden',
-                            isHiddenByConcurrentMode && 'hidden',
-                            isHiddenByDflash && 'hidden'
+                            isHiddenConcurrentMode && 'hidden',
+                            isHiddenByDflash && 'hidden',
+                            isHiddenForManaged && 'hidden'
                           )}
                           onChange={(newValue) => {
                             // Manual "Latest <variant>" picks carry a
@@ -2132,6 +2364,7 @@ function ProviderDetail() {
                             }
                             if (provider) {
                               const newSettings = [...provider.settings]
+                              const changedSettingKeys = new Set([setting.key])
                               // Handle different value types by forcing the type
                               // Use type assertion to bypass type checking
 
@@ -2140,28 +2373,6 @@ function ProviderDetail() {
                                   value: string | boolean | number
                                 }
                               ).value = newValue
-
-                              // Concurrent Mode implies Prometheus /metrics:
-                              // when the user turns the master toggle on,
-                              // reflect the implicit expose_metrics=true in
-                              // the UI so the Prometheus checkbox matches the
-                              // server-side behaviour enforced in args.rs.
-                              if (
-                                setting.key === 'concurrent_mode' &&
-                                newValue === true
-                              ) {
-                                const metricsIdx = newSettings.findIndex(
-                                  (s) => s.key === 'expose_metrics'
-                                )
-                                if (metricsIdx !== -1) {
-                                  (
-                                    newSettings[metricsIdx]
-                                      .controller_props as {
-                                      value: boolean
-                                    }
-                                  ).value = true
-                                }
-                              }
 
                               // Create update object with updated settings
                               const updateObj: Partial<ModelProvider> = {
@@ -2173,7 +2384,26 @@ function ProviderDetail() {
                                 settingKey === 'api-key' &&
                                 typeof newValue === 'string'
                               ) {
-                                updateObj.api_key = newValue
+                                // Single-sourced with onboarding's cloud dialog
+                                // so the two cannot drift on what writing a key
+                                // means (settings entry + top-level mirror).
+                                Object.assign(
+                                  updateObj,
+                                  buildApiKeyUpdate(provider, newValue)
+                                )
+                                // Configuring a key satisfies the onboarding
+                                // gate, so this is a real exit from the flow
+                                // that previously bypassed all telemetry.
+                                // Only the presence of a key is reported —
+                                // never the key itself.
+                                if (newValue.length > 0) {
+                                  captureProviderKeyConfigured({
+                                    provider: provider.provider,
+                                    duringOnboarding: isOnboardingPending(
+                                      useModelProvider.getState().providers
+                                    ),
+                                  })
+                                }
                               } else if (
                                 settingKey === 'base-url' &&
                                 typeof newValue === 'string'
@@ -2217,17 +2447,50 @@ function ProviderDetail() {
                                 }
                               }
 
+                              updateProvider(providerName, {
+                                ...provider,
+                                ...updateObj,
+                              })
+
+                              if (
+                                settingKey !== 'version_backend' &&
+                                (providerName === 'llamacpp' ||
+                                  providerName === 'llamacpp-upstream' ||
+                                  providerName === 'atomic-prism')
+                              ) {
+                                // Backend discovery can update version_backend while this
+                                // page still holds an older provider snapshot. Persist only
+                                // the controls this action changed, so toggling e.g. fit
+                                // cannot overwrite the selected backend and start a download.
+                                const changedSettings = newSettings.filter((item) =>
+                                  changedSettingKeys.has(item.key)
+                                )
+                                providerSettingsWriteRef.current =
+                                  providerSettingsWriteRef.current
+                                    .catch((error) => {
+                                      console.error(
+                                        'Previous provider settings update failed:',
+                                        error
+                                      )
+                                    })
+                                    .then(() =>
+                                      serviceHub
+                                        .providers()
+                                        .updateSettings(
+                                          providerName,
+                                          changedSettings
+                                        )
+                                    )
+                                debouncedRestartLlamacppModel(providerName)
+                                return
+                              }
+
                               serviceHub
                                 .providers()
                                 .updateSettings(
                                   providerName,
                                   updateObj.settings ?? []
                                 )
-                              updateProvider(providerName, {
-                                ...provider,
-                                ...updateObj,
-                              })
-
                               serviceHub.models().stopAllModels()
 
                               // Refresh active models after stopping. Use
@@ -2252,10 +2515,9 @@ function ProviderDetail() {
                       title={setting.title}
                       className={cn(
                         setting.key === 'device' && 'hidden',
-                        isHiddenByConcurrentMode && 'hidden',
+                        isHiddenConcurrentMode && 'hidden',
                         isHiddenByDflash && 'hidden',
-                        isManagedByConcurrentMode &&
-                          'opacity-60 pointer-events-none'
+                        isHiddenForManaged && 'hidden'
                       )}
                       column={
                         setting.controller_type === 'input' &&
@@ -2286,14 +2548,6 @@ function ProviderDetail() {
                               ),
                             }}
                           />
-                          {setting.key === 'concurrent_slots' &&
-                            concurrentModeOn && (
-                              <div className="mt-1 text-sm text-muted-foreground">
-                                {t(
-                                  'providers:llamacpp.concurrentMode.perSlotContextWarning'
-                                )}
-                              </div>
-                            )}
                           {setting.key === 'version_backend' &&
                             setting.controller_props?.recommended && (
                               <div className="mt-1 text-sm text-muted-foreground">
@@ -2307,29 +2561,135 @@ function ProviderDetail() {
                               </div>
                             )}
                           {setting.key === 'version_backend' &&
+                            provider?.provider === 'mlx' &&
+                            (() => {
+                              const build = describeMlxBuild(
+                                String(setting.controller_props?.value ?? '')
+                              )
+                              return build ? (
+                                <div
+                                  className="mt-1 text-sm text-muted-foreground"
+                                  data-testid="mlx-build-origin"
+                                >
+                                  {t(`settings:mlxEngine.origin.${build.origin}`)}
+                                </div>
+                              ) : null
+                            })()}
+                          {setting.key === 'version_backend' &&
+                            runningBackendNotice && (
+                              <div className="mt-1 flex items-center gap-1.5 text-sm text-amber-600 dark:text-amber-500">
+                                <IconAlertTriangle size={14} />
+                                <span>{runningBackendNotice}</span>
+                              </div>
+                            )}
+                          {setting.key === 'version_backend' &&
                             (provider?.provider === 'llamacpp' ||
                               provider?.provider === 'llamacpp-upstream' ||
+                              provider?.provider === 'atomic-prism' ||
                               provider?.provider === 'mlx') && (
                               <div className="mt-2 flex flex-wrap gap-2">
-                                <Button
-                                  variant="outline"
-                                  size="sm"
-                                  onClick={handleInstallBackendFromFile}
-                                  disabled={isInstallingBackend}
-                                >
-                                  <IconUpload
-                                    size={12}
-                                    className={cn(
-                                      'text-muted-foreground',
-                                      isInstallingBackend && 'animate-pulse'
+                                {/* The install and engine-update controls use
+                                    the same fixed width so they read as one
+                                    control group and never resize with their
+                                    labels. A PrismML pack is installed only
+                                    from the conf manifest, sha256-checked, so
+                                    it has no install-from-file. */}
+                                {provider?.provider !== 'atomic-prism' && (
+                                  <Button
+                                    variant="outline"
+                                    size="sm"
+                                    onClick={handleInstallBackendFromFile}
+                                    disabled={isInstallingBackend}
+                                    className="w-[16rem]"
+                                  >
+                                    <IconUpload
+                                      size={12}
+                                      className={cn(
+                                        'text-muted-foreground',
+                                        isInstallingBackend && 'animate-pulse'
+                                      )}
+                                    />
+                                    <span>
+                                      {isInstallingBackend
+                                        ? 'Installing Backend...'
+                                        : 'Install Backend from File'}
+                                    </span>
+                                  </Button>
+                                )}
+                                {/* MLX: the core compares the active
+                                    build with conf's manifest; a newer one
+                                    becomes the banner's offer (design D10). */}
+                                {provider?.provider === 'mlx' && (
+                                  <Button
+                                    variant="outline"
+                                    size="sm"
+                                    onClick={() => void mlxEngineCheck.check()}
+                                    disabled={mlxEngineCheck.checking}
+                                    className="w-[16rem]"
+                                    data-testid="mlx-engine-check"
+                                  >
+                                    {mlxEngineCheck.checking ? (
+                                      <IconLoader
+                                        size={12}
+                                        className="animate-spin text-muted-foreground"
+                                      />
+                                    ) : (
+                                      <IconRefresh
+                                        size={12}
+                                        className="text-muted-foreground"
+                                      />
                                     )}
-                                  />
-                                  <span>
-                                    {isInstallingBackend
-                                      ? 'Installing Backend...'
-                                      : 'Install Backend from File'}
-                                  </span>
-                                </Button>
+                                    <span>
+                                      {t('settings:mlxEngine.checkForUpdates')}
+                                    </span>
+                                  </Button>
+                                )}
+                                {/* Engine updates land without an app
+                                    release, but both the version list and
+                                    the release index are snapshots taken at
+                                    extension load, so a release published
+                                    while the app was open stays invisible
+                                    until this button refetches. Both local
+                                    providers resolve their catalog from an
+                                    index they can refetch: turboquant from
+                                    the fork's release index, upstream from
+                                    the atomic-chat-conf manifest. */}
+                                {(provider?.provider === 'llamacpp' ||
+                                  provider?.provider ===
+                                    LOCAL_LLAMACPP_PROVIDER ||
+                                  provider?.provider === 'atomic-prism') && (
+                                  <Button
+                                    variant="outline"
+                                    size="sm"
+                                    onClick={handleCheckEngineUpdate}
+                                    disabled={
+                                      isCheckingEngineUpdate ||
+                                      isOptimalBackendBusy
+                                    }
+                                    className="w-[16rem]"
+                                  >
+                                    {/* Only the icon reflects progress. A
+                                        label that swapped to a longer
+                                        "Checking…" string would resize the
+                                        button mid-click and shift the row,
+                                        and no floor width fixes that for
+                                        every locale. */}
+                                    {isCheckingEngineUpdate ? (
+                                      <IconLoader
+                                        size={12}
+                                        className="animate-spin text-muted-foreground"
+                                      />
+                                    ) : (
+                                      <IconRefresh
+                                        size={12}
+                                        className="text-muted-foreground"
+                                      />
+                                    )}
+                                    <span>
+                                      {t('settings:checkForBackendUpdates')}
+                                    </span>
+                                  </Button>
+                                )}
                                 {/* "Find optimal backend" replaces the
                                     legacy auto-popup nag — it runs the
                                     same hardware detection on demand and
@@ -2363,7 +2723,7 @@ function ProviderDetail() {
                                       size="sm"
                                       onClick={handleFindOptimalBackend}
                                       disabled={isOptimalBackendBusy}
-                                      className="min-w-[12rem] justify-start"
+                                      className="min-w-[12rem]"
                                     >
                                       {isOptimalBackendBusy ? (
                                         <IconLoader
@@ -2381,48 +2741,26 @@ function ProviderDetail() {
                                   )}
                               </div>
                             )}
-                          {/* Pending-backend banner: appears as soon as
-                              the just-downloaded backend is sitting in
-                              `llama_cpp_pending_backend` and waiting
-                              for `activatePendingBackend()` on the
-                              next launch. The `version_backend`
-                              setting itself can't be hot-swapped while
-                              the llama-server is running, so without
-                              this pill the user sees no change
-                              between "I clicked Find optimal" and "I
-                              restarted the app". */}
+                          {/* The builds of this engine on disk: remove one,
+                              or (llama.cpp) make another active, through
+                              the core. */}
                           {setting.key === 'version_backend' &&
-                            provider?.provider === 'llamacpp' &&
-                            pendingBackend && (
-                              <div className="mt-2 flex flex-wrap items-center gap-2 rounded-md border border-dashed border-emerald-500/40 bg-emerald-500/5 px-3 py-2 text-xs">
-                                <span className="font-medium text-emerald-600 dark:text-emerald-400">
-                                  {t(
-                                    'settings:backendUpdater.pendingBackendLabel'
-                                  )}
-                                </span>
-                                <code className="font-mono text-foreground/80">
-                                  {pendingBackend}
-                                </code>
-                                <span className="text-muted-foreground">
-                                  {t(
-                                    'settings:backendUpdater.pendingBackendHint'
-                                  )}
-                                </span>
-                                <Button
-                                  variant="outline"
-                                  size="sm"
-                                  className="ml-auto"
-                                  onClick={handleRestartForPendingBackend}
-                                >
-                                  <IconRefresh
-                                    size={12}
-                                    className="text-muted-foreground"
-                                  />
-                                  <span>
-                                    {t('settings:backendUpdater.restartNow')}
-                                  </span>
-                                </Button>
-                              </div>
+                            provider &&
+                            (provider.provider === 'llamacpp' ||
+                              provider.provider === 'llamacpp-upstream' ||
+                              provider.provider === 'atomic-prism' ||
+                              provider.provider === 'mlx') && (
+                              <InstalledEngineBuilds
+                                engine={provider.provider}
+                                hasLoadedModels={provider.models.some((model) =>
+                                  activeModels.includes(model.id)
+                                )}
+                                onActivated={
+                                  isLlamacppProvider(provider.provider)
+                                    ? clearDeviceAfterSwitch
+                                    : undefined
+                                }
+                              />
                             )}
                         </>
                       }
@@ -2446,6 +2784,21 @@ function ProviderDetail() {
                 <DeleteProvider provider={provider} />
               </Card>
 
+              {/* Embedding models: stock llama.cpp only, and before the
+                  decision models in the reversed column, so it shows under
+                  them. */}
+              {providerName === 'llamacpp-upstream' && (
+                <EmbeddingModelsSection />
+              )}
+
+              {/* Decision models: the column is reversed for llama.cpp, so
+                  this shows under the chat models. TurboQuant runs the laya
+                  checkpoints, stock llama.cpp the upstream decision GGUFs. */}
+              {(providerName === 'llamacpp' ||
+                providerName === 'llamacpp-upstream') && (
+                <DecisionModelsSection provider={providerName} />
+              )}
+
               {/* Models */}
               <Card
                 header={
@@ -2457,7 +2810,9 @@ function ProviderDetail() {
                       {provider &&
                         provider.provider !== 'llamacpp' &&
                         provider.provider !== 'llamacpp-upstream' &&
-                        provider.provider !== 'mlx' && (
+                        provider.provider !== 'atomic-prism' &&
+                        provider.provider !== 'mlx' &&
+                        provider.provider !== 'foundry-local' && (
                           <>
                             <Button
                               variant="secondary"
@@ -2483,7 +2838,9 @@ function ProviderDetail() {
                       {provider &&
                         (provider.provider === 'llamacpp' ||
                           provider.provider === 'llamacpp-upstream' ||
-                          provider.provider === 'mlx') &&
+                          provider.provider === 'atomic-prism' ||
+                          provider.provider === 'mlx' ||
+                          provider.provider === 'foundry-local') &&
                         !hasDownloadedModels && (
                           <Button
                             variant="default"
@@ -2496,7 +2853,11 @@ function ProviderDetail() {
                                   engine:
                                     provider.provider === 'mlx'
                                       ? 'mlx'
-                                      : 'gguf',
+                                      : provider.provider === 'atomic-prism'
+                                        ? 'atomic-prism'
+                                        : provider.provider === 'foundry-local'
+                                          ? 'foundry-local'
+                                          : 'gguf',
                                 },
                               })
                             }
@@ -2626,18 +2987,26 @@ function ProviderDetail() {
                                   const isLocalEngine =
                                     provider.provider === 'llamacpp' ||
                                     provider.provider === 'llamacpp-upstream' ||
+                                    provider.provider === 'atomic-prism' ||
                                     provider.provider === 'mlx'
                                   // Cloud providers need an API key before
                                   // they can be "started" (registered with the
-                                  // proxy). Local engines don't.
+                                  // proxy). Local engines don't, and neither do
+                                  // subscriptions — their token lives in the
+                                  // backend, not on the provider object.
                                   const needsApiKey =
                                     !isLocalProvider(provider.provider) &&
                                     !provider.api_key &&
-                                    !isKeylessRemoteProvider(provider)
+                                    !isKeylessRemoteProvider(provider) &&
+                                    !isSubscriptionProvider(provider.provider)
                                   const isActive = activeModels.some(
                                     (activeModel) => activeModel === model.id
                                   )
                                   const isLoading = loadingModels.includes(
+                                    model.id
+                                  )
+
+                                  const isStopping = stoppingModels.includes(
                                     model.id
                                   )
 
@@ -2647,9 +3016,22 @@ function ProviderDetail() {
                                         <Button
                                           size="sm"
                                           variant="destructive"
-                                          onClick={() => handleStopModel()}
+                                          className={MODEL_ACTION_BUTTON_CLASS}
+                                          disabled={isStopping}
+                                          onClick={() =>
+                                            handleStopModel(model.id)
+                                          }
                                         >
-                                          {t('providers:stop')}
+                                          {isStopping ? (
+                                            <div className="flex items-center gap-2">
+                                              <IconLoader
+                                                size={16}
+                                                className="animate-spin"
+                                              />
+                                            </div>
+                                          ) : (
+                                            t('providers:stop')
+                                          )}
                                         </Button>
                                       </div>
                                     )
@@ -2658,6 +3040,7 @@ function ProviderDetail() {
                                   const startButton = (
                                     <Button
                                       size="sm"
+                                      className={MODEL_ACTION_BUTTON_CLASS}
                                       disabled={isLoading || needsApiKey}
                                       onClick={() => handleStartModel(model.id)}
                                     >

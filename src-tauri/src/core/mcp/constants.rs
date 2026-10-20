@@ -2,6 +2,7 @@ use std::path::PathBuf;
 
 // Default MCP runtime settings
 pub const DEFAULT_MCP_TOOL_CALL_TIMEOUT_SECS: u64 = 30;
+pub const DEFAULT_MCP_HANDSHAKE_TIMEOUT_SECS: u64 = 30;
 
 /// Short, dedicated ceiling for *listing* tools (`get_tools`), distinct from the
 /// 30s tool-*call* timeout. Listing is a metadata round-trip that a healthy
@@ -11,9 +12,6 @@ pub const DEFAULT_MCP_TOOL_CALL_TIMEOUT_SECS: u64 = 30;
 /// Applied per-server while all servers are listed concurrently, so total
 /// `get_tools` latency is bounded by this value rather than N × 30s (ATO-271).
 pub const DEFAULT_MCP_TOOL_LIST_TIMEOUT_SECS: u64 = 5;
-pub const DEFAULT_MCP_BASE_RESTART_DELAY_MS: u64 = 1000; // Start with 1 second
-pub const DEFAULT_MCP_MAX_RESTART_DELAY_MS: u64 = 30000; // Cap at 30 seconds
-pub const DEFAULT_MCP_BACKOFF_MULTIPLIER: f64 = 2.0; // Double the delay each time
 
 /// Sentinel inside `DEFAULT_MCP_CONFIG_TEMPLATE` that is replaced at runtime
 /// with the per-user sandbox directory exposed to the filesystem MCP server.
@@ -40,12 +38,59 @@ pub const FILESYSTEM_MCP_PACKAGE: &str = "@modelcontextprotocol/server-filesyste
 /// busts the stale `bun`/`BUN_INSTALL` cache: `bun x <pkg>@<ver>` misses the
 /// cached old version and fetches the fixed build. Bump this when a newer
 /// fixed release is validated.
-pub const FILESYSTEM_MCP_PINNED_VERSION: &str = "2026.1.14";
+///
+/// The original pin, `2026.1.14`, did NOT carry that fix — it was published
+/// 2026-01-14, four weeks before servers#2609 merged (2026-02-11). Verified
+/// against the published tarballs: `dist/lib.js` in 2026.1.14 resolves a
+/// relative request as `path.resolve(process.cwd(), expandedPath)`, while
+/// 2026.8.31 routes it through `resolveRelativePathAgainstAllowedDirectories`,
+/// which walks the allowed dirs. So every user was pinned to the broken
+/// build, and the `cwd` field below was the only thing masking it — on fresh
+/// installs only, since the migration never retrofits `cwd`. Re-verify the
+/// same way before bumping again; publish dates alone do not prove the fix
+/// is in.
+pub const FILESYSTEM_MCP_PINNED_VERSION: &str = "2026.8.31";
+
+/// Versions of the filesystem MCP server that a previous build of Atomic Chat
+/// wrote into the user's `mcp_config.json` itself. The pin migration re-pins
+/// only these to `FILESYSTEM_MCP_PINNED_VERSION`; a version the *user* chose
+/// is left alone.
+///
+/// Without this the migration is a one-shot: it matches the bare package
+/// token, so once an arg reads `...@2026.1.14` it never matches again and no
+/// future release can correct the pin it shipped. Every entry here is a spec
+/// this app authored, never a user's choice.
+pub const APP_WRITTEN_FILESYSTEM_MCP_VERSIONS: &[&str] = &["2026.1.14"];
 
 /// Fully-qualified, version-pinned spec written into args, e.g.
 /// `@modelcontextprotocol/server-filesystem@2026.1.14`.
 pub fn filesystem_mcp_pinned_spec() -> String {
     format!("{FILESYSTEM_MCP_PACKAGE}@{FILESYSTEM_MCP_PINNED_VERSION}")
+}
+
+/// Schema version `migrate_mcp_servers` stores in `mcp_version` once every
+/// step has run. Each step is gated on its own literal (`mcp_version < N`);
+/// bump this together with the newest gate.
+pub const MCP_CONFIG_VERSION: i64 = 4;
+
+/// Key of the web-search server `DEFAULT_MCP_CONFIG_TEMPLATE` seeded from its
+/// introduction (`e1c8d98bf`, 2025-08-15) until `0ae50bca7` (2026-09-17)
+/// dropped it: switched off behind a placeholder key, next to an always-on Exa
+/// doing the same job.
+pub const RETIRED_SERPER_SERVER_KEY: &str = "serper";
+
+/// The exact entry that template wrote for `serper` — the only shape it ever
+/// had. Migration 4 removes a `serper` entry from an existing
+/// `mcp_config.json` only when it equals this value (key order aside); an
+/// entry the user changed — switched on, a real key, other args, an added
+/// field — is theirs and stays.
+pub fn retired_serper_default_server() -> serde_json::Value {
+    serde_json::json!({
+        "command": "npx",
+        "args": ["-y", "serper-search-scrape-mcp-server"],
+        "env": { "SERPER_API_KEY": "YOUR_SERPER_API_KEY_HERE" },
+        "active": false
+    })
 }
 
 const DEFAULT_MCP_CONFIG_TEMPLATE: &str = r#"{
@@ -80,12 +125,6 @@ const DEFAULT_MCP_CONFIG_TEMPLATE: &str = r#"{
       "env": {},
       "active": false
     },
-    "serper": {
-      "command": "npx",
-      "args": ["-y", "serper-search-scrape-mcp-server"],
-      "env": { "SERPER_API_KEY": "YOUR_SERPER_API_KEY_HERE" },
-      "active": false
-    },
     "filesystem": {
       "command": "npx",
       "args": [
@@ -105,19 +144,21 @@ const DEFAULT_MCP_CONFIG_TEMPLATE: &str = r#"{
     }
   },
   "mcpSettings": {
-    "toolCallTimeoutSeconds": 30,
-    "baseRestartDelayMs": 1000,
-    "maxRestartDelayMs": 30000,
-    "backoffMultiplier": 2.0
+    "toolCallTimeoutSeconds": 30
   }
 }"#;
 
 /// Default sandbox directory exposed to the `filesystem` MCP server.
 /// Resolves to `~/Documents/Atomic_chat` (or the platform equivalent).
+///
+/// Always absolute: this path is persisted as the server's `cwd`, and a
+/// relative `./Atomic_chat` would be resolved against whatever the app was
+/// launched from and fail the spawn with "directory name is invalid" (#259).
 pub fn default_filesystem_root() -> PathBuf {
     let docs = dirs::document_dir()
         .or_else(|| dirs::home_dir().map(|h| h.join("Documents")))
-        .unwrap_or_else(|| PathBuf::from("."));
+        .or_else(dirs::data_dir)
+        .unwrap_or_else(std::env::temp_dir);
     docs.join("Atomic_chat")
 }
 

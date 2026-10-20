@@ -72,4 +72,39 @@ export const PlatformFeatures: Record<PlatformFeature, boolean> = {
   // File attachments/RAG UI and tooling - desktop platforms only
   [PlatformFeature.FILE_ATTACHMENTS]:
     isPlatformTauri() && !isPlatformIOS() && !isPlatformAndroid(),
+
+  // Voice input / dictation - desktop platforms only
+  [PlatformFeature.VOICE_INPUT]:
+    isPlatformTauri() && !isPlatformIOS() && !isPlatformAndroid(),
+
+  // ChatGPT subscription sign-in — see PlatformFeature.CHATGPT_SUBSCRIPTION.
+  [PlatformFeature.CHATGPT_SUBSCRIPTION]:
+    isPlatformTauri() && !isPlatformIOS() && !isPlatformAndroid(),
+
+  // Local image generation — desktop platforms only, like voice input.
+  // Windows on Arm and arm64 Linux run the Atomic fork's stable-diffusion.cpp
+  // builds (ADR 2026-10-06); a manifest without them leaves the engine card
+  // explaining why, rather than hiding Images and Video.
+  [PlatformFeature.MEDIA_GENERATION]:
+    isPlatformTauri() && !isPlatformIOS() && !isPlatformAndroid(),
+
+  // Public Remote access through the bundled cloudflared tunnel. Cloudflare
+  // publishes no Windows arm64 build, so that bundle ships without it.
+  [PlatformFeature.REMOTE_ACCESS]:
+    isPlatformTauri() &&
+    !isPlatformIOS() &&
+    !isPlatformAndroid() &&
+    !(IS_WINDOWS && IS_ARM64),
+
+  // Only gates the `llamacpp` provider where it is listed; it is never
+  // registered on mobile or web in the first place. The Windows and Linux
+  // arm64 bundles ship without the TurboQuant engine.
+  [PlatformFeature.TURBOQUANT_ENGINE]: !((IS_WINDOWS || IS_LINUX) && IS_ARM64),
+
+  // Hidden on every platform (ADR 2026-10-15-hide-agent-mode).
+  [PlatformFeature.AGENT_MODE]: false,
+
+  // Commands and scripts from chat — desktop platforms only.
+  [PlatformFeature.CHAT_EXEC]:
+    isPlatformTauri() && !isPlatformIOS() && !isPlatformAndroid(),
 }

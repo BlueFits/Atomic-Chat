@@ -25,11 +25,16 @@ import {
   type RegistrySource,
 } from '@/services/recommended-models-registry'
 import { BASELINE_RECOMMENDED_MODELS } from '@/constants/models'
+import type { HardwareTier } from '@/lib/hardware-tier'
 
 export type RegistryStatus = 'idle' | 'loading' | 'success' | 'error'
 
 type RegistryState = {
   recommendations: Recommendation[]
+  /** Per-tier overrides from the manifest. Partial by design — a tier the
+   *  manifest omits falls back to the bundled ladder in
+   *  `selectTierRecommendations`. */
+  tiers: Partial<Record<HardwareTier, Recommendation[]>>
   status: RegistryStatus
   source: RegistrySource
   fetchedAt: number | null
@@ -40,23 +45,42 @@ type RegistryState = {
   refresh: (options?: FetchOptions) => Promise<void>
 }
 
-const seedRecommendations = (): Recommendation[] => {
+const seedRecommendations = (): {
+  recommendations: Recommendation[]
+  tiers: Partial<Record<HardwareTier, Recommendation[]>>
+} => {
   const cached = getCachedManifest()
-  if (cached) return cached.manifest.recommendations.slice()
-  return BASELINE_RECOMMENDED_MODELS.slice()
+  if (cached) {
+    return {
+      recommendations: cached.manifest.recommendations.slice(),
+      // A cache entry written before the manifest gained its tier lists has
+      // none; `selectTierRecommendations` falls back to the bundled ladder.
+      tiers: { ...(cached.manifest.tiers ?? {}) },
+    }
+  }
+  return {
+    recommendations: BASELINE_RECOMMENDED_MODELS.slice(),
+    tiers: {},
+  }
 }
 
 const baselineFallback = (message: string): RegistryFetchResult => ({
   recommendations: BASELINE_RECOMMENDED_MODELS.slice(),
+  tiers: {},
   source: 'baseline',
   fetchedAt: null,
   manifestUpdatedAt: null,
   error: message,
 })
 
+// Read once: `seedRecommendations` parses localStorage, and calling it per
+// field would also let the two lists come from different cache reads.
+const seed = seedRecommendations()
+
 export const useRecommendedModelsRegistryStore = create<RegistryState>()(
   (set) => ({
-    recommendations: seedRecommendations(),
+    recommendations: seed.recommendations,
+    tiers: seed.tiers,
     status: 'idle',
     source: getCachedManifest() ? 'cache' : 'baseline',
     fetchedAt: getCachedManifest()?.fetchedAt ?? null,
@@ -86,6 +110,7 @@ export const useRecommendedModelsRegistryStore = create<RegistryState>()(
 
       set({
         recommendations: result.recommendations,
+        tiers: result.tiers,
         source: result.source,
         fetchedAt: result.fetchedAt,
         manifestUpdatedAt: result.manifestUpdatedAt,

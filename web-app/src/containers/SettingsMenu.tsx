@@ -1,23 +1,18 @@
 import { Link } from '@tanstack/react-router'
 import { route } from '@/constants/routes'
 import { useTranslation } from '@/i18n/react-i18next-compat'
-import { useState, useEffect, useCallback } from 'react'
-import {
-  IconChevronDown,
-  IconChevronRight,
-  IconPlus,
-} from '@tabler/icons-react'
+import { useState, useEffect } from 'react'
+import { IconChevronDown, IconChevronRight } from '@tabler/icons-react'
 import { useMatches, useNavigate } from '@tanstack/react-router'
 import { cn } from '@/lib/utils'
+import { PlatformFeatures } from '@/lib/platform/const'
+import { PlatformFeature } from '@/lib/platform/types'
 
 import { useModelProvider } from '@/hooks/useModelProvider'
 import { getProviderTitle } from '@/lib/utils'
+import { sortProvidersForSettings } from '@/lib/providerOrder'
 import ProvidersAvatar from '@/containers/ProvidersAvatar'
-import { AddProviderDialog } from '@/containers/dialogs'
-import { openAIProviderSettings } from '@/constants/providers'
-import cloneDeep from 'lodash/cloneDeep'
-import { toast } from 'sonner'
-import { Button } from '@/components/ui/button'
+import { isLocalEngineProvider } from '@/lib/cloud-providers'
 
 const SettingsMenu = () => {
   const { t } = useTranslation()
@@ -26,46 +21,33 @@ const SettingsMenu = () => {
   const matches = useMatches()
   const navigate = useNavigate()
 
-  const { providers, addProvider } = useModelProvider()
+  const { providers, selectedProvider } = useModelProvider()
 
-  const createProvider = useCallback(
-    (name: string) => {
-      if (
-        providers.some((e) => e.provider.toLowerCase() === name.toLowerCase())
-      ) {
-        toast.error(t('provider:providerAlreadyExists', { name }))
-        return
-      }
-      const newProvider: ProviderObject = {
-        provider: name,
-        active: true,
-        models: [],
-        settings: cloneDeep(openAIProviderSettings) as ProviderSetting[],
-        api_key: '',
-        base_url: 'https://api.openai.com/v1',
-      }
-      addProvider(newProvider)
-      setTimeout(() => {
-        navigate({
-          to: route.settings.providers,
-          params: { providerName: name },
-        })
-      }, 0)
-    },
-    [providers, addProvider, t, navigate]
+  // Settings owns the local inference engines only. Connecting a cloud
+  // provider — including Ollama and user-created OpenAI-compatible endpoints —
+  // lives on `/cloud`, and `isCloudProvider` is the exact complement of this
+  // filter, so nothing is listed in neither place.
+  const localProviders = providers.filter(isLocalEngineProvider)
+
+  const turboquant = PlatformFeatures[PlatformFeature.TURBOQUANT_ENGINE]
+
+  const activeProviders = sortProvidersForSettings(
+    localProviders.filter((provider) => {
+      if (!provider.active) return false
+      if (!IS_MACOS && provider.provider === 'mlx') return false
+      if (!turboquant && provider.provider === 'llamacpp') return false
+      return true
+    })
   )
 
-  const activeProviders = providers.filter((provider) => {
-    if (!provider.active) return false
-    if (!IS_MACOS && provider.provider === 'mlx') return false
-    return true
-  })
-
-  const hiddenProviders = providers.filter((provider) => {
-    if (provider.active) return false
-    if (!IS_MACOS && provider.provider === 'mlx') return false
-    return true
-  })
+  const hiddenProviders = sortProvidersForSettings(
+    localProviders.filter((provider) => {
+      if (provider.active) return false
+      if (!IS_MACOS && provider.provider === 'mlx') return false
+      if (!turboquant && provider.provider === 'llamacpp') return false
+      return true
+    })
+  )
 
   // Check if current route has a providerName parameter and expand providers submenu
   useEffect(() => {
@@ -105,12 +87,24 @@ const SettingsMenu = () => {
       isEnabled: true,
     },
     {
+      title: 'common:voice',
+      route: route.settings.voice,
+      hasSubMenu: false,
+      isEnabled: PlatformFeatures[PlatformFeature.VOICE_INPUT],
+    },
+    {
+      title: 'common:media',
+      route: route.settings.media,
+      hasSubMenu: false,
+      isEnabled: PlatformFeatures[PlatformFeature.MEDIA_GENERATION],
+    },
+    {
       title: 'common:interface',
       route: route.settings.interface,
       hasSubMenu: false,
       isEnabled: true,
     },
-    // Privacy — вкладка скрыта
+    // Privacy — tab hidden
     // {
     //   title: 'common:privacy',
     //   route: route.settings.privacy,
@@ -132,12 +126,6 @@ const SettingsMenu = () => {
     {
       title: 'common:hardware',
       route: route.settings.hardware,
-      hasSubMenu: false,
-      isEnabled: true,
-    },
-    {
-      title: 'common:mcp-servers',
-      route: route.settings.mcp_servers,
       hasSubMenu: false,
       isEnabled: true,
     },
@@ -248,11 +236,6 @@ const SettingsMenu = () => {
               <span className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
                 {t('common:modelProviders')}
               </span>
-              <AddProviderDialog onCreateProvider={createProvider}>
-                <Button variant="ghost" size="icon-xs">
-                  <IconPlus size={12} />
-                </Button>
-              </AddProviderDialog>
             </div>
             <div className="mt-1 flex flex-col gap-0.5">
               {activeProviders.map((provider) => {
@@ -283,9 +266,17 @@ const SettingsMenu = () => {
                     }
                   >
                     <ProvidersAvatar provider={provider} />
-                    <div className="truncate flex-1">
+                    <div className="truncate">
                       <span>{getProviderTitle(provider.provider)}</span>
                     </div>
+                    {/* Same marker as the model select dropdown: the
+                        provider currently backing the selected model. */}
+                    {provider.provider === selectedProvider && (
+                      <span
+                        data-testid={`provider-active-dot-${provider.provider}`}
+                        className="size-2 rounded-full bg-green-500 shrink-0"
+                      />
+                    )}
                   </div>
                 )
               })}

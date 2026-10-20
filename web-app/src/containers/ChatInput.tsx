@@ -5,10 +5,27 @@ import {
   formatBytes,
   LOCAL_LLAMACPP_PROVIDER,
   isLlamacppProvider,
+  getModelDisplayName,
 } from '@/lib/utils'
+import { useMessageExecutionRoute } from '@/hooks/useMessageExecutionRoute'
+import { useAgentProvider } from '@/hooks/useAgentProvider'
+import { agentProviderBlockReason } from '@/lib/agent-provider'
+import {
+  agentModelBlockReason,
+} from '@/lib/managed-engine/chat'
+import AgentApprovalInline from '@/containers/AgentApprovalInline'
+import { addExternalAgentFolder } from '@/lib/agent-workspace-actions'
 import { usePrompt } from '@/hooks/usePrompt'
 import { useThreads } from '@/hooks/useThreads'
-import { useCallback, useEffect, useMemo, useRef, useState, memo } from 'react'
+import {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+  memo,
+} from 'react'
 import { Button } from '@/components/ui/button'
 import {
   Tooltip,
@@ -24,27 +41,39 @@ import {
 import { ArrowRight, PlusIcon } from 'lucide-react'
 import {
   IconLivePhoto,
+  IconCheck,
   IconPhoto,
-  IconTool,
   IconCodeCircle2,
   IconPlayerStopFilled,
   IconX,
+  IconFolderPlus,
   IconPaperclip,
+  IconTerminal2,
   IconLoader2,
-  IconWorld,
   IconMusic,
 } from '@tabler/icons-react'
 import { useTranslation } from '@/i18n/react-i18next-compat'
-import { useGeneralSetting } from '@/hooks/useGeneralSetting'
+import { isAgentModeOn, useGeneralSetting } from '@/hooks/useGeneralSetting'
 import { useModelProvider } from '@/hooks/useModelProvider'
+import { captureChatSendBlocked } from '@/lib/chat-telemetry'
+import { describeProviderState } from '@/lib/onboarding'
 
-import { useAppState } from '@/hooks/useAppState'
+import { modelStopKey, useAppState } from '@/hooks/useAppState'
+import { switchToModel } from '@/utils/switchModel'
+import {
+  ReplyModelGate,
+  type ReplyModelGateResolution,
+} from '@/containers/ReplyModelGate'
+import { captureReplyGateReady } from '@/lib/reply-gate-telemetry'
+import { useReplyModelAutoStart } from '@/hooks/useReplyModelAutoStart'
+import { useDeferredFirstSend } from '@/stores/deferred-first-send-store'
 import { useModelLoad } from '@/hooks/useModelLoad'
 import { syncActiveModelsFromEngines } from '@/utils/activeModelsSync'
-import type { ChatStatus } from 'ai'
+import { generateId, type ChatStatus } from 'ai'
 import { useRouter } from '@tanstack/react-router'
 import { route } from '@/constants/routes'
 import { TEMPORARY_CHAT_ID, TEMPORARY_CHAT_QUERY_ID } from '@/constants/chat'
+import { composerThreadKey as buildComposerThreadKey } from '@/lib/composer-thread-key'
 import {
   InitialMessageFile,
   useInitialMessage,
@@ -54,11 +83,13 @@ import { buildOptimisticUserMessage } from '@/lib/optimisticUserMessage'
 import { localStorageKey } from '@/constants/localStorage'
 import { defaultModel } from '@/lib/models'
 import { useAssistant } from '@/hooks/useAssistant'
-import DropdownToolsAvailable from '@/containers/DropdownToolsAvailable'
+import DropdownPlugins from '@/containers/DropdownPlugins'
+import ToolCostHint from '@/containers/ToolCostHint'
+import { PuzzleIcon } from '@/components/animated-icon/puzzle'
+import { RobotHeadIcon } from '@/components/icons/robot-head'
 import { useServiceHub } from '@/hooks/useServiceHub'
 import { useTools } from '@/hooks/useTools'
 import { TokenCounter } from '@/components/TokenCounter'
-import { ContextSizeControl } from '@/containers/ContextSizeControl'
 import { useMessages } from '@/hooks/useMessages'
 import { useShallow } from 'zustand/react/shallow'
 import { McpExtensionToolLoader } from './McpExtensionToolLoader'
@@ -72,10 +103,12 @@ import {
   VectorDBExtension,
 } from '@janhq/core'
 import { ExtensionManager } from '@/lib/extension'
-import { useImageGeneration } from '@/hooks/useImageGeneration'
+import { useChatImageGeneration } from '@/hooks/useChatImageGeneration'
 import { useAttachments } from '@/hooks/useAttachments'
 import { toast } from 'sonner'
 import { isPlatformTauri } from '@/lib/platform/utils'
+import { PlatformFeatures } from '@/lib/platform/const'
+import { PlatformFeature } from '@/lib/platform/types'
 import { processAttachmentsForSend } from '@/lib/attachmentProcessing'
 import { useAttachmentIngestionPrompt } from '@/hooks/useAttachmentIngestionPrompt'
 import {
@@ -90,6 +123,7 @@ import {
   createAudioAttachment,
 } from '@/types/attachment'
 import { AttachmentChip } from '@/containers/AttachmentChip'
+import { FileTooLargeError } from '@/lib/readFileBytes'
 import { readImageAttachmentFromPath } from '@/containers/chatInput/imageFromPath'
 import {
   readAudioAttachmentFromPath,
@@ -106,29 +140,45 @@ import {
 } from '@/containers/chatInput/classifyDroppedPaths'
 import JanBrowserExtensionDialog from '@/containers/dialogs/JanBrowserExtensionDialog'
 import { useJanBrowserExtension } from '@/hooks/useJanBrowserExtension'
-import { PromptVisionModel } from '@/containers/PromptVisionModel'
+import { VisionModelDialog } from '@/containers/dialogs/VisionModelDialog'
 import { useAgentMode } from '@/hooks/useAgentMode'
 import { useDownloadStore } from '@/hooks/useDownloadStore'
-import ReasoningToggle from '@/containers/ReasoningToggle'
+import DropdownModelProvider from '@/containers/DropdownModelProvider'
+import WebSearchToggle from '@/containers/WebSearchToggle'
+import VoiceInputToggle from '@/containers/VoiceInputToggle'
+import VoiceRecordingBar from '@/containers/chatInput/VoiceRecordingBar'
+import { useVoiceInput } from '@/hooks/useVoiceInput'
+import {
+  captureAnchor as captureDictationAnchor,
+  mergeDictation,
+  revertDictation,
+} from '@/lib/voice/promptMerge'
+import { VOICE_ACTIVE_PHASES } from '@/constants/voice'
 import { ttftPreBegin } from '@/lib/ttft-timing'
 import { ModelFactory } from '@/lib/model-factory'
-import { canSelectChatAgentMode } from '@/containers/ChatAgentModeSwitch'
 import { AgentApprovalModeSelect } from '@/containers/AgentApprovalModeSelect'
-import { AgentExternalFolderButton } from '@/containers/AgentExternalFolderButton'
 import { AgentSkillSlashMenu } from '@/containers/AgentSkillSlashMenu'
 import {
   filterAgentSkills,
+  containsAgentSkillInvocation,
   findAvailableAgentSkill,
   findAgentSkillSlashQuery,
   moveAgentSkillActiveIndex,
-  removeAgentSkillSlashQuery,
+  prependAgentSkillInvocation,
+  replaceAgentSkillSlashQuery,
   type AgentSkillSlashQuery,
 } from '@/containers/agentSkillSlash'
 import { useAgentSkills } from '@/hooks/useAgentSkills'
+import {
+  BACKEND_MISMATCH_PROMPT_EVENT,
+  useBackendMismatch,
+} from '@/hooks/useBackendMismatch'
 import type { AgentSkill } from '@/services/agent/skills'
 
 type ChatInputProps = {
   className?: string
+  containerClassName?: string
+  minRows?: number
   showSpeedToken?: boolean
   model?: ThreadModel
   initialMessage?: boolean
@@ -145,6 +195,8 @@ type ChatInputProps = {
 
 const ChatInput = memo(function ChatInput({
   className,
+  containerClassName,
+  minRows = 2,
   initialMessage,
   preselectedAgentSkillName,
   projectId,
@@ -153,6 +205,9 @@ const ChatInput = memo(function ChatInput({
   chatStatus,
 }: ChatInputProps) {
   const textareaRef = useRef<HTMLTextAreaElement>(null)
+  const pendingAgentSkillCaretRef = useRef<number | null>(null)
+  const composerAnchorRef = useRef<HTMLDivElement>(null)
+  const [compactComposer, setCompactComposer] = useState(false)
   const [isFocused, setIsFocused] = useState(false)
   const [rows, setRows] = useState(1)
   const [creationMode, setCreationMode] = useState<'image' | null>(null)
@@ -164,8 +219,16 @@ const ChatInput = memo(function ChatInput({
   const cancelToolCall = useAppState((state) => state.cancelToolCall)
   const prompt = usePrompt((state) => state.prompt)
   const setPrompt = usePrompt((state) => state.setPrompt)
+  // Narrow selectors on purpose. Subscribing to the whole voice store
+  // would pull in `level`, which updates ~20 times a second.
+  const voicePhase = useVoiceInput((state) => state.phase)
+  const voiceOwner = useVoiceInput((state) => state.ownerKey)
+  const voiceCommitted = useVoiceInput((state) => state.committed)
+  const voiceAnchor = useVoiceInput((state) => state.anchor)
+  const voiceOutcome = useVoiceInput((state) => state.lastOutcome)
+  const lastDictatedValueRef = useRef('')
   const currentThreadId = useThreads((state) => state.currentThreadId)
-  const { generateImage } = useImageGeneration(currentThreadId)
+  const { generateImage } = useChatImageGeneration(currentThreadId)
   const updateCurrentThreadModel = useThreads(
     (state) => state.updateCurrentThreadModel
   )
@@ -177,6 +240,7 @@ const ChatInput = memo(function ChatInput({
     (state) => state.tokenCounterCompact
   )
   const maxImageSizePx = useGeneralSetting((state) => state.maxImageSizePx)
+  const { shouldPrompt: shouldPromptBackendMismatch } = useBackendMismatch()
   useTools()
   const router = useRouter()
   const createThread = useThreads((state) => state.createThread)
@@ -188,19 +252,75 @@ const ChatInput = memo(function ChatInput({
     (state) => state.selectModelProvider
   )
   const updateProvider = useModelProvider((state) => state.updateProvider)
-
-  const canSelectAgentMode = canSelectChatAgentMode(initialMessage, projectId)
-  const isAgentProviderSelected = isLlamacppProvider(selectedProvider)
-  const agentModeKey = canSelectAgentMode
-    ? TEMPORARY_CHAT_ID
-    : (currentThreadId ?? TEMPORARY_CHAT_ID)
-  const isAgentMode = useAgentMode(
-    (state) => state.agentThreads[agentModeKey] === true
+  const getProviderByName = useModelProvider((state) => state.getProviderByName)
+  // Import completion refreshes the provider library without selecting or
+  // starting the new model. A compact primitive revision lets the queued-send
+  // effect below notice that its download has become an installed model.
+  const modelLibraryRevision = useModelProvider((state) =>
+    state.providers
+      .map(
+        (provider) =>
+          `${provider.provider}:${provider.models.map((model) => model.id).join(',')}`
+      )
+      .join('|')
   )
-  const effectiveAgentMode =
-    isAgentMode && !projectId && isAgentProviderSelected
-  const { skills: agentSkills, loading: agentSkillsLoading } =
-    useAgentSkills(effectiveAgentMode)
+
+  // Keys per-composer state (voice, workspace, approval mode). Composers use
+  // a placeholder key until the real thread exists — the project composer its
+  // own `project:<id>` slot, so it never fights the home composer over one.
+  const composerThreadKey = buildComposerThreadKey({
+    isComposer: Boolean(initialMessage),
+    currentThreadId,
+    projectId,
+  })
+  // Which engine would serve a send right now. Gates agent-only affordances;
+  // per-turn factors (audio) are re-resolved at send time.
+  //
+  // While the user has Agent mode on, a provider that has not resolved yet
+  // still counts as agent mode: routing reports `chat-transport` there only
+  // because there is nothing to judge (the list loads asynchronously at boot,
+  // and no model is picked on a fresh launch), and a composer that drops its
+  // approval mode, skills and placeholder until a model is chosen reads as a
+  // broken input rather than a deliberate one. With the toggle off, chat is
+  // simply the default — no guard needed.
+  const agentProvider = useAgentProvider()
+  const agentProviderResolved = Boolean(agentProvider)
+  const agentModeEnabled = useGeneralSetting(isAgentModeOn)
+  const setAgentModeEnabled = useGeneralSetting(
+    (state) => state.setAgentModeEnabled
+  )
+  const chatExecEnabled = useGeneralSetting((state) => state.chatExecEnabled)
+  const setChatExecEnabled = useGeneralSetting(
+    (state) => state.setChatExecEnabled
+  )
+  const agentRouteActive =
+    useMessageExecutionRoute().route === 'agent-ipc' ||
+    (agentModeEnabled && !agentProviderResolved)
+  // Why the current provider can't serve the agent loop (null = it can).
+  // Only used for hints — the toggle stays usable and routing falls back to
+  // chat safely at send time.
+  const agentBlockReason = agentProviderBlockReason(agentProvider)
+  // A model that cannot call tools (TensorRT-LLM without a tool parser): the turn goes to chat,
+  // and the chip says why.
+  const agentModelBlock = agentModelBlockReason(
+    agentProvider?.provider,
+    selectedModel ?? undefined
+  )
+  // This composer owns the microphone only if it started the session —
+  // home and an open thread can both be mounted at once.
+  const isVoiceActive =
+    voiceOwner === composerThreadKey && VOICE_ACTIVE_PHASES.has(voicePhase)
+  // Insertion outlives the recording. The tail phrase is transcribed after the
+  // microphone closes, so it arrives together with the `stopped` event — by
+  // which point the phase is `idle` and `isVoiceActive` is already false.
+  const isVoiceOwned = voiceOwner === composerThreadKey
+  // Skills work on both engines now; the web build has no `invoke`, so the
+  // hook stays off there.
+  const {
+    skills: agentSkills,
+    loading: agentSkillsLoading,
+    setEnabled: setAgentSkillEnabled,
+  } = useAgentSkills(IS_TAURI)
   const [selectedAgentSkill, setSelectedAgentSkill] =
     useState<AgentSkill | null>(null)
   const preselectedAgentSkillAppliedRef = useRef<string | null>(null)
@@ -212,24 +332,31 @@ const ChatInput = memo(function ChatInput({
     () => filterAgentSkills(agentSkills, agentSkillSlashQuery?.query ?? ''),
     [agentSkillSlashQuery?.query, agentSkills]
   )
-  const setAgentMode = useAgentMode((state) => state.setAgentMode)
   const approvalMode = useAgentMode(
-    (state) => state.approvalModes[agentModeKey] ?? 'manual'
+    (state) => state.approvalModes[composerThreadKey] ?? 'manual'
   )
   const setApprovalMode = useAgentMode((state) => state.setApprovalMode)
 
-  useEffect(() => {
-    if (!isAgentProviderSelected && isAgentMode) {
-      setAgentMode(agentModeKey, false)
-    }
-  }, [agentModeKey, isAgentProviderSelected, isAgentMode, setAgentMode])
+  useLayoutEffect(() => {
+    const caret = pendingAgentSkillCaretRef.current
+    if (caret === null) return
+    pendingAgentSkillCaretRef.current = null
+    textareaRef.current?.focus()
+    textareaRef.current?.setSelectionRange(caret, caret)
+  }, [prompt])
 
-  useEffect(() => {
-    if (effectiveAgentMode) return
-    setSelectedAgentSkill(null)
-    setAgentSkillSlashQuery(null)
-    setAgentSkillMenuOpen(false)
-  }, [effectiveAgentMode])
+  useLayoutEffect(() => {
+    const element = composerAnchorRef.current
+    if (!element || typeof ResizeObserver === 'undefined') return
+    const update = (width: number) => setCompactComposer(width < 620)
+    update(element.getBoundingClientRect().width)
+    const observer = new ResizeObserver((entries) => {
+      const width = entries[0]?.contentRect.width
+      if (typeof width === 'number') update(width)
+    })
+    observer.observe(element)
+    return () => observer.disconnect()
+  }, [])
 
   useEffect(() => {
     if (!preselectedAgentSkillName) {
@@ -237,7 +364,6 @@ const ChatInput = memo(function ChatInput({
       return
     }
     if (
-      !effectiveAgentMode ||
       agentSkillsLoading ||
       preselectedAgentSkillAppliedRef.current === preselectedAgentSkillName
     ) {
@@ -248,12 +374,17 @@ const ChatInput = memo(function ChatInput({
       preselectedAgentSkillName
     )
     preselectedAgentSkillAppliedRef.current = preselectedAgentSkillName
-    if (skill) setSelectedAgentSkill(skill)
+    if (!skill) return
+
+    setSelectedAgentSkill(skill)
+    const currentPrompt = usePrompt.getState().prompt
+    const next = prependAgentSkillInvocation(currentPrompt, skill.name)
+    if (next.value !== currentPrompt) setPrompt(next.value)
   }, [
     agentSkills,
     agentSkillsLoading,
-    effectiveAgentMode,
     preselectedAgentSkillName,
+    setPrompt,
   ])
 
   useEffect(() => {
@@ -262,9 +393,9 @@ const ChatInput = memo(function ChatInput({
 
   const handleApprovalModeChange = useCallback(
     (mode: 'manual' | 'skip') => {
-      setApprovalMode(agentModeKey, mode)
+      setApprovalMode(composerThreadKey, mode)
     },
-    [agentModeKey, setApprovalMode]
+    [composerThreadKey, setApprovalMode]
   )
 
   // Get current thread messages for token counting
@@ -283,6 +414,25 @@ const ChatInput = memo(function ChatInput({
   const [isDragOver, setIsDragOver] = useState(false)
   const [hasMmproj, setHasMmproj] = useState(false)
   const [showVisionModelPrompt, setShowVisionModelPrompt] = useState(false)
+  const [replyGateOpen, setReplyGateOpen] = useState(false)
+  /**
+   * The message the user typed before there was anything to answer with.
+   *
+   * Armed when a model is on its way — resolved silently by
+   * `useReplyModelAutoStart`, or chosen in the widget: starting, downloading,
+   * or a cloud provider just connected — and consumed the moment that model
+   * can actually answer. Survives the widget closing: a download is minutes
+   * long, and holding a modal open for it would be worse than useless.
+   */
+  const [queuedSend, setQueuedSend] = useState<
+    | (ReplyModelGateResolution & {
+        /** Armed by a Send to a model the user had stopped — not the reply
+         *  gate, so it is left out of the gate's funnel. */
+        resumesStoppedModel?: boolean
+      })
+    | null
+  >(null)
+  const { tryAutoStart } = useReplyModelAutoStart()
   const [isPreparingDocumentAttachments, setIsPreparingDocumentAttachments] =
     useState(false)
   const activeModels = useAppState(useShallow((state) => state.activeModels))
@@ -299,7 +449,8 @@ const ChatInput = memo(function ChatInput({
     const isLocal =
       selectedProvider === 'mlx' ||
       selectedProvider === 'llamacpp' ||
-      selectedProvider === 'llamacpp-upstream'
+      selectedProvider === 'llamacpp-upstream' ||
+      selectedProvider === 'atomic-prism'
     if (
       !isLocal ||
       !selectedModel?.id ||
@@ -312,6 +463,33 @@ const ChatInput = memo(function ChatInput({
 
     const ensureLocalModelRunning = async () => {
       try {
+        const {
+          switchToModel,
+          shouldAttemptAutoStart,
+          isExplicitSwitchPending,
+        } = await import('@/utils/switchModel')
+        const { isAnyChatBusy } = await import('@/stores/chat-session-store')
+        if (cancelled) return
+
+        // Never reshuffle engines while an answer is being generated: a
+        // switch runs `stopAllModelsExcept` / `stopAllModels`, which SIGKILLs
+        // the llama-server that is streaming. `chatStatus` covers this
+        // composer's thread; `isAnyChatBusy` covers other threads and the
+        // home/project composers that get no `chatStatus`. The effect re-runs
+        // once the stream ends (`chatStatus` is a dependency).
+        if (
+          chatStatus === 'submitted' ||
+          chatStatus === 'streaming' ||
+          isAnyChatBusy()
+        )
+          return
+
+        // An explicit pick (dropdown / send) is already driving this exact
+        // target. It changes the selection first, so this effect fires while
+        // that switch is in flight — probing the engines here only duplicates
+        // its work and enqueues a redundant switch behind it.
+        if (isExplicitSwitchPending(selectedProvider, selectedModel.id)) return
+
         const [actualActive, activeAcrossProviders] = await Promise.all([
           serviceHub.models().getActiveModels(selectedProvider),
           serviceHub.models().getActiveModels(),
@@ -323,19 +501,39 @@ const ChatInput = memo(function ChatInput({
         // every navigation into a thread.
         syncActiveModelsFromEngines(activeAcrossProviders || [])
 
-        if (
-          actualActive.length === 1 &&
-          actualActive[0] === selectedModel.id &&
-          activeAcrossProviders.length === 1 &&
-          activeAcrossProviders[0] === selectedModel.id
-        ) {
+        if (actualActive.includes(selectedModel.id)) {
+          // The selected provider already serves this model. If another
+          // engine holds a stray copy (both llama.cpp providers list the
+          // same GGUF dir, so a post-download auto-start can land in the
+          // other one), drop only that copy — a full `switchToModel` would
+          // tear down the serving engine as well. `getActiveModels()` with
+          // no provider de-duplicates ids across engines, so the same model
+          // loaded twice is invisible there; probe the other engines.
+          const otherEngines = (
+            ['llamacpp', 'llamacpp-upstream', 'atomic-prism', 'mlx'] as const
+          ).filter((engine) => engine !== selectedProvider)
+          const strayCopies = await Promise.all(
+            otherEngines.map((engine) =>
+              serviceHub
+                .models()
+                .getActiveModels(engine)
+                .catch(() => [] as string[])
+            )
+          )
+          if (cancelled) return
+          if (
+            actualActive.length > 1 ||
+            strayCopies.some((models) => models.length > 0)
+          ) {
+            await serviceHub
+              .models()
+              .stopAllModelsExcept(selectedModel.id, selectedProvider)
+            if (cancelled) return
+            syncActiveModelsFromEngines([selectedModel.id])
+          }
           return
         }
 
-        const { switchToModel, shouldAttemptAutoStart } = await import(
-          '@/utils/switchModel'
-        )
-        if (cancelled) return
         // WS2: don't auto-retry a model that just failed terminally (missing
         // file/binary) or is still within its backoff window — this is what
         // turned a failed load into a tight restart loop. Explicit user
@@ -371,6 +569,8 @@ const ChatInput = memo(function ChatInput({
     // finishes and marks the model active again is a harmless no-op (the
     // active-model check above short-circuits immediately).
     isModelActive,
+    // Re-check after a stream ends: the busy guard above skipped the probe.
+    chatStatus,
   ])
 
   const modelLoadError = useModelLoad((state) => state.modelLoadError)
@@ -381,7 +581,8 @@ const ChatInput = memo(function ChatInput({
   const isLocalModelNotReady =
     (selectedProvider === 'mlx' ||
       selectedProvider === 'llamacpp' ||
-      selectedProvider === 'llamacpp-upstream') &&
+      selectedProvider === 'llamacpp-upstream' ||
+      selectedProvider === 'atomic-prism') &&
     !!selectedModel?.id &&
     !activeModels.includes(selectedModel.id)
 
@@ -394,8 +595,35 @@ const ChatInput = memo(function ChatInput({
     !!modelLoadError &&
     modelLoadErrorModelId === selectedModel?.id
 
+  // The user stopped this model by hand (Settings → Stop). Auto-start leaves it
+  // down, so Send is what brings it back — it must not wait on a load that
+  // nothing is going to start.
+  const selectedModelStoppedByUser = useAppState(
+    (state) =>
+      !!selectedModel?.id &&
+      state.userStoppedModels.includes(
+        modelStopKey(selectedProvider, selectedModel.id)
+      )
+  )
+  const resumesStoppedModel =
+    isLocalModelNotReady && selectedModelStoppedByUser && !loadingModel
+
   const blockSendUntilModelReady =
-    (isLocalModelNotReady && !!onSubmit) || selectedModelLoadFailed
+    (isLocalModelNotReady && !!onSubmit && !resumesStoppedModel) ||
+    selectedModelLoadFailed
+
+  /**
+   * Nothing is selected, so there is nothing to send with.
+   *
+   * This is the normal state of every cold launch, not an edge case:
+   * `preloadModelOnStartup` is off by default and `main.tsx` clears the
+   * persisted selection on boot. Pressing Send here used to produce a red line;
+   * it now opens the "what do I reply with?" widget.
+   */
+  const needsReplyModel = !selectedModel
+
+  /** A model that can answer right now — a loaded local one, or a cloud one. */
+  const canSendToSelectedModel = !!selectedModel && !isLocalModelNotReady
 
   const selectedAssistant = useAssistant((state) => state.pendingAssistant)
   const setSelectedAssistant = useAssistant(
@@ -406,7 +634,7 @@ const ChatInput = memo(function ChatInput({
 
   // Jan Browser Extension hook
   const {
-    //! при возврате кнопки Browse: hasConfig: hasJanBrowserMCPConfig, isLoading: isJanBrowserMCPLoading,
+    //! when bringing back the Browse button: hasConfig: hasJanBrowserMCPConfig, isLoading: isJanBrowserMCPLoading,
     isActive: janBrowserMCPActive,
     dialogOpen: extensionDialogOpen,
     dialogState: extensionDialogState,
@@ -420,6 +648,17 @@ const ChatInput = memo(function ChatInput({
     const capabilities = selectedModel?.capabilities || []
     return capabilities.includes('vision') && capabilities.includes('tools')
   }, [selectedModel?.capabilities])
+
+  // Tool-driven controls (the tools dropdown, web search, document ingest)
+  // stay visible while no model is picked yet: an empty toolbar reads as a
+  // broken composer, and picking a model is the very next thing the user does.
+  // Once a model is selected the real `tools` capability decides.
+  const supportsTools = useMemo(
+    () =>
+      !selectedModel ||
+      (selectedModel.capabilities?.includes('tools') ?? false),
+    [selectedModel]
+  )
 
   // Audio input is gated on the model's `audio` capability (omni/audio-capable
   // models such as Gemma 4 via the MLX backend). The "Add audio" menu item is
@@ -460,13 +699,14 @@ const ChatInput = memo(function ChatInput({
   const transferAttachments = useChatAttachments(
     (state) => state.transferAttachments
   )
-  const getProviderByName = useModelProvider((state) => state.getProviderByName)
-  const { downloads, localDownloadingModels } = useDownloadStore(
+  const { downloads, localDownloadingModels, resumableDownloads } =
+    useDownloadStore(
     useShallow((state) => ({
       downloads: state.downloads,
       localDownloadingModels: state.localDownloadingModels,
+      resumableDownloads: state.resumableDownloads,
     }))
-  )
+    )
 
   useEffect(() => {
     attachmentsKeyRef.current = attachmentsKey
@@ -545,25 +785,55 @@ const ChatInput = memo(function ChatInput({
     [clearAttachmentsForThread, setAttachmentsForThread]
   )
 
-  // Check for mmproj existence or vision capability when model changes
+  // Session vision for llama.cpp (live --mmproj), catalog vision otherwise.
+  // Also re-check when an unsupported projector forces text-only fallback.
   useEffect(() => {
+    let cancelled = false
+    let unlistenFallback: (() => void) | undefined
+
     const checkMmprojSupport = async () => {
-      if (selectedModel && selectedModel?.id) {
-        try {
-          // Only check mmproj for llamacpp provider
-          if (selectedModel?.capabilities?.includes('vision')) {
-            setHasMmproj(true)
-          } else {
-            setHasMmproj(false)
-          }
-        } catch (error) {
-          console.error('Error checking mmproj:', error)
-          setHasMmproj(false)
-        }
+      if (!selectedModel?.id) {
+        setHasMmproj(false)
+        return
+      }
+      try {
+        const { resolveSupportsVision } = await import('@/lib/session-vision')
+        const supported = await resolveSupportsVision({
+          providerName: selectedProvider,
+          modelId: selectedModel.id,
+          capabilities: selectedModel.capabilities,
+        })
+        if (!cancelled) setHasMmproj(supported && selectedProvider !== 'tensorrt-llm')
+      } catch (error) {
+        console.error('Error checking mmproj:', error)
+        if (!cancelled) setHasMmproj(false)
       }
     }
 
     checkMmprojSupport()
+
+    void (async () => {
+      try {
+        const { listen } = await import('@tauri-apps/api/event')
+        if (cancelled) return
+        unlistenFallback = await listen<{ modelId?: string }>(
+          'local_backend://multimodal_disabled_fallback',
+          (event) => {
+            const modelId = event.payload?.modelId
+            if (modelId && modelId !== selectedModel?.id) return
+            setHasMmproj(false)
+            void checkMmprojSupport()
+          }
+        )
+      } catch {
+        // Outside Tauri / tests: attach still uses catalog vision.
+      }
+    })()
+
+    return () => {
+      cancelled = true
+      unlistenFallback?.()
+    }
   }, [selectedModel, selectedModel?.capabilities, selectedProvider, serviceHub])
 
   // Check if there are active MCP servers
@@ -576,31 +846,175 @@ const ChatInput = memo(function ChatInput({
   const MCPToolComponent = mcpExtension?.getToolComponent?.()
 
   const updateAgentSkillSlashQuery = (value: string, cursor: number | null) => {
-    if (!effectiveAgentMode) return
     const nextQuery = findAgentSkillSlashQuery(value, cursor)
     setAgentSkillSlashQuery(nextQuery)
     setAgentSkillMenuOpen(nextQuery !== null)
   }
 
+  // Switching a skill off from the plugins menu is the same flag the skills
+  // page flips. A skill that is off can't run, so the composer drops it as
+  // the selected one too rather than sending a name the agent will reject.
+  const handleAgentSkillToggle = (name: string, enabled: boolean) => {
+    void (async () => {
+      try {
+        await setAgentSkillEnabled(name, enabled)
+        if (!enabled && selectedAgentSkill?.name === name) {
+          setSelectedAgentSkill(null)
+        }
+      } catch (reason) {
+        toast.error(String(reason))
+      }
+    })()
+  }
+
   const handleAgentSkillSelect = (skill: AgentSkill) => {
     if (!agentSkillSlashQuery) return
-    const next = removeAgentSkillSlashQuery(prompt, agentSkillSlashQuery)
+    const next = replaceAgentSkillSlashQuery(
+      prompt,
+      agentSkillSlashQuery,
+      skill.name
+    )
+    pendingAgentSkillCaretRef.current = next.cursor
     setPrompt(next.value)
     setSelectedAgentSkill(skill)
     setAgentSkillSlashQuery(null)
     setAgentSkillMenuOpen(false)
-    requestAnimationFrame(() => {
-      textareaRef.current?.focus()
-      textareaRef.current?.setSelectionRange(next.cursor, next.cursor)
-    })
   }
 
-  const handleSendMessage = async (prompt: string) => {
-    if (!selectedModel) {
-      setMessage('Please select a model to start chatting.')
-      return
+  // Read the caret at the moment the microphone is pressed; dictated text is
+  // spliced there and whatever is to the right is preserved.
+  const captureVoiceAnchor = useCallback(
+    () =>
+      captureDictationAnchor(
+        usePrompt.getState().prompt,
+        textareaRef.current?.selectionStart ?? null
+      ),
+    []
+  )
+
+  // Recompute the whole value from the anchor on every new phrase rather than
+  // appending, so a dropped render can never duplicate a phrase.
+  useEffect(() => {
+    if (!isVoiceOwned || !voiceAnchor) return
+    // A discarded recording is the revert effect's business, not ours.
+    if (voiceOutcome === 'cancelled') return
+    const { value, caret, insertedLength } = mergeDictation(
+      voiceAnchor,
+      voiceCommitted
+    )
+    lastDictatedValueRef.current = value
+    setPrompt(value)
+    useVoiceInput.getState().noteInserted(insertedLength)
+    requestAnimationFrame(() => {
+      textareaRef.current?.focus()
+      textareaRef.current?.setSelectionRange(caret, caret)
+    })
+  }, [isVoiceOwned, voiceAnchor, voiceCommitted, voiceOutcome, setPrompt])
+
+  // Cancelling removes exactly what this session inserted — unless the user
+  // edited the field meanwhile, in which case the text is theirs and stays.
+  useEffect(() => {
+    if (voiceOutcome !== 'cancelled') return
+    const state = useVoiceInput.getState()
+    if (state.ownerKey !== null && state.ownerKey !== composerThreadKey) return
+    if (!voiceAnchor) return
+
+    if (state.canRevert) {
+      const reverted = revertDictation(
+        usePrompt.getState().prompt,
+        voiceAnchor,
+        state.insertedLength
+      )
+      if (reverted) {
+        setPrompt(reverted.value)
+        requestAnimationFrame(() => {
+          textareaRef.current?.setSelectionRange(reverted.caret, reverted.caret)
+        })
+      }
+    } else if (state.insertedLength > 0) {
+      toast.info(t('common:voiceInput.keptOnCancel'))
+    }
+    state.reset()
+  }, [voiceOutcome, voiceAnchor, composerThreadKey, setPrompt, t])
+
+  // Stop dictation when this composer goes away, otherwise the microphone
+  // stays open with nowhere to put the text.
+  useEffect(() => {
+    return () => {
+      const state = useVoiceInput.getState()
+      if (state.ownerKey === composerThreadKey && state.sessionId) {
+        void state.cancel()
+      }
+    }
+  }, [composerThreadKey])
+
+  const handleSendMessage = async (submitted: string) => {
+    let prompt = submitted
+    // Flush the tail phrase first, or pressing Enter mid-sentence drops the
+    // last few words the user just spoke. `stop()` resolves only once that
+    // phrase has actually been transcribed, so the value has to be recomputed
+    // afterwards — `submitted` was captured before those words existed.
+    if (isVoiceActive) {
+      await useVoiceInput.getState().stop()
+      const { anchor, committed, lastOutcome } = useVoiceInput.getState()
+      if (anchor && lastOutcome !== 'cancelled') {
+        prompt = mergeDictation(anchor, committed).value
+        setPrompt(prompt)
+      }
     }
     if (!prompt.trim()) {
+      return
+    }
+    if (!selectedModel) {
+      // The composer cannot answer this, but the device often can: a model
+      // from last time, a connected cloud provider, the only model on disk.
+      // Decide silently first, and hold the message — it is sent, unchanged,
+      // the moment something is ready to answer with (ATO-461).
+      setPrompt(prompt)
+      const auto = tryAutoStart()
+      if (auto) {
+        setQueuedSend(auto)
+        return
+      }
+      // Nothing to decide with: ask.
+      setReplyGateOpen(true)
+      // Everything downstream captures a turn; this returns before any of it,
+      // so the most common first-run dead end produced no event at all. Now
+      // that ATO-453 answers it with a widget, this is also the baseline the
+      // widget's effect is measured against.
+      // Mapped by hand: `describeProviderState` is camelCase and a spread
+      // would ship its keys verbatim, leaving the documented snake_case
+      // properties permanently empty in PostHog.
+      const providerState = describeProviderState(
+        useModelProvider.getState().providers
+      )
+      captureChatSendBlocked({
+        reason: 'no_model',
+        is_agent_mode: agentRouteActive,
+        had_local_model_on_disk: providerState.hadLocalModelOnDisk,
+        had_cloud_key: providerState.hadCloudKey,
+      })
+      return
+    }
+    if (resumesStoppedModel) {
+      // Sending is the ask to bring a stopped model back: start it the way a
+      // pick in the dropdown would, and hold the message until it can answer.
+      setPrompt(prompt)
+      void switchToModel({
+        modelId: selectedModel.id,
+        providerName: selectedProvider,
+        serviceHub,
+      }).catch((error) => {
+        console.error('[ChatInput] failed to start the stopped model', error)
+      })
+      setQueuedSend({
+        outcome: 'auto_start',
+        branch: 'auto_start',
+        decidedInMs: 0,
+        openedAtMs: Date.now(),
+        modelLabel: getModelDisplayName(selectedModel),
+        resumesStoppedModel: true,
+      })
       return
     }
     if (isAttachmentPipelineBusy) {
@@ -608,14 +1022,7 @@ const ChatInput = memo(function ChatInput({
       return
     }
     if (
-      effectiveAgentMode &&
-      attachments.some((attachment) => attachment.type === 'audio')
-    ) {
-      toast.error(t('chat:agentErrors.audioUnsupported'))
-      return
-    }
-    if (
-      effectiveAgentMode &&
+      agentRouteActive &&
       !hasMmproj &&
       attachments.some((attachment) => attachment.type === 'image')
     ) {
@@ -625,6 +1032,13 @@ const ChatInput = memo(function ChatInput({
     }
 
     setMessage('')
+
+    // A previous model load found that the running backend is not the one the UI
+    // shows (or that a faster one exists). Raise it here, on the first send after
+    // the load, rather than interrupting the load itself. Never blocks the send.
+    if (shouldPromptBackendMismatch) {
+      window.dispatchEvent(new Event(BACKEND_MISMATCH_PROMPT_EVENT))
+    }
 
     // Use onSubmit prop if available (AI SDK), otherwise create thread and navigate
     if (onSubmit) {
@@ -707,7 +1121,7 @@ const ChatInput = memo(function ChatInput({
       // createThread + navigation + ThreadDetail mount. By the time
       // `CustomChatTransport.sendMessages` calls `ModelFactory.createModel`,
       // the session-cache entry is already populated and the IPC round-trips
-      // (`startModel` + `find_session_by_model`) are skipped, shaving
+      // (`startModel` + `resolve_local_session`) are skipped, shaving
       // ~150–220ms off the critical path. Fire-and-forget — failures fall
       // back to the regular discovery path inside `createModel`.
       if (selectedModel?.id) {
@@ -740,10 +1154,10 @@ const ChatInput = memo(function ChatInput({
         // image data URLs can exceed the per-origin quota and silently abort
         // navigation with QuotaExceededError.
         useInitialMessage.getState().set(TEMPORARY_CHAT_ID, messagePayload)
-        if (isAgentMode && agentModeKey !== TEMPORARY_CHAT_ID) {
+        if (composerThreadKey !== TEMPORARY_CHAT_ID) {
           useAgentMode
             .getState()
-            .transferAgentMode(agentModeKey, TEMPORARY_CHAT_ID)
+            .transferThreadState(composerThreadKey, TEMPORARY_CHAT_ID)
         }
         router.navigate({
           to: route.threadsDetail,
@@ -833,7 +1247,9 @@ const ChatInput = memo(function ChatInput({
           )
         }
 
-        useAgentMode.getState().transferAgentMode(agentModeKey, newThread.id)
+        useAgentMode
+          .getState()
+          .transferThreadState(composerThreadKey, newThread.id)
 
         useInitialMessage.getState().set(newThread.id, messagePayload)
 
@@ -864,6 +1280,141 @@ const ChatInput = memo(function ChatInput({
       }
     }
   }
+
+  // Held in a ref so the queued-send effect below can depend on readiness
+  // alone. `handleSendMessage` is a plain function rebuilt on every render, and
+  // depending on it would re-fire the queued send on any unrelated keystroke.
+  const sendMessageRef = useRef(handleSendMessage)
+  sendMessageRef.current = handleSendMessage
+
+  const handleReplyGateResolved = useCallback(
+    (resolution: ReplyModelGateResolution) => {
+      const canRunFromRoot =
+        Boolean(initialMessage) &&
+        !projectId &&
+        !onSubmit &&
+        attachments.length === 0 &&
+        (resolution.outcome === 'download' ||
+          resolution.outcome === 'download_in_flight') &&
+        (resolution.downloadModelIds?.length ?? 0) > 0
+
+      if (canRunFromRoot) {
+        useDeferredFirstSend.getState().enqueue({
+          id: generateId(),
+          prompt: usePrompt.getState().prompt,
+          downloadModelIds: resolution.downloadModelIds!,
+          createdAt: Date.now(),
+        })
+        // Keep the fast path local while New Chat is still mounted. The root
+        // queue is its navigation-safe backup and takes over only if the user
+        // leaves this route before the download finishes.
+        setQueuedSend(resolution)
+        return
+      }
+      // Choosing a cloud key/subscription or importing a folder supersedes a
+      // previously armed first-download queue.
+      useDeferredFirstSend.getState().clear()
+      setQueuedSend(resolution)
+    },
+    [attachments.length, initialMessage, onSubmit, projectId]
+  )
+
+  const handleReplyGateDismissed = useCallback(() => {
+    useDeferredFirstSend.getState().clear()
+    setQueuedSend(null)
+    setReplyGateOpen(false)
+    useDeferredFirstSend.getState().clear()
+  }, [])
+
+  // A download deliberately lands in the library without auto-starting: an
+  // import must not interrupt an unrelated active chat. A queued Send is the
+  // exception because it is explicit intent to use that exact first model.
+  // Once the imported id appears in the refreshed provider list, select and
+  // start it; the existing readiness effect below sends the preserved draft.
+  useEffect(() => {
+    const ids = queuedSend?.downloadModelIds ?? []
+    if (ids.length === 0 || selectedModel) return
+
+    const providers = useModelProvider.getState().providers
+    const imported = ids.some((id) =>
+      providers.some((provider) =>
+        provider.models.some(
+          (model) => model.id === id || model.id === id.replace(/\//g, '\\')
+        )
+      )
+    )
+    if (!imported) return
+
+    const resumed = tryAutoStart()
+    if (!resumed) return
+    setQueuedSend((current) =>
+      current
+        ? {
+            ...current,
+            resolution: resumed.resolution,
+            modelLabel: resumed.modelLabel,
+          }
+        : current
+    )
+  }, [modelLibraryRevision, queuedSend, selectedModel, tryAutoStart])
+
+  // Cancelling from the global download panel must disarm the queued Send as
+  // well. The draft itself remains untouched in the composer.
+  useEffect(() => {
+    const ids = queuedSend?.downloadModelIds ?? []
+    if (ids.some((id) => resumableDownloads.has(id))) {
+      setQueuedSend(null)
+    }
+  }, [queuedSend, resumableDownloads])
+
+  useEffect(() => {
+    if (!queuedSend) return
+    if (!canSendToSelectedModel) return
+
+    setQueuedSend(null)
+    setReplyGateOpen(false)
+
+    // The user may have cleared or rewritten the field while the model came up.
+    // Whatever is in it now is what they meant; an empty field means they
+    // changed their mind, and re-sending the old text would put words in.
+    const pending = usePrompt.getState().prompt
+    if (!queuedSend.resumesStoppedModel) {
+      captureReplyGateReady({
+        branch: queuedSend.branch,
+        outcome: queuedSend.outcome,
+        readyInMs: Date.now() - queuedSend.openedAtMs,
+        queuedMessageSent: pending.trim().length > 0,
+        resolution: queuedSend.resolution,
+      })
+    }
+    if (!pending.trim()) return
+    void sendMessageRef.current(pending)
+  }, [queuedSend, canSendToSelectedModel])
+
+  // A model that failed to come up will never satisfy the queued send. Drop
+  // the promise rather than leave "starting…" on screen forever; the load
+  // error toast says what happened, and the text is still in the field. The
+  // failure clears the selection (`switchToModel`), so losing it is the
+  // signal: the error itself outlives the failure, and would also drop a send
+  // that starts the same model again. A send armed on a download has no
+  // selection yet, so only the change counts.
+  const hadSelectionRef = useRef(!!selectedModel)
+  useEffect(() => {
+    const lostSelection = hadSelectionRef.current && !selectedModel
+    hadSelectionRef.current = !!selectedModel
+    if (queuedSend && lostSelection) setQueuedSend(null)
+  }, [queuedSend, selectedModel])
+
+  // Nor will a model the user stops while the send waits — a Cancel on its
+  // load, or a Stop (ATO-530). Only the change counts: a send made *to* a
+  // stopped model is what lifts the stop, and must not be dropped by it.
+  const wasStoppedByUserRef = useRef(selectedModelStoppedByUser)
+  useEffect(() => {
+    const becameStopped =
+      selectedModelStoppedByUser && !wasStoppedByUserRef.current
+    wasStoppedByUserRef.current = selectedModelStoppedByUser
+    if (queuedSend && becameStopped) setQueuedSend(null)
+  }, [queuedSend, selectedModelStoppedByUser])
 
   useEffect(() => {
     const handleFocusIn = () => {
@@ -912,6 +1463,18 @@ const ChatInput = memo(function ChatInput({
     if (chatStatus !== 'submitted' && textareaRef.current) {
       // Small delay to ensure UI has updated
       setTimeout(() => {
+        // Never yank the caret out of another field the user is typing in —
+        // an inline message editor open in the transcript, for instance.
+        const active = document.activeElement
+        if (
+          active &&
+          active !== textareaRef.current &&
+          (active.tagName === 'TEXTAREA' ||
+            active.tagName === 'INPUT' ||
+            (active as HTMLElement).isContentEditable)
+        ) {
+          return
+        }
         textareaRef.current?.focus()
       }, 10)
     }
@@ -945,6 +1508,7 @@ const ChatInput = memo(function ChatInput({
           const isLocal =
             selectedProvider === 'llamacpp' ||
             selectedProvider === 'llamacpp-upstream' ||
+            selectedProvider === 'atomic-prism' ||
             selectedProvider === 'mlx'
           if (!isLocal) return false
           try {
@@ -1363,7 +1927,12 @@ const ChatInput = memo(function ChatInput({
     return hashArray.map((b) => b.toString(16).padStart(2, '0')).join('')
   }
 
-  const IMAGE_MAX_SIZE_BYTES = 10 * 1024 * 1024
+  const IMAGE_MAX_SIZE_MB = 10
+  const IMAGE_MAX_SIZE_BYTES = IMAGE_MAX_SIZE_MB * 1024 * 1024
+  // Raw on-disk ceiling for an image read by path. Deliberately above
+  // IMAGE_MAX_SIZE_BYTES: the limit applies after downscaling, and a big PNG
+  // often shrinks under it (the File path behaves the same way).
+  const IMAGE_MAX_READ_BYTES = 64 * 1024 * 1024
   const IMAGE_ALLOWED_MIME_TYPES = [
     'image/jpg',
     'image/jpeg',
@@ -1375,6 +1944,12 @@ const ChatInput = memo(function ChatInput({
     candidates: Attachment[]
     oversized: string[]
     invalidType: string[]
+    /**
+     * Files of an accepted type that could not be read from disk. Kept apart
+     * from `invalidType`: reporting a read failure as "invalid file type" sent
+     * people hunting for the wrong problem (#261).
+     */
+    readFailed: string[]
   }
 
   const prepareImageAttachmentsFromFiles = async (
@@ -1382,13 +1957,10 @@ const ChatInput = memo(function ChatInput({
   ): Promise<ImageValidationOutcome> => {
     const oversized: string[] = []
     const invalidType: string[] = []
+    const readFailed: string[] = []
     const validFiles: File[] = []
 
     for (const file of files) {
-      if (file.size > IMAGE_MAX_SIZE_BYTES) {
-        oversized.push(file.name)
-        continue
-      }
       const detectedType = file.type || getFileTypeFromExtension(file.name)
       const actualType = getFileTypeFromExtension(file.name) || detectedType
       if (!IMAGE_ALLOWED_MIME_TYPES.includes(actualType)) {
@@ -1422,10 +1994,16 @@ const ChatInput = memo(function ChatInput({
         actualType
       )
 
+      const size = downscaled?.size ?? file.size
+      if (size > IMAGE_MAX_SIZE_BYTES) {
+        oversized.push(file.name)
+        continue
+      }
+
       candidates.push(
         createImageAttachment({
           name: file.name,
-          size: downscaled?.size ?? file.size,
+          size,
           mimeType: downscaled?.mimeType ?? actualType,
           base64: downscaled?.base64 ?? dataUrl.split(',')[1] ?? '',
           dataUrl: downscaled?.dataUrl ?? dataUrl,
@@ -1433,7 +2011,7 @@ const ChatInput = memo(function ChatInput({
       )
     }
 
-    return { candidates, oversized, invalidType }
+    return { candidates, oversized, invalidType, readFailed }
   }
 
   const prepareImageAttachmentsFromPaths = async (
@@ -1441,6 +2019,7 @@ const ChatInput = memo(function ChatInput({
   ): Promise<ImageValidationOutcome> => {
     const oversized: string[] = []
     const invalidType: string[] = []
+    const readFailed: string[] = []
     const candidates: Attachment[] = []
 
     for (const p of paths) {
@@ -1450,11 +2029,9 @@ const ChatInput = memo(function ChatInput({
         continue
       }
       try {
-        const att = await readImageAttachmentFromPath(p)
-        if (typeof att.size === 'number' && att.size > IMAGE_MAX_SIZE_BYTES) {
-          oversized.push(att.name)
-          continue
-        }
+        const att = await readImageAttachmentFromPath(p, {
+          maxBytes: IMAGE_MAX_READ_BYTES,
+        })
         // Downscale oversized images so they don't flood the model's context.
         if (att.dataUrl) {
           const downscaled = await downscaleImageDataUrl(
@@ -1469,20 +2046,29 @@ const ChatInput = memo(function ChatInput({
             att.size = downscaled.size
           }
         }
+        if (typeof att.size === 'number' && att.size > IMAGE_MAX_SIZE_BYTES) {
+          oversized.push(att.name)
+          continue
+        }
         candidates.push(att)
       } catch (e) {
+        const fileName = p.split(/[\\/]/).pop() || p
+        if (e instanceof FileTooLargeError) {
+          oversized.push(fileName)
+          continue
+        }
         console.error('Failed to read dropped image', p, e)
-        invalidType.push(p.split(/[\\/]/).pop() || p)
+        readFailed.push(fileName)
       }
     }
 
-    return { candidates, oversized, invalidType }
+    return { candidates, oversized, invalidType, readFailed }
   }
 
   const commitImageAttachments = async (
     outcome: ImageValidationOutcome
   ): Promise<void> => {
-    const { candidates, oversized, invalidType } = outcome
+    const { candidates, oversized, invalidType, readFailed } = outcome
 
     for (const att of candidates) {
       if (att.base64) {
@@ -1586,13 +2172,30 @@ const ChatInput = memo(function ChatInput({
     const errors: string[] = []
     if (oversized.length > 0) {
       errors.push(
-        `File${oversized.length > 1 ? 's' : ''} too large (max 10MB): ${oversized.join(', ')}`
+        oversized
+          .map((fileName) =>
+            t('common:errors.fileTooLargeDescription', {
+              fileName,
+              maxFileSizeMB: IMAGE_MAX_SIZE_MB,
+            })
+          )
+          .join(', ')
       )
     }
 
     if (invalidType.length > 0) {
       errors.push(
         `Invalid file type${invalidType.length > 1 ? 's' : ''} (only JPEG, JPG, PNG, WEBP allowed): ${invalidType.join(', ')}`
+      )
+    }
+
+    if (readFailed.length > 0) {
+      errors.push(
+        readFailed
+          .map((fileName) =>
+            t('common:errors.fileReadFailedDescription', { fileName })
+          )
+          .join(', ')
       )
     }
 
@@ -1752,6 +2355,7 @@ const ChatInput = memo(function ChatInput({
   ): Promise<ImageValidationOutcome> => {
     const oversized: string[] = []
     const invalidType: string[] = []
+    const readFailed: string[] = []
     const candidates: Attachment[] = []
 
     for (const file of files) {
@@ -1787,7 +2391,7 @@ const ChatInput = memo(function ChatInput({
       )
     }
 
-    return { candidates, oversized, invalidType }
+    return { candidates, oversized, invalidType, readFailed }
   }
 
   const prepareAudioAttachmentsFromPaths = async (
@@ -1795,6 +2399,7 @@ const ChatInput = memo(function ChatInput({
   ): Promise<ImageValidationOutcome> => {
     const oversized: string[] = []
     const invalidType: string[] = []
+    const readFailed: string[] = []
     const candidates: Attachment[] = []
 
     for (const p of paths) {
@@ -1804,25 +2409,32 @@ const ChatInput = memo(function ChatInput({
         continue
       }
       try {
-        const att = await readAudioAttachmentFromPath(p)
+        const att = await readAudioAttachmentFromPath(p, {
+          maxBytes: AUDIO_MAX_SIZE_BYTES,
+        })
         if (typeof att.size === 'number' && att.size > AUDIO_MAX_SIZE_BYTES) {
           oversized.push(att.name)
           continue
         }
         candidates.push(att)
       } catch (e) {
+        const fileName = p.split(/[\\/]/).pop() || p
+        if (e instanceof FileTooLargeError) {
+          oversized.push(fileName)
+          continue
+        }
         console.error('Failed to read dropped audio', p, e)
-        invalidType.push(p.split(/[\\/]/).pop() || p)
+        readFailed.push(fileName)
       }
     }
 
-    return { candidates, oversized, invalidType }
+    return { candidates, oversized, invalidType, readFailed }
   }
 
   const commitAudioAttachments = async (
     outcome: ImageValidationOutcome
   ): Promise<void> => {
-    const { candidates, oversized, invalidType } = outcome
+    const { candidates, oversized, invalidType, readFailed } = outcome
 
     // Audio payloads are large (a 20MB FLAC is a ~27MB base64 string). Hashing
     // that on the main thread blocks the attach. Dedup by name+size instead —
@@ -1898,6 +2510,15 @@ const ChatInput = memo(function ChatInput({
     }
     if (invalidType.length > 0) {
       errors.push(`${invalidType.join(', ')} is not a supported audio file`)
+    }
+    if (readFailed.length > 0) {
+      errors.push(
+        readFailed
+          .map((fileName) =>
+            t('common:errors.fileReadFailedDescription', { fileName })
+          )
+          .join(', ')
+      )
     }
     if (duplicates.length > 0) {
       toast.info(
@@ -2253,19 +2874,34 @@ const ChatInput = memo(function ChatInput({
   const isStreaming = chatStatus === 'submitted' || chatStatus === 'streaming'
 
   return (
-    <div className="relative mx-auto w-full max-w-3xl">
+    // ATO-462: the download panel docks above this element when the composer is
+    // sitting at the bottom of the screen, so a running download never covers
+    // the send button. Writing to a model that is still downloading is the
+    // whole point of ATO-460, so the composer has to stay reachable.
+    <div
+      ref={composerAnchorRef}
+      data-composer-anchor
+      className={cn('relative mx-auto w-full max-w-3xl', containerClassName)}
+    >
       <div className="relative">
         <div
           className={cn(
             'relative p-0.5 rounded-3xl',
-            effectiveAgentMode ? 'overflow-visible' : 'overflow-hidden',
-            isStreaming && 'opacity-70'
+            // Always visible: the skills slash menu pops above the composer
+            // in both modes and would be clipped by overflow-hidden.
+            'overflow-visible'
           )}
         >
-          <div className="relative z-20">
+          <div className="group/approval relative z-20">
+            {/* Share the input's inset width, outside its streaming opacity
+                and disabled toolbar. Absolute docking preserves scroll position. */}
+            {!initialMessage && (
+              <AgentApprovalInline threadId={composerThreadKey} />
+            )}
             <div
               className={cn(
-                'relative z-20 px-0 pb-10 border rounded-3xl border-input bg-white dark:bg-input/30',
+                'relative z-20 px-0 pb-10 border rounded-3xl border-input bg-white dark:bg-input/30 group-has-[[data-slot=composer-approval]]/approval:rounded-t-none',
+                isStreaming && 'opacity-70',
                 isFocused && 'ring-1 ring-ring/50',
                 isDragOver && 'ring-2 ring-ring/50 border-primary'
               )}
@@ -2331,7 +2967,7 @@ const ChatInput = memo(function ChatInput({
                         return (
                           <div
                             key={`${att.type}-${idx}-${att.name}`}
-                            className="relative"
+                            className="group/attachment relative"
                           >
                             <Tooltip>
                               <TooltipTrigger asChild>
@@ -2393,12 +3029,14 @@ const ChatInput = memo(function ChatInput({
                             </Tooltip>
 
                             {!showAttachmentLoader && (
-                              <div
-                                className="absolute -top-1 -right-2.5 bg-destructive size-5 flex rounded-full items-center justify-center cursor-pointer"
+                              <button
+                                type="button"
+                                aria-label={`Remove ${att.name}`}
+                                className="absolute -right-1.5 -top-1.5 flex size-5 cursor-pointer items-center justify-center rounded-full bg-foreground text-background opacity-0 shadow-sm transition-opacity group-hover/attachment:opacity-100 focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
                                 onClick={() => handleRemoveAttachment(idx)}
                               >
-                                <IconX className="text-neutral-200" size={14} />
-                              </div>
+                                <IconX size={13} />
+                              </button>
                             )}
                           </div>
                         )
@@ -2417,57 +3055,69 @@ const ChatInput = memo(function ChatInput({
                   )}
                 </div>
               )}
-              {effectiveAgentMode && (
-                <AgentSkillSlashMenu
-                  skills={eligibleAgentSkills}
-                  activeIndex={agentSkillActiveIndex}
-                  loading={agentSkillsLoading}
-                  open={agentSkillMenuOpen}
-                  onSelect={handleAgentSkillSelect}
-                  onActiveIndexChange={setAgentSkillActiveIndex}
-                />
-              )}
-              <div className="flex w-full items-start gap-2 px-4 pt-3">
-                {selectedAgentSkill && (
-                  <div
-                    className="inline-flex shrink-0 text-sm font-medium leading-6 text-blue-600 dark:text-blue-400"
-                    data-testid="agent-skill-inline-token"
-                  >
-                    <span>/{selectedAgentSkill.name}</span>
-                  </div>
-                )}
+              <ToolCostHint
+                threadId={currentThreadId}
+                initialMessage={initialMessage}
+              />
+              <AgentSkillSlashMenu
+                skills={eligibleAgentSkills}
+                activeIndex={agentSkillActiveIndex}
+                loading={agentSkillsLoading}
+                open={agentSkillMenuOpen}
+                onSelect={handleAgentSkillSelect}
+                onActiveIndexChange={setAgentSkillActiveIndex}
+              />
+              <div className="relative min-w-0 w-full px-4 pt-3">
                 <TextareaAutosize
                   dir="auto"
                   ref={textareaRef}
-                  minRows={2}
+                  minRows={minRows}
                   rows={1}
                   maxRows={10}
                   value={prompt}
                   data-testid={'chat-input'}
                   onChange={(e) => {
-                    setPrompt(e.target.value)
+                    const nextValue = e.target.value
+                    setPrompt(nextValue)
+                    if (
+                      selectedAgentSkill &&
+                      !containsAgentSkillInvocation(
+                        nextValue,
+                        selectedAgentSkill.name
+                      )
+                    ) {
+                      setSelectedAgentSkill(null)
+                    }
+                    // The user typed while dictating. Re-baseline so the next
+                    // phrase lands after their edit instead of overwriting it,
+                    // and give up the ability to cleanly undo the session.
+                    if (
+                      isVoiceActive &&
+                      nextValue !== lastDictatedValueRef.current
+                    ) {
+                      lastDictatedValueRef.current = nextValue
+                      useVoiceInput
+                        .getState()
+                        .rebase(
+                          captureDictationAnchor(
+                            nextValue,
+                            e.target.selectionStart
+                          )
+                        )
+                    }
                     updateAgentSkillSlashQuery(
-                      e.target.value,
+                      nextValue,
                       e.target.selectionStart
                     )
                     // Count the number of newlines to estimate rows
                     const newRows =
-                      (e.target.value.match(/\n/g) || []).length + 1
+                      (nextValue.match(/\n/g) || []).length + 1
                     setRows(Math.min(newRows, maxRows))
                   }}
                   onKeyDown={(e) => {
                     // e.keyCode 229 is for IME input with Safari
                     const isComposing =
                       e.nativeEvent.isComposing || e.keyCode === 229
-                    if (
-                      e.key === 'Backspace' &&
-                      selectedAgentSkill &&
-                      prompt.length === 0
-                    ) {
-                      e.preventDefault()
-                      setSelectedAgentSkill(null)
-                      return
-                    }
                     if (
                       agentSkillMenuOpen &&
                       eligibleAgentSkills.length > 0 &&
@@ -2493,6 +3143,11 @@ const ChatInput = memo(function ChatInput({
                         )
                         return
                       }
+                    }
+                    if (isVoiceActive && e.key === 'Escape') {
+                      e.preventDefault()
+                      void useVoiceInput.getState().cancel()
+                      return
                     }
                     if (agentSkillMenuOpen && e.key === 'Escape') {
                       e.preventDefault()
@@ -2530,10 +3185,8 @@ const ChatInput = memo(function ChatInput({
                   placeholder={
                     creationMode === 'image'
                       ? 'Describe the image you want to create'
-                      : selectedAgentSkill
-                      ? ''
-                      : effectiveAgentMode
-                        ? t('chat:agentMode.placeholder')
+                      : isVoiceActive && !prompt
+                        ? t('common:voiceInput.placeholder')
                         : t('common:placeholder.chatInput')
                   }
                   autoFocus
@@ -2542,16 +3195,33 @@ const ChatInput = memo(function ChatInput({
                   data-gramm_editor={spellCheckChatInput}
                   data-gramm_grammarly={spellCheckChatInput}
                   className={cn(
-                    'min-w-0 flex-1 resize-none border-none bg-transparent p-0 text-sm leading-6 outline-0',
+                    'block min-w-0 w-full resize-none border-none bg-transparent p-0 text-sm leading-6 outline-0 break-words',
+                    // Sideways is never a scroll axis here: text wraps, and
+                    // WebKit otherwise rubber-bands a vertically scrollable
+                    // textarea on a horizontal trackpad swipe.
+                    'overflow-x-hidden overscroll-x-none',
                     rows < maxRows && 'scrollbar-hide',
                     className
                   )}
                 />
               </div>
+              {/* Inside the composer body rather than the toolbar: the toolbar's
+                  left cluster is pointer-events-none while a reply streams, and
+                  a recording you cannot stop is worse than no recording. */}
+              <VoiceRecordingBar threadKey={composerThreadKey} />
             </div>
           </div>
 
-          <div className="absolute z-20 bg-transparent bottom-0 w-full p-2 ">
+          {/* inset-x, not w-full: the parent pads 2px, and a full-width box
+              placed at the static position overhangs the right edge by that
+              much — enough for the page's scroll container to let the whole
+              composer be dragged sideways. */}
+          <div
+            className={cn(
+              'absolute z-20 bg-transparent bottom-0 inset-x-0.5 p-2',
+              isStreaming && 'opacity-70'
+            )}
+          >
             <div className="flex justify-between items-center w-full">
               <div className="px-1 flex items-center gap-1 flex-1 min-w-0">
                 <div
@@ -2626,9 +3296,7 @@ const ChatInput = memo(function ChatInput({
                       {/* RAG document attachments - desktop-only via dialog; shown when feature enabled */}
                       <DropdownMenuItem
                         onClick={handleAttachDocsIngest}
-                        disabled={
-                          !selectedModel?.capabilities?.includes('tools')
-                        }
+                        disabled={!supportsTools}
                       >
                         {ingestingDocs ? (
                           <IconLoader2
@@ -2647,42 +3315,107 @@ const ChatInput = memo(function ChatInput({
                             : 'Add documents or files'}
                         </span>
                       </DropdownMenuItem>
+                      {/* Global Agent mode toggle. It lives here and surfaces
+                          as a toolbar chip; routing guards at send time, so
+                          it stays togglable even when the current provider
+                          can't serve the agent loop — the chip's tooltip
+                          carries that explanation, so this row stays a single
+                          line like its neighbours. (Plugins is not in this
+                          menu: its button is a toolbar fixture like the
+                          web-search globe, with each connector's on/off
+                          switch inside its dropdown.) */}
+                      {PlatformFeatures[PlatformFeature.AGENT_MODE] && (
+                        <DropdownMenuItem
+                          onClick={() =>
+                            setAgentModeEnabled(!agentModeEnabled)
+                          }
+                        >
+                          <RobotHeadIcon
+                            size={18}
+                            className="text-muted-foreground"
+                          />
+                          <span>{t('chat:agentMode.menuItem')}</span>
+                          {agentModeEnabled && (
+                            <IconCheck
+                              size={16}
+                              className="ml-auto text-primary"
+                            />
+                          )}
+                        </DropdownMenuItem>
+                      )}
+                      {/* Lets the model run terminal commands and scripts
+                          (`run_command` / `run_script`); every call still
+                          goes through the approval mode beside this menu. */}
+                      {PlatformFeatures[PlatformFeature.CHAT_EXEC] && (
+                        <DropdownMenuItem
+                          onClick={() => setChatExecEnabled(!chatExecEnabled)}
+                          data-testid="chat-exec-toggle"
+                        >
+                          <IconTerminal2
+                            size={18}
+                            className="text-muted-foreground"
+                          />
+                          <span>{t('chat:chatExec.menuItem')}</span>
+                          {chatExecEnabled && (
+                            <IconCheck
+                              size={16}
+                              className="ml-auto text-primary"
+                            />
+                          )}
+                        </DropdownMenuItem>
+                      )}
+                      {/* Workspace folders ride in the same attach menu: for
+                          the agent they are just another kind of context. The
+                          project composer hides it — that page has no files
+                          panel to surface the folder in. */}
+                      {agentRouteActive && !projectId && (
+                        <DropdownMenuItem
+                          onClick={() =>
+                            void addExternalAgentFolder(
+                              serviceHub,
+                              composerThreadKey
+                            )
+                          }
+                        >
+                          <IconFolderPlus
+                            size={18}
+                            className="text-muted-foreground"
+                          />
+                          <span>{t('chat:agentWorkspace.addFolder')}</span>
+                        </DropdownMenuItem>
+                      )}
                     </DropdownMenuContent>
                   </DropdownMenu>
 
-                  {effectiveAgentMode && (
-                    <>
-                      <AgentExternalFolderButton workspaceKey={agentModeKey} />
-                      <AgentApprovalModeSelect
-                        mode={approvalMode}
-                        onChange={handleApprovalModeChange}
-                        manualSelectedLabel={t(
-                          'chat:agentApprovals.manualSelected'
-                        )}
-                        manualLabel={t('chat:agentApprovals.manual')}
-                        manualDescription={t(
-                          'chat:agentApprovals.manualDescription'
-                        )}
-                        skipSelectedLabel={t(
-                          'chat:agentApprovals.skipSelected'
-                        )}
-                        skipLabel={t('chat:agentApprovals.skip')}
-                        skipDescription={t(
-                          'chat:agentApprovals.skipDescription'
-                        )}
-                      />
-                    </>
-                  )}
-                  {/* {model?.provider === 'llamacpp' && loadingModel ? (
-                  <ModelLoader />
-                ) : (
-                  <DropdownModelProvider
-                    model={model}
-                    useLastUsedModel={initialMessage}
+                  {/* Approval mode rides the toolbar in both engines: it
+                      gates the agent's dangerous tools AND the MCP/RAG calls
+                      of the chat pipeline (see lib/mcp-approval.ts). */}
+                  <AgentApprovalModeSelect
+                    compact={compactComposer}
+                    mode={approvalMode}
+                    onChange={handleApprovalModeChange}
+                    menuTitle={t('chat:agentApprovals.menuTitle')}
+                    manualSelectedLabel={t(
+                      'chat:agentApprovals.manualSelected'
+                    )}
+                    manualLabel={t('chat:agentApprovals.manual')}
+                    manualDescription={t(
+                      'chat:agentApprovals.manualDescription'
+                    )}
+                    skipSelectedLabel={t('chat:agentApprovals.skipSelected')}
+                    skipLabel={t('chat:agentApprovals.skip')}
+                    skipDescription={t('chat:agentApprovals.skipDescription')}
+                    skipConfirmTitle={t('chat:agentApprovals.skipConfirmTitle')}
+                    skipConfirmBody={t('chat:agentApprovals.skipConfirmBody')}
+                    skipConfirmCancel={t(
+                      'chat:agentApprovals.skipConfirmCancel'
+                    )}
+                    skipConfirmAccept={t(
+                      'chat:agentApprovals.skipConfirmAccept'
+                    )}
                   />
-                )} */}
-                  {/* //! Кнопка Browse (Chrome) — временно скрыта
-                {!effectiveAgentMode && hasJanBrowserMCPConfig && modelSupportsBrowser && (
+                  {/* //! Browse (Chrome) button — temporarily hidden
+                {!agentRouteActive && hasJanBrowserMCPConfig && modelSupportsBrowser && (
                   <Tooltip>
                     <TooltipTrigger asChild>
                       <Button
@@ -2725,40 +3458,41 @@ const ChatInput = memo(function ChatInput({
                 )}
                 */}
 
-                  {!effectiveAgentMode &&
-                    selectedModel?.capabilities?.includes('embeddings') && (
-                      <Tooltip>
-                        <TooltipTrigger asChild>
-                          <Button variant="ghost" size="icon-xs">
-                            <IconCodeCircle2
-                              size={18}
-                              className="text-muted-foreground"
-                            />
-                          </Button>
-                        </TooltipTrigger>
-                        <TooltipContent>
-                          <p>{t('embeddings')}</p>
-                        </TooltipContent>
-                      </Tooltip>
-                    )}
+                  {selectedModel?.capabilities?.includes('embeddings') && (
+                    <Tooltip>
+                      <TooltipTrigger asChild>
+                        <Button variant="ghost" size="icon-xs">
+                          <IconCodeCircle2
+                            size={18}
+                            className="text-muted-foreground"
+                          />
+                        </Button>
+                      </TooltipTrigger>
+                      <TooltipContent>
+                        <p>{t('embeddings')}</p>
+                      </TooltipContent>
+                    </Tooltip>
+                  )}
 
-                  {!effectiveAgentMode &&
-                    selectedModel?.capabilities?.includes('tools') &&
-                    hasActiveMCPServers &&
-                    (MCPToolComponent ? (
+                  {/* Servers and their tools live behind this one menu, which
+                      is also where a server gets (dis)connected. Like the
+                      web-search globe beside it, the button is a fixture of
+                      the toolbar: no setting hides it, and it stays put even
+                      with every MCP server switched off — the dropdown says
+                      so itself, and an icon that vanishes when web search
+                      goes off reads as a bug. */}
+                  {(supportsTools || agentRouteActive) &&
+                    (MCPToolComponent && hasActiveMCPServers ? (
                       // Use custom MCP component
                       <McpExtensionToolLoader
                         tools={tools}
                         hasActiveMCPServers={hasActiveMCPServers}
-                        selectedModelHasTools={
-                          selectedModel?.capabilities?.includes('tools') ??
-                          false
-                        }
+                        selectedModelHasTools={supportsTools}
                         initialMessage={initialMessage}
                         MCPToolComponent={MCPToolComponent}
                       />
                     ) : (
-                      // Use default tools dropdown
+                      // Use default connectors dropdown
                       <Tooltip
                         open={tooltipToolsAvailable}
                         onOpenChange={setTooltipToolsAvailable}
@@ -2770,13 +3504,17 @@ const ChatInput = memo(function ChatInput({
                           <Button
                             variant="ghost"
                             size="icon-xs"
+                            aria-label={t('plugins')}
                             onClick={(e) => {
                               setDropdownToolsAvailable(false)
                               e.stopPropagation()
                             }}
                           >
-                            <DropdownToolsAvailable
+                            <DropdownPlugins
                               initialMessage={initialMessage}
+                              skills={IS_TAURI ? agentSkills : undefined}
+                              skillsLoading={agentSkillsLoading}
+                              onToggleSkill={handleAgentSkillToggle}
                               onOpenChange={(isOpen) => {
                                 setDropdownToolsAvailable(isOpen)
                                 if (isOpen) {
@@ -2784,62 +3522,136 @@ const ChatInput = memo(function ChatInput({
                                 }
                               }}
                             >
-                              {() => {
+                              {(_isOpen, sentConnectors, activeConnectors) => {
+                                // Lit when a connector's tools ride this
+                                // chat; "sent/active" once some are muted.
                                 return (
                                   <div
                                     className={cn(
                                       'p-1 flex items-center justify-center rounded-sm transition-all duration-200 ease-in-out gap-1 cursor-pointer'
                                     )}
                                   >
-                                    <IconTool
+                                    <PuzzleIcon
                                       size={18}
-                                      className={cn('text-muted-foreground')}
+                                      className={cn(
+                                        'text-muted-foreground',
+                                        sentConnectors > 0 && 'text-primary'
+                                      )}
                                     />
+                                    {activeConnectors > sentConnectors && (
+                                      <span
+                                        className="text-[10px] text-muted-foreground"
+                                        data-testid="connectors-sent-count"
+                                      >
+                                        {sentConnectors}/{activeConnectors}
+                                      </span>
+                                    )}
                                   </div>
                                 )
                               }}
-                            </DropdownToolsAvailable>
+                            </DropdownPlugins>
                           </Button>
                         </TooltipTrigger>
                         <TooltipContent>
-                          <p>{t('tools')}</p>
+                          <p>{t('plugins')}</p>
                         </TooltipContent>
                       </Tooltip>
                     ))}
 
-                  {!effectiveAgentMode && <ReasoningToggle />}
-
-                  {!effectiveAgentMode &&
-                    selectedModel?.capabilities?.includes('web_search') && (
-                      <Tooltip>
-                        <TooltipTrigger asChild>
-                          <Button variant="ghost" size="icon-xs">
-                            <IconWorld
-                              size={18}
-                              className="text-muted-foreground"
-                            />
+                  {/* Web search lives on the globe. On the chat transport it
+                      switches the Exa (or equivalent) MCP server; agent turns
+                      read the same state as their per-turn web_search flag. */}
+                  {(supportsTools || agentRouteActive) && (
+                    <WebSearchToggle initialMessage={initialMessage} />
+                  )}
+                  {/* Agent mode chip — the toolbar face of the global toggle,
+                      beside the connectors button. Last in the cluster on
+                      purpose: turning the mode on then appends the chip instead
+                      of shifting every control the user was aiming at. The X
+                      (or unchecking in the "+" menu) turns it off everywhere.
+                      Muted with a tooltip while the provider can't serve the
+                      agent loop. */}
+                  {agentModeEnabled && (
+                    <Tooltip>
+                      <TooltipTrigger asChild>
+                        {compactComposer ? (
+                          <Button
+                            variant="secondary"
+                            size="icon-xs"
+                            className="mb-1 rounded-full"
+                            aria-label={t('chat:agentMode.turnOff')}
+                            onClick={() => setAgentModeEnabled(false)}
+                            data-testid="agent-mode-chip"
+                          >
+                            <RobotHeadIcon size={16} />
                           </Button>
-                        </TooltipTrigger>
+                        ) : (
+                          <div
+                            className={cn(
+                              'flex items-center gap-1 rounded-full bg-secondary pl-2 pr-1 py-0.5 mb-1 shrink-0',
+                              (agentBlockReason || agentModelBlock) &&
+                                'opacity-60'
+                            )}
+                            data-testid="agent-mode-chip"
+                          >
+                            <RobotHeadIcon
+                              size={16}
+                              className="text-secondary-foreground"
+                            />
+                            <span className="text-xs text-secondary-foreground">
+                              {t('chat:agentMode.agent')}
+                            </span>
+                            <Button
+                              variant="ghost"
+                              size="icon-xs"
+                              className="rounded-full size-5"
+                              aria-label={t('chat:agentMode.turnOff')}
+                              onClick={() => setAgentModeEnabled(false)}
+                            >
+                              <IconX size={12} />
+                            </Button>
+                          </div>
+                        )}
+                      </TooltipTrigger>
+                      {(agentBlockReason || agentModelBlock) && (
                         <TooltipContent>
-                          <p>Web Search</p>
+                          {t(
+                            agentBlockReason === 'missing-api-key'
+                              ? 'chat:agentMode.providerKeyMissing'
+                              : agentBlockReason
+                                ? 'chat:agentMode.providerUnavailable'
+                                : 'chat:agentMode.modelWithoutTools'
+                          )}
                         </TooltipContent>
-                      </Tooltip>
-                    )}
+                      )}
+                    </Tooltip>
+                  )}
                 </div>
               </div>
 
               <div className="flex items-center gap-2">
-                <ContextSizeControl
-                  messages={threadMessages || []}
-                  uploadedFiles={attachments
-                    .filter((a) => a.type === 'image' && a.dataUrl)
-                    .map((a) => ({
-                      name: a.name,
-                      type: a.mimeType || getFileTypeFromExtension(a.name),
-                      size: a.size || 0,
-                      base64: a.base64 || '',
-                      dataUrl: a.dataUrl!,
-                    }))}
+                {/* The model rides with the microphone rather than the
+                    attachment cluster: both change how the next message is
+                    produced. The pill names the model and, while thinking is
+                    on, how hard it thinks — its panel holds the effort slider,
+                    whose first stop switches thinking off, and leads into the
+                    model list. */}
+                <DropdownModelProvider
+                  className="mb-1"
+                  compact={compactComposer}
+                />
+
+                {/* Beside Send, which is where users expect a microphone.
+                    Note this cluster has no streaming guard of its own (the
+                    left one does), so the disable is passed explicitly — and
+                    the toggle deliberately stays clickable while it is the one
+                    recording, or sending a message would strand an
+                    unstoppable recording. */}
+                <VoiceInputToggle
+                  threadKey={composerThreadKey}
+                  captureAnchor={captureVoiceAnchor}
+                  disabled={isStreaming}
+                  className="mb-1"
                 />
 
                 {isStreaming ? (
@@ -2853,6 +3665,30 @@ const ChatInput = memo(function ChatInput({
                   >
                     <IconPlayerStopFilled />
                   </Button>
+                ) : needsReplyModel ? (
+                  // Nothing to answer with yet. The button says so before it is
+                  // pressed — the old behaviour let it look ready and answered
+                  // with a red line afterwards — but stays live, because
+                  // pressing it is how the user gets a model.
+                  <Tooltip>
+                    <TooltipTrigger asChild>
+                      <Button
+                        variant="secondary"
+                        size="icon-sm"
+                        disabled={!prompt.trim() || isAttachmentPipelineBusy}
+                        data-test-id="send-message-button"
+                        data-needs-model="true"
+                        aria-label={t('chat:replyGate.sendHint')}
+                        onClick={() => handleSendMessage(prompt)}
+                        className="rounded-full mr-1 mb-1"
+                      >
+                        <ArrowRight />
+                      </Button>
+                    </TooltipTrigger>
+                    <TooltipContent>
+                      {t('chat:replyGate.sendHint')}
+                    </TooltipContent>
+                  </Tooltip>
                 ) : (
                   <Button
                     variant="default"
@@ -2899,6 +3735,13 @@ const ChatInput = memo(function ChatInput({
         </div>
       )}
 
+      <ReplyModelGate
+        open={replyGateOpen}
+        onOpenChange={setReplyGateOpen}
+        onResolved={handleReplyGateResolved}
+        onDismissed={handleReplyGateDismissed}
+      />
+
       {isLlamacppProvider(selectedProvider) &&
         isModelActive &&
         !tokenCounterCompact &&
@@ -2927,11 +3770,12 @@ const ChatInput = memo(function ChatInput({
         onCancel={handleExtensionDialogCancel}
       />
 
-      {/* Vision Model Download Prompt */}
-      <PromptVisionModel
+      {/* "This model can't see images": the vision models that run here. */}
+      <VisionModelDialog
         open={showVisionModelPrompt}
-        onClose={() => setShowVisionModelPrompt(false)}
-        onDownloadComplete={handleVisionModelDownloadComplete}
+        onOpenChange={setShowVisionModelPrompt}
+        modelName={selectedModel ? getModelDisplayName(selectedModel) : ''}
+        onModelReady={handleVisionModelDownloadComplete}
       />
     </div>
   )

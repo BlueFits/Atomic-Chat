@@ -15,7 +15,15 @@
       "signature": "",
       "url": ""
     },
+    "windows-aarch64": {
+      "signature": "",
+      "url": ""
+    },
     "linux-x86_64": {
+      "signature": "",
+      "url": ""
+    },
+    "linux-aarch64": {
       "signature": "",
       "url": ""
     }

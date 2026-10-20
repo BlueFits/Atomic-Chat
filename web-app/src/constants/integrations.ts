@@ -135,6 +135,24 @@ export const INTEGRATION_AGENTS: IntegrationAgent[] = [
     endpointWithPrefix: true,
   },
   {
+    id: 'dsh',
+    name: 'DeepSeek Harness',
+    description: 'Plugin-based open-source agent harness by DeepSeek AI.',
+    kind: 'coding',
+    detectBin: 'dsh',
+    docsUrl: 'https://github.com/deepseek-ai/deepseek-harness',
+    installable: true,
+    configurable: true,
+    // A provider route DeepSeek Harness does not ship in its catalog is only
+    // valid with a non-empty model list, and it rejects the whole `llm-pi-ai`
+    // section when one route is invalid -- so an unset model would take the
+    // user's other providers down with it, not merely fail to help.
+    requiresModel: true,
+    // The route is declared with the `openai-completions` protocol, whose
+    // `baseURL` is expected to already carry the `/v1` prefix.
+    endpointWithPrefix: true,
+  },
+  {
     id: 'zed',
     name: 'Zed',
     description: 'High-performance code editor with a built-in AI agent.',
@@ -146,6 +164,23 @@ export const INTEGRATION_AGENTS: IntegrationAgent[] = [
     requiresModel: true,
     // Zed's native Atomic Chat provider expects the OpenAI-compatible base URL
     // with the `/v1` prefix (matches its built-in default).
+    endpointWithPrefix: true,
+  },
+  {
+    id: 'zcode',
+    name: 'ZCode',
+    description: "Z.ai's desktop AI coding workspace.",
+    kind: 'coding',
+    detectBin: 'zcode',
+    docsUrl: 'https://zcode.z.ai/en/docs/configuration',
+    // ZCode ships as a desktop app from zcode.z.ai (its CLI is not published),
+    // so there is nothing for `install_agent` to run. Enabling only writes its
+    // provider file, which ZCode reads whenever it runs — installed or not yet.
+    installable: false,
+    configurable: true,
+    requiresModel: true,
+    // Stored as an `openai-chat-completions` provider, whose `baseUrl` is the
+    // OpenAI API root ZCode appends `/chat/completions` to.
     endpointWithPrefix: true,
   },
   {
@@ -219,6 +254,37 @@ export const INTEGRATION_AGENTS: IntegrationAgent[] = [
     configurable: true,
     requiresModel: true,
     endpointWithPrefix: false,
+  },
+  {
+    id: 'muse',
+    name: 'Muse Code',
+    description: "Meta's multi-agent coding tool for your terminal.",
+    kind: 'coding',
+    detectBin: 'muse',
+    docsUrl: 'https://developer.meta.com/ai/products/muse-code/',
+    installable: true,
+    configurable: true,
+    requiresModel: true,
+    // `--base-url` replaces the Meta Model API root (`https://api.meta.ai/v1`),
+    // onto which Muse appends `/responses` itself -- the same Responses wire
+    // protocol Codex CLI speaks, which the local server already serves.
+    endpointWithPrefix: true,
+  },
+  {
+    id: 'atomic-agent',
+    name: 'Atomic Agent',
+    description:
+      'Local-first agent that browses, edits files, and runs commands.',
+    kind: 'assistant',
+    detectBin: 'atomic-agent',
+    docsUrl: 'https://github.com/AtomicBot-ai/atomic-agent',
+    installable: true,
+    configurable: true,
+    requiresModel: true,
+    // Atomic Agent stores an `openai-compatible` provider, whose `baseUrl` is
+    // the OpenAI API root. It normalises a trailing `/v1` away itself, but the
+    // stored value should still read as the base URL the user would paste.
+    endpointWithPrefix: true,
   },
   {
     id: 'hermes',

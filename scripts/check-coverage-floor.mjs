@@ -34,9 +34,14 @@ const summaryRoots = [
 const targetPaths = [
   'web-app/src/lib/custom-chat-transport.ts',
   'web-app/src/containers/SetupScreen.tsx',
+  // The first-run auto-start rule, extracted from SetupScreen (ATO-458) and
+  // shared with the composer widget; guarded here so the move keeps its cover.
+  'web-app/src/lib/scanned-model-import.ts',
   'web-app/src/containers/SetupBackendStep.tsx',
   'web-app/src/utils/getModelToStart.ts',
   'web-app/src/hooks/useModelProvider.ts',
+  'web-app/src/services/staff-picks-registry.ts',
+  'web-app/src/lib/hub-filters.ts',
   'extensions/llamacpp-extension/src/backend.ts',
   'extensions/llamacpp-upstream-extension/src/backend.ts',
 ]
@@ -48,8 +53,11 @@ function normalizePath(path) {
 
 function collectSummaries() {
   const collected = new Map()
-  for (const path of summaryRoots) {
-    if (!existsSync(path)) continue
+  const existingSummaries = summaryRoots
+    .filter((path) => existsSync(path))
+    .sort((left, right) => statSync(left).mtimeMs - statSync(right).mtimeMs)
+
+  for (const path of existingSummaries) {
     const summary = JSON.parse(readFileSync(path, 'utf8'))
     for (const [sourcePath, metrics] of Object.entries(summary)) {
       if (sourcePath === 'total') continue

@@ -1,13 +1,20 @@
 use rmcp::{
-    model::{ClientCapabilities, ClientInfo, Implementation},
+    model::{ClientCapabilities, ClientInfo, Implementation, InitializeRequestParam},
+    service::RunningService,
     transport::{
         streamable_http_client::StreamableHttpClientTransportConfig, SseClientTransport,
         StreamableHttpClientTransport, TokioChildProcess,
     },
-    ServiceExt,
+    RoleClient, ServiceExt,
 };
 use serde_json::Value;
-use std::{collections::HashMap, env, process::Stdio, sync::Arc, time::Duration};
+use std::{
+    collections::{HashMap, HashSet, VecDeque},
+    env,
+    process::Stdio,
+    sync::Arc,
+    time::Duration,
+};
 use tauri::{AppHandle, Emitter, Manager, Runtime, State};
 use tauri_plugin_http::reqwest;
 use tokio::{
@@ -17,9 +24,16 @@ use tokio::{
     time::{sleep, timeout},
 };
 
+const MCP_STDERR_CONTEXT_MAX_BYTES: usize = 16 * 1024;
+
 use crate::core::{
     app::commands::get_jan_data_folder_path,
-    mcp::models::{McpServerConfig, McpSettings},
+    mcp::{
+        commands::drop_retired_serper_default,
+        constants::{default_mcp_config, DEFAULT_MCP_HANDSHAKE_TIMEOUT_SECS},
+        models::{McpServerConfig, McpSettings},
+    },
+    process_env::sanitize_tokio_command,
     state::{AppState, RunningServiceEnum, SharedMcpServers},
 };
 use jan_utils::{can_override_npx, can_override_uvx};
@@ -118,9 +132,13 @@ pub async fn run_mcp_commands<R: Runtime>(
             )
             .await;
 
-            // If initial startup failed, we still want to continue with other servers
+            // If initial startup failed, we still want to continue with other
+            // servers. Reported at `warn`: the failure is already logged with
+            // its captured stderr where it happened, and the Sentry log bridge
+            // turns every `error!` into an event — re-reporting the same string
+            // at three levels filed one failure as four separate issues.
             if let Err(e) = &result {
-                log::error!("Initial startup failed for MCP server {name_clone}: {e}");
+                log::warn!("Initial startup failed for MCP server {name_clone}: {e}");
             }
 
             (name_clone, result)
@@ -141,7 +159,8 @@ pub async fn run_mcp_commands<R: Runtime>(
                     successful_count += 1;
                 }
                 Err(e) => {
-                    log::error!("MCP server {name} failed to initialize: {e}");
+                    // Same failure as above, counted here — see the note there.
+                    log::warn!("MCP server {name} failed to initialize: {e}");
                     failed_count += 1;
                 }
             },
@@ -159,73 +178,6 @@ pub async fn run_mcp_commands<R: Runtime>(
     Ok(())
 }
 
-/// Monitor MCP server health without removing it from the HashMap
-pub async fn monitor_mcp_server_handle(
-    servers_state: SharedMcpServers,
-    name: String,
-    shutdown_flag: Arc<Mutex<bool>>,
-) -> Option<rmcp::service::QuitReason> {
-    log::info!("Monitoring MCP server {name} health");
-
-    // Monitor server health with periodic checks
-    loop {
-        // Small delay between health checks
-        sleep(Duration::from_secs(5)).await;
-
-        {
-            let shutdown = shutdown_flag.lock().await;
-            if *shutdown {
-                return Some(rmcp::service::QuitReason::Closed);
-            }
-        }
-
-        let health_check_result = {
-            let servers = servers_state.lock().await;
-            if let Some(service) = servers.get(&name) {
-                // Try to list tools as a health check with a short timeout
-                match timeout(Duration::from_secs(2), service.list_all_tools()).await {
-                    Ok(Ok(_)) => {
-                        // Server responded successfully
-                        true
-                    }
-                    Ok(Err(e)) => {
-                        log::warn!("MCP server {name} health check failed: {e}");
-                        false
-                    }
-                    Err(_) => {
-                        log::warn!("MCP server {name} health check timed out");
-                        false
-                    }
-                }
-            } else {
-                // Server was removed from HashMap (e.g., by deactivate_mcp_server)
-                log::info!("MCP server {name} no longer in running services");
-                return Some(rmcp::service::QuitReason::Closed);
-            }
-        };
-
-        if !health_check_result {
-            // Server failed health check - remove it and return
-            log::error!("MCP server {name} failed health check, removing from active servers");
-            let mut servers = servers_state.lock().await;
-            if let Some(service) = servers.remove(&name) {
-                // Try to cancel the service gracefully
-                match service {
-                    RunningServiceEnum::NoInit(service) => {
-                        log::info!("Stopping server {name}...");
-                        let _ = service.cancel().await;
-                    }
-                    RunningServiceEnum::WithInit(service) => {
-                        log::info!("Stopping server {name} with initialization...");
-                        let _ = service.cancel().await;
-                    }
-                }
-            }
-            return Some(rmcp::service::QuitReason::Closed);
-        }
-    }
-}
-
 /// Starts an MCP server
 /// Returns the result of the first start attempt
 pub async fn start_mcp_server<R: Runtime>(
@@ -236,9 +188,22 @@ pub async fn start_mcp_server<R: Runtime>(
 ) -> Result<(), String> {
     let app_state = app.state::<AppState>();
     let active_servers_state = app_state.mcp_active_servers.clone();
+    let shutdown_in_progress = app_state.mcp_shutdown_in_progress.lock().await;
+    if *shutdown_in_progress {
+        return Err(format!(
+            "Cannot start MCP server {name} while MCP shutdown is in progress"
+        ));
+    }
 
     // Store active server config for restart purposes
     store_active_server_config(&active_servers_state, &name, &config).await;
+    let start_generation = {
+        let mut generations = app_state.mcp_start_generations.lock().await;
+        let generation = generations.entry(name.clone()).or_default();
+        *generation = generation.wrapping_add(1);
+        *generation
+    };
+    drop(shutdown_in_progress);
 
     // Try the first start attempt and return its result
     log::info!("Starting MCP server {name} (Initial attempt)");
@@ -247,18 +212,258 @@ pub async fn start_mcp_server<R: Runtime>(
         servers_state.clone(),
         name.clone(),
         config.clone(),
+        start_generation,
     )
     .await;
 
+    let start_generations = app_state.mcp_start_generations.lock().await;
+    if start_generations.get(&name).copied() != Some(start_generation) {
+        log::info!("Ignoring superseded MCP server {name} startup result");
+        return first_start_result;
+    }
+
     match first_start_result {
         Ok(_) => {
+            app_state.mcp_server_errors.lock().await.remove(&name);
+            drop(start_generations);
             log::info!("MCP server {name} started successfully");
+            emit_mcp_status_update_event(&app, &name);
             Ok(())
         }
         Err(e) => {
-            log::error!("Failed to start MCP server {name} on first attempt: {e}");
-            Err(e)
+            app_state
+                .mcp_server_errors
+                .lock()
+                .await
+                .insert(name.clone(), e.clone());
+            drop(start_generations);
+            // Already reported with its stderr by the start task; this is the
+            // same failure travelling back up.
+            log::warn!("Failed to start MCP server {name} on first attempt: {e}");
+            emit_mcp_status_update_event(&app, &name);
+            // The bundled search adapter is local and stateless: its query path
+            // retries Exa and falls back to the already bundled DuckDuckGo path.
+            if name == "exa" && super::web_search::enabled(&app).await {
+                Ok(())
+            } else {
+                Err(e)
+            }
         }
+    }
+}
+
+async fn connect_remote_mcp<R: Runtime>(
+    app: &AppHandle<R>,
+    name: &str,
+    config: &McpServerConfig,
+    transport_type: &str,
+) -> Result<RunningService<RoleClient, InitializeRequestParam>, String> {
+    let url = config
+        .url
+        .as_deref()
+        .filter(|url| !url.trim().is_empty())
+        .ok_or_else(|| format!("MCP {transport_type} transport requires a non-empty URL"))?;
+    let handshake_timeout = config
+        .timeout
+        .unwrap_or_else(|| Duration::from_secs(DEFAULT_MCP_HANDSHAKE_TIMEOUT_SECS));
+
+    timeout(handshake_timeout, async {
+        let client = build_remote_http_client(config, handshake_timeout)?;
+        let client_info = ClientInfo {
+            protocol_version: Default::default(),
+            capabilities: ClientCapabilities::default(),
+            client_info: Implementation {
+                name: "Atomic Chat MCP Client".to_string(),
+                version: env!("CARGO_PKG_VERSION").to_string(),
+                title: Some("Atomic Chat".to_string()),
+                website_url: None,
+                icons: None,
+            },
+        };
+
+        // A server the user signed into gets its session restored (refreshed
+        // first when close to expiry) and wrapped around the base client. The
+        // restore does its own discovery round trip — bounded by this timeout.
+        let oauth_manager = {
+            let state = app.state::<AppState>();
+            let data_dir = get_jan_data_folder_path(app.clone());
+            state
+                .mcp_oauth
+                .manager_for_connect(&data_dir, name, url)
+                .await?
+        };
+
+        // The auth and plain arms are deliberately duplicated: the transports
+        // are generic over the client type, and unifying `AuthClient<C>` with
+        // `C` behind one variable costs more bounds than these lines.
+        match (transport_type, oauth_manager) {
+            ("http", Some(manager)) => {
+                let auth_client = rmcp::transport::auth::AuthClient::new(client, manager);
+                app.state::<AppState>()
+                    .mcp_oauth
+                    .register_live(name, auth_client.auth_manager.clone())
+                    .await;
+                // `auth_header` stays unset: when it is Some, the transport
+                // pre-fills the token and AuthClient never runs.
+                let transport = StreamableHttpClientTransport::with_client(
+                    auth_client,
+                    StreamableHttpClientTransportConfig {
+                        uri: url.into(),
+                        ..Default::default()
+                    },
+                );
+                client_info
+                    .serve(transport)
+                    .await
+                    .map_err(|e| format!("Streamable HTTP handshake failed: {e}"))
+            }
+            ("http", None) => {
+                let transport = StreamableHttpClientTransport::with_client(
+                    client,
+                    StreamableHttpClientTransportConfig {
+                        uri: url.into(),
+                        ..Default::default()
+                    },
+                );
+                client_info
+                    .serve(transport)
+                    .await
+                    .map_err(|e| format!("Streamable HTTP handshake failed: {e}"))
+            }
+            ("sse", Some(manager)) => {
+                let auth_client = rmcp::transport::auth::AuthClient::new(client, manager);
+                app.state::<AppState>()
+                    .mcp_oauth
+                    .register_live(name, auth_client.auth_manager.clone())
+                    .await;
+                let transport = SseClientTransport::start_with_client(
+                    auth_client,
+                    rmcp::transport::sse_client::SseClientConfig {
+                        sse_endpoint: url.into(),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .map_err(|e| format!("SSE transport failed: {e}"))?;
+                client_info
+                    .serve(transport)
+                    .await
+                    .map_err(|e| format!("SSE handshake failed: {e}"))
+            }
+            ("sse", None) => {
+                let transport = SseClientTransport::start_with_client(
+                    client,
+                    rmcp::transport::sse_client::SseClientConfig {
+                        sse_endpoint: url.into(),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .map_err(|e| format!("SSE transport failed: {e}"))?;
+                client_info
+                    .serve(transport)
+                    .await
+                    .map_err(|e| format!("SSE handshake failed: {e}"))
+            }
+            (other, _) => Err(format!("Unsupported remote MCP transport '{other}'")),
+        }
+    })
+    .await
+    .map_err(|_| {
+        format!(
+            "{transport_type} handshake timed out after {}s",
+            handshake_timeout.as_secs()
+        )
+    })?
+}
+
+fn build_remote_http_client(
+    config: &McpServerConfig,
+    connect_timeout: Duration,
+) -> Result<reqwest::Client, String> {
+    let mut headers = reqwest::header::HeaderMap::new();
+    for (key, value) in &config.headers {
+        if let Some(value) = value.as_str() {
+            if let (Ok(name), Ok(value)) = (
+                reqwest::header::HeaderName::from_bytes(key.as_bytes()),
+                reqwest::header::HeaderValue::from_str(value),
+            ) {
+                headers.insert(name, value);
+            }
+        }
+    }
+
+    reqwest::Client::builder()
+        .default_headers(headers)
+        .connect_timeout(connect_timeout)
+        .build()
+        .map_err(|e| format!("Failed to build MCP HTTP client: {e}"))
+}
+
+/// Whether a `taskkill` failure just means the process had already exited.
+///
+/// Windows reports "the process ... not found" as an error; on unix the same
+/// condition (`ESRCH`) is already treated as success. Kept platform-independent
+/// so it can be tested anywhere.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn is_process_already_gone(stderr: &str) -> bool {
+    let lower = stderr.to_ascii_lowercase();
+    lower.contains("not found") || lower.contains("no running instance")
+}
+
+pub(crate) fn append_bounded_stderr(captured: &mut VecDeque<u8>, chunk: &[u8]) {
+    captured.extend(chunk);
+    let excess = captured.len().saturating_sub(MCP_STDERR_CONTEXT_MAX_BYTES);
+    captured.drain(..excess);
+}
+
+pub(crate) fn format_mcp_start_error(service_error: &str, stderr_context: &str) -> String {
+    let stderr_context = stderr_context.trim();
+    if stderr_context.is_empty() {
+        service_error.to_string()
+    } else {
+        format!("{service_error}\nMCP server stderr (context):\n{stderr_context}")
+    }
+}
+
+async fn store_running_server<R: Runtime>(
+    app: &AppHandle<R>,
+    servers: &SharedMcpServers,
+    name: &str,
+    service: RunningServiceEnum,
+    start_generation: u64,
+) -> bool {
+    let mut servers_guard = servers.lock().await;
+    let state = app.state::<AppState>();
+    let start_generations = state.mcp_start_generations.lock().await;
+    if start_generations.get(name).copied() != Some(start_generation) {
+        return false;
+    }
+    let mut generations = state.mcp_server_generations.lock().await;
+    let generation = generations.entry(name.to_string()).or_default();
+    *generation = generation.wrapping_add(1);
+    servers_guard.insert(name.to_string(), service);
+    true
+}
+
+async fn remove_mcp_pid_if_matches<R: Runtime>(
+    app: &AppHandle<R>,
+    name: &str,
+    start_generation: u64,
+    pid: u32,
+) {
+    let state = app.state::<AppState>();
+    let mut pids = state.mcp_server_pids.lock().await;
+    let remove_server_entry = if let Some(server_pids) = pids.get_mut(name) {
+        if server_pids.get(&start_generation).copied() == Some(pid) {
+            server_pids.remove(&start_generation);
+        }
+        server_pids.is_empty()
+    } else {
+        false
+    };
+    if remove_server_entry {
+        pids.remove(name);
     }
 }
 
@@ -267,6 +472,7 @@ async fn schedule_mcp_start_task<R: Runtime>(
     servers: SharedMcpServers,
     name: String,
     config: Value,
+    start_generation: u64,
 ) -> Result<(), String> {
     let app_path = get_jan_data_folder_path(app.clone());
     let exe_path = env::current_exe().expect("Failed to get current exe path");
@@ -278,138 +484,109 @@ async fn schedule_mcp_start_task<R: Runtime>(
     let config_params = extract_command_args(&config)
         .ok_or_else(|| format!("Failed to extract command args from config for {name}"))?;
 
-    if config_params.transport_type.as_deref() == Some("http") && config_params.url.is_some() {
-        let transport = StreamableHttpClientTransport::with_client(
-            reqwest::Client::builder()
-                .default_headers({
-                    // Map envs to request headers
-                    let mut headers: tauri::http::HeaderMap = reqwest::header::HeaderMap::new();
-                    for (key, value) in config_params.headers.iter() {
-                        if let Some(v_str) = value.as_str() {
-                            // Try to map env keys to HTTP header names (case-insensitive)
-                            // Most HTTP headers are Title-Case, so we try to convert
-                            let header_name =
-                                reqwest::header::HeaderName::from_bytes(key.as_bytes());
-                            if let Ok(header_name) = header_name {
-                                if let Ok(header_value) =
-                                    reqwest::header::HeaderValue::from_str(v_str)
-                                {
-                                    headers.insert(header_name, header_value);
-                                }
-                            }
-                        }
-                    }
-                    headers
-                })
-                .connect_timeout(config_params.timeout.unwrap_or(Duration::MAX))
-                .build()
-                .unwrap(),
-            StreamableHttpClientTransportConfig {
-                uri: config_params.url.unwrap().into(),
-                ..Default::default()
-            },
-        );
-
-        let client_info = ClientInfo {
-            protocol_version: Default::default(),
-            capabilities: ClientCapabilities::default(),
-            client_info: Implementation {
-                name: "Jan Streamable Client".to_string(),
-                version: "0.0.1".to_string(),
-                title: None,
-                website_url: None,
-                icons: None,
-            },
+    if matches!(
+        config_params.transport_type.as_deref(),
+        Some("http" | "sse")
+    ) {
+        let primary_transport = config_params.transport_type.as_deref().unwrap();
+        let fallback_transport = if primary_transport == "http" {
+            "sse"
+        } else {
+            "http"
         };
-        let client = client_info.serve(transport).await.inspect_err(|e| {
-            log::error!("client error: {e:?}");
-        });
 
-        match client {
+        let has_oauth_session = {
+            let state = app.state::<AppState>();
+            state.mcp_oauth.has_entry(&app_path, &name).await
+        };
+
+        let client = match connect_remote_mcp(&app, &name, &config_params, primary_transport).await
+        {
             Ok(client) => {
-                log::info!("Connected to server: {:?}", client.peer_info());
-                servers
-                    .lock()
-                    .await
-                    .insert(name.clone(), RunningServiceEnum::WithInit(client));
-
-                emit_mcp_update_event(&app, &name);
+                log::info!("MCP server {name} connected using {primary_transport} transport");
+                client
             }
-            Err(e) => {
-                log::error!("Failed to connect to server: {e}");
-                return Err(format!("Failed to connect to server: {e}"));
-            }
-        }
-    } else if config_params.transport_type.as_deref() == Some("sse") && config_params.url.is_some()
-    {
-        let transport = SseClientTransport::start_with_client(
-            reqwest::Client::builder()
-                .default_headers({
-                    // Map envs to request headers
-                    let mut headers = reqwest::header::HeaderMap::new();
-                    for (key, value) in config_params.headers.iter() {
-                        if let Some(v_str) = value.as_str() {
-                            // Try to map env keys to HTTP header names (case-insensitive)
-                            // Most HTTP headers are Title-Case, so we try to convert
-                            let header_name =
-                                reqwest::header::HeaderName::from_bytes(key.as_bytes());
-                            if let Ok(header_name) = header_name {
-                                if let Ok(header_value) =
-                                    reqwest::header::HeaderValue::from_str(v_str)
-                                {
-                                    headers.insert(header_name, header_value);
-                                }
-                            }
-                        }
+            // A 401 on a signed-in server is an auth problem, not a transport
+            // problem: retry the same transport once after a forced token
+            // refresh instead of a pointless fallback-transport attempt.
+            Err(primary_error)
+                if has_oauth_session && crate::core::mcp::oauth::is_auth_error(&primary_error) =>
+            {
+                log::warn!(
+                    "MCP server {name}: auth failure on {primary_transport}: {primary_error}; \
+                     refreshing the sign-in and retrying"
+                );
+                app.state::<AppState>()
+                    .mcp_oauth
+                    .refresh_if_stale(&app_path, &name, true)
+                    .await?;
+                match connect_remote_mcp(&app, &name, &config_params, primary_transport).await {
+                    Ok(client) => {
+                        log::info!(
+                            "MCP server {name} connected using {primary_transport} after refresh"
+                        );
+                        client
                     }
-                    headers
-                })
-                .connect_timeout(config_params.timeout.unwrap_or(Duration::MAX))
-                .build()
-                .unwrap(),
-            rmcp::transport::sse_client::SseClientConfig {
-                sse_endpoint: config_params.url.unwrap().into(),
-                ..Default::default()
-            },
+                    Err(retry_error) => {
+                        return Err(format!(
+                            "Failed to connect MCP server {name}: the sign-in is no longer \
+                             valid ({retry_error}) — open Connectors and sign in again"
+                        ));
+                    }
+                }
+            }
+            Err(primary_error) => {
+                log::warn!(
+                    "MCP server {name} failed using {primary_transport} transport: \
+                     {primary_error}; retrying with {fallback_transport}"
+                );
+                match connect_remote_mcp(&app, &name, &config_params, fallback_transport).await {
+                    Ok(client) => {
+                        log::info!(
+                            "MCP server {name} connected using fallback \
+                             {fallback_transport} transport"
+                        );
+                        client
+                    }
+                    Err(fallback_error) => {
+                        return Err(format!(
+                            "Failed to connect MCP server {name}: \
+                             {primary_transport}: {primary_error}; \
+                             {fallback_transport}: {fallback_error}"
+                        ));
+                    }
+                }
+            }
+        };
+
+        log::info!("Connected to server: {:?}", client.peer_info());
+        if !store_running_server(
+            &app,
+            &servers,
+            &name,
+            RunningServiceEnum::WithInit(client),
+            start_generation,
         )
         .await
-        .map_err(|e| {
-            log::error!("transport error: {e:?}");
-            format!("Failed to start SSE transport: {e}")
-        })?;
-
-        let client_info = ClientInfo {
-            protocol_version: Default::default(),
-            capabilities: ClientCapabilities::default(),
-            client_info: Implementation {
-                name: "Jan SSE Client".to_string(),
-                version: "0.0.1".to_string(),
-                title: None,
-                website_url: None,
-                icons: None,
-            },
-        };
-        let client = client_info.serve(transport).await.map_err(|e| {
-            log::error!("client error: {e:?}");
-            e.to_string()
-        });
-
-        match client {
-            Ok(client) => {
-                log::info!("Connected to server: {:?}", client.peer_info());
-                servers
-                    .lock()
-                    .await
-                    .insert(name.clone(), RunningServiceEnum::WithInit(client));
-
-                emit_mcp_update_event(&app, &name);
-            }
-            Err(e) => {
-                log::error!("Failed to connect to server: {e}");
-                return Err(format!("Failed to connect to server: {e}"));
-            }
+        {
+            return Err(format!("MCP server {name} startup was superseded"));
         }
+        emit_mcp_update_event(&app, &name);
     } else {
+        if let Some(transport_type) = config_params.transport_type.as_deref() {
+            if transport_type != "stdio" {
+                return Err(format!(
+                    "Unsupported MCP transport type '{transport_type}' for server {name}"
+                ));
+            }
+        } else if config_params.url.is_some() {
+            return Err(format!(
+                "MCP server {name} has a URL but no transport type; expected 'http' or 'sse'"
+            ));
+        }
+        if config_params.command.trim().is_empty() {
+            return Err(format!("MCP stdio server {name} has no command"));
+        }
         if name == "Jan Browser MCP" {
             if let Some(port_str) = config_params.envs.get("BRIDGE_PORT") {
                 if let Some(port_str) = port_str.as_str() {
@@ -468,14 +645,31 @@ async fn schedule_mcp_start_task<R: Runtime>(
         {
             cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW: prevents shell window on Windows
         }
+        #[cfg(unix)]
+        cmd.process_group(0);
 
+        sanitize_tokio_command(&mut cmd);
         cmd.kill_on_drop(true);
 
         // ATO-164 (defense-in-depth): launch the stdio server in its configured
         // working directory so relative paths resolve there rather than the
         // app's data dir. No-op when `cwd` is unset (inherits the app CWD).
+        //
+        // The directory has to exist: CreateProcess fails with ERROR_DIRECTORY
+        // (os error 267, "The directory name is invalid") for a missing one,
+        // which took every stdio server down with it once the sandbox folder
+        // was moved or never created (#259). Fall back to the inherited CWD
+        // with a warning instead.
         if let Some(cwd) = config_params.cwd.as_deref() {
-            cmd.current_dir(cwd);
+            let dir = std::path::Path::new(cwd);
+            if dir.is_dir() {
+                cmd.current_dir(dir);
+            } else {
+                log::warn!(
+                    "MCP server {name}: working directory {cwd:?} is not an existing \
+                     directory; starting from the app working directory instead"
+                );
+            }
         }
 
         config_params
@@ -500,38 +694,117 @@ async fn schedule_mcp_start_task<R: Runtime>(
             })?;
 
         let process_pid = process.id();
+        let app_state = app.state::<AppState>();
+        let start_generations = app_state.mcp_start_generations.lock().await;
+        if start_generations.get(&name).copied() != Some(start_generation) {
+            drop(start_generations);
+            if let Some(pid) = process_pid {
+                let _ = kill_process_tree_by_pid(pid).await;
+            }
+            return Err(format!("MCP server {name} startup was superseded"));
+        }
         if let Some(pid) = process_pid {
             log::info!("MCP server {name} spawned with PID {pid}");
-            let app_state = app.state::<AppState>();
-            let mut pids = app_state.mcp_server_pids.lock().await;
-            pids.insert(name.clone(), pid);
+            app_state
+                .mcp_server_pids
+                .lock()
+                .await
+                .entry(name.clone())
+                .or_default()
+                .insert(start_generation, pid);
         }
+        drop(start_generations);
 
-        let service = ()
-            .serve(process)
-            .await
-            .map_err(|e| format!("Failed to start MCP server {name}: {e}"));
+        let stderr_context = Arc::new(Mutex::new(VecDeque::<u8>::new()));
+        let stderr_context_for_task = stderr_context.clone();
+        let stderr_server_name = name.clone();
+        let stderr_task = tauri::async_runtime::spawn(async move {
+            let Some(mut stderr) = stderr else {
+                return;
+            };
+            let mut chunk = [0_u8; 4096];
+            loop {
+                match stderr.read(&mut chunk).await {
+                    Ok(0) => break,
+                    Ok(size) => {
+                        log::info!(
+                            "MCP server {stderr_server_name} stderr: {}",
+                            String::from_utf8_lossy(&chunk[..size]).trim_end()
+                        );
+                        let mut captured = stderr_context_for_task.lock().await;
+                        append_bounded_stderr(&mut captured, &chunk[..size]);
+                    }
+                    Err(error) => {
+                        log::warn!(
+                            "Failed reading MCP server {stderr_server_name} stderr: {error}"
+                        );
+                        break;
+                    }
+                }
+            }
+        });
+
+        let handshake_timeout = config_params
+            .timeout
+            .unwrap_or_else(|| Duration::from_secs(DEFAULT_MCP_HANDSHAKE_TIMEOUT_SECS));
+        let service = match timeout(handshake_timeout, ().serve(process)).await {
+            Ok(Ok(server)) => Ok(server),
+            Ok(Err(error)) => Err(format!("Failed to start MCP server {name}: {error}")),
+            Err(_) => Err(format!(
+                "MCP server {name} handshake timed out after {}s",
+                handshake_timeout.as_secs()
+            )),
+        };
 
         match service {
             Ok(server) => {
                 log::trace!("Connected to server: {:#?}", server.peer_info());
-                servers
-                    .lock()
-                    .await
-                    .insert(name.clone(), RunningServiceEnum::NoInit(server));
+                if !store_running_server(
+                    &app,
+                    &servers,
+                    &name,
+                    RunningServiceEnum::NoInit(server),
+                    start_generation,
+                )
+                .await
+                {
+                    if let Some(pid) = process_pid {
+                        if let Err(error) = kill_process_tree_by_pid(pid).await {
+                            log::warn!("Failed to clean up superseded MCP server {name}: {error}");
+                        }
+                        remove_mcp_pid_if_matches(&app, &name, start_generation, pid).await;
+                    }
+                    return Err(format!("MCP server {name} startup was superseded"));
+                }
                 log::info!("Server {name} started successfully.");
             }
-            Err(_) => {
-                let mut buffer = String::new();
-                let error = match stderr
-                    .expect("stderr must be piped")
-                    .read_to_string(&mut buffer)
+            Err(service_error) => {
+                let _ = timeout(Duration::from_secs(1), stderr_task).await;
+                let stderr_bytes = stderr_context
+                    .lock()
                     .await
-                {
-                    Ok(_) => format!("Failed to start MCP server {name}: {buffer}"),
-                    Err(_) => format!("Failed to read MCP server {name} stderr"),
-                };
-                log::error!("{error}");
+                    .iter()
+                    .copied()
+                    .collect::<Vec<_>>();
+                let stderr_context = String::from_utf8_lossy(&stderr_bytes);
+                let error = format_mcp_start_error(&service_error, &stderr_context);
+                if let Some(pid) = process_pid {
+                    if let Err(kill_error) = kill_process_tree_by_pid(pid).await {
+                        log::warn!(
+                            "Failed to clean up MCP server {name} process tree: {kill_error}"
+                        );
+                    }
+                    remove_mcp_pid_if_matches(&app, &name, start_generation, pid).await;
+                }
+                // Log the service error alone. `error` additionally carries the
+                // server's captured stderr, which is what the UI needs but is
+                // also different for every user — pasting it into the log
+                // message made Sentry group one failure into a fresh issue per
+                // host. The stderr goes out as a preceding breadcrumb instead.
+                if !stderr_context.trim().is_empty() {
+                    log::warn!("MCP server {name} stderr (context):\n{stderr_context}");
+                }
+                log::error!("{service_error}");
                 return Err(error);
             }
         }
@@ -581,10 +854,47 @@ fn emit_mcp_update_event<R: Runtime>(app: &AppHandle<R>, name: &str) {
     }
 }
 
+fn emit_mcp_status_update_event<R: Runtime>(app: &AppHandle<R>, name: &str) {
+    if let Err(e) = app.emit(
+        "mcp-status-update",
+        serde_json::json!({
+            "server": name
+        }),
+    ) {
+        log::error!("Failed to emit mcp-status-update event: {e}");
+    }
+}
+
+/// Clean up a user-entered working directory: trim whitespace and strip one
+/// pair of surrounding quotes (Windows users paste `"C:\path with spaces"`
+/// straight out of Explorer). `None` when nothing usable is left.
+fn normalize_cwd(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    let unquoted = trimmed
+        .strip_prefix('"')
+        .and_then(|s| s.strip_suffix('"'))
+        .or_else(|| {
+            trimmed
+                .strip_prefix('\'')
+                .and_then(|s| s.strip_suffix('\''))
+        })
+        .unwrap_or(trimmed)
+        .trim();
+    (!unquoted.is_empty()).then(|| unquoted.to_string())
+}
+
 pub fn extract_command_args(config: &Value) -> Option<McpServerConfig> {
     let obj = config.as_object()?;
-    let command = obj.get("command")?.as_str()?.to_string();
-    let args = obj.get("args")?.as_array()?.clone();
+    let command = obj
+        .get("command")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let args = obj
+        .get("args")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
     let url = obj.get("url").and_then(|u| u.as_str()).map(String::from);
     let transport_type = obj.get("type").and_then(|t| t.as_str()).map(String::from);
     let timeout = obj
@@ -604,8 +914,7 @@ pub fn extract_command_args(config: &Value) -> Option<McpServerConfig> {
     let cwd = obj
         .get("cwd")
         .and_then(|c| c.as_str())
-        .filter(|s| !s.is_empty())
-        .map(String::from);
+        .and_then(normalize_cwd);
     Some(McpServerConfig {
         timeout,
         transport_type,
@@ -792,10 +1101,56 @@ async fn kill_process_by_pid(pid: u32) -> Result<(), String> {
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
+        // "There is no running instance of the task" / "process not found" is
+        // the outcome we were asking for: the process is already gone. The unix
+        // path treats the same condition (ESRCH) as success; Windows reported
+        // it as a failure, and the shutdown sweep — which runs after servers
+        // have already stopped — filed one crash per PID on every exit.
+        if is_process_already_gone(&stderr) {
+            log::debug!("taskkill: PID {pid} was already gone");
+            return Ok(());
+        }
         return Err(format!("taskkill failed: {}", stderr));
     }
 
     Ok(())
+}
+
+#[cfg(unix)]
+pub(crate) async fn kill_process_tree_by_pid(pid: u32) -> Result<(), String> {
+    use nix::errno::Errno;
+    use nix::sys::signal::{kill, Signal};
+    use nix::unistd::Pid;
+
+    let process_group = Pid::from_raw(-(pid as i32));
+    match kill(process_group, Signal::SIGTERM) {
+        Ok(()) | Err(Errno::ESRCH) => {}
+        Err(error) => {
+            return Err(format!(
+                "Failed to send SIGTERM to process group {pid}: {error}"
+            ))
+        }
+    }
+
+    for _ in 0..30 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        if kill(process_group, None).is_err() {
+            return Ok(());
+        }
+    }
+
+    log::warn!("MCP process group {pid} unresponsive, sending SIGKILL");
+    match kill(process_group, Signal::SIGKILL) {
+        Ok(()) | Err(Errno::ESRCH) => Ok(()),
+        Err(error) => Err(format!(
+            "Failed to send SIGKILL to process group {pid}: {error}"
+        )),
+    }
+}
+
+#[cfg(windows)]
+pub(crate) async fn kill_process_tree_by_pid(pid: u32) -> Result<(), String> {
+    kill_process_by_pid(pid).await
 }
 
 pub async fn background_cleanup_mcp_servers<R: Runtime>(
@@ -850,19 +1205,23 @@ pub async fn stop_mcp_servers_with_context<R: Runtime>(
         flag: state.mcp_shutdown_in_progress.clone(),
     };
 
-    {
-        let mut monitoring_tasks = state.mcp_monitoring_tasks.lock().await;
-        for (_name, handle) in monitoring_tasks.drain() {
-            handle.abort();
-        }
-    }
-
-    tokio::time::sleep(Duration::from_millis(50)).await;
-
-    let pids_snapshot: std::collections::HashMap<String, u32> = {
-        let pids = state.mcp_server_pids.lock().await;
-        pids.clone()
+    let active_startup_names: Vec<String> = {
+        let active_servers = state.mcp_active_servers.lock().await;
+        active_servers.keys().cloned().collect()
     };
+    let mut start_generations = state.mcp_start_generations.lock().await;
+    let pids = state.mcp_server_pids.lock().await;
+    let pids_snapshot = pids.clone();
+    let startup_names: HashSet<String> = active_startup_names
+        .into_iter()
+        .chain(pids_snapshot.keys().cloned())
+        .collect();
+    for name in startup_names {
+        let generation = start_generations.entry(name).or_default();
+        *generation = generation.wrapping_add(1);
+    }
+    drop(pids);
+    drop(start_generations);
     let servers_to_stop: Vec<(String, RunningServiceEnum, Option<u16>)> = {
         let mut servers_map = state.mcp_servers.lock().await;
         let keys: Vec<String> = servers_map.keys().cloned().collect();
@@ -889,10 +1248,6 @@ pub async fn stop_mcp_servers_with_context<R: Runtime>(
         result
     };
 
-    if servers_to_stop.is_empty() {
-        return Ok(());
-    }
-
     let server_names: Vec<String> = servers_to_stop
         .iter()
         .map(|(name, _, _)| name.clone())
@@ -902,6 +1257,10 @@ pub async fn stop_mcp_servers_with_context<R: Runtime>(
         .into_iter()
         .map(|(name, service, port)| {
             let app_clone = app.clone();
+            let process_pids = pids_snapshot
+                .get(&name)
+                .map(|server_pids| server_pids.values().copied().collect::<Vec<_>>())
+                .unwrap_or_default();
 
             tauri::async_runtime::spawn(async move {
                 let cancel_future = async {
@@ -915,6 +1274,11 @@ pub async fn stop_mcp_servers_with_context<R: Runtime>(
                     .await
                     .map(|r| r.is_ok())
                     .unwrap_or(false);
+                for pid in process_pids {
+                    if let Err(error) = kill_process_tree_by_pid(pid).await {
+                        log::warn!("Failed to clean up MCP server {name} process tree: {error}");
+                    }
+                }
 
                 if name == "Jan Browser MCP" {
                     if let Some(port) = port {
@@ -938,7 +1302,7 @@ pub async fn stop_mcp_servers_with_context<R: Runtime>(
     )
     .await;
 
-    let failed_servers: Vec<String> = match results {
+    let _failed_servers: Vec<String> = match results {
         Ok(results) => {
             results
                 .into_iter()
@@ -956,12 +1320,15 @@ pub async fn stop_mcp_servers_with_context<R: Runtime>(
         }
     };
 
-    // Force-kill processes that didn't stop gracefully
-    for server_name in &failed_servers {
-        if let Some(&pid) = pids_snapshot.get(server_name) {
-            log::warn!("Force-killing MCP server {} (PID {})", server_name, pid);
-            if let Err(e) = kill_process_by_pid(pid).await {
-                log::error!("Failed to force-kill PID {}: {}", pid, e);
+    // Ensure every tracked process tree is gone, including servers still handshaking.
+    for (server_name, server_pids) in &pids_snapshot {
+        for pid in server_pids.values().copied() {
+            log::trace!("Ensuring MCP server {server_name} PID {pid} is stopped");
+            if let Err(e) = kill_process_tree_by_pid(pid).await {
+                // Best-effort sweep after the servers have already been asked to
+                // stop; a straggler we could not reap is worth noting, not
+                // worth filing as a crash.
+                log::warn!("Failed to stop MCP process tree PID {}: {}", pid, e);
             }
         }
     }
@@ -969,8 +1336,20 @@ pub async fn stop_mcp_servers_with_context<R: Runtime>(
     // Clean up PIDs from tracking
     {
         let mut pids = state.mcp_server_pids.lock().await;
-        for name in &server_names {
-            pids.remove(name);
+        for (name, snapshot_pids) in &pids_snapshot {
+            let remove_server_entry = if let Some(current_pids) = pids.get_mut(name) {
+                for (generation, pid) in snapshot_pids {
+                    if current_pids.get(generation) == Some(pid) {
+                        current_pids.remove(generation);
+                    }
+                }
+                current_pids.is_empty()
+            } else {
+                false
+            };
+            if remove_server_entry {
+                pids.remove(name);
+            }
         }
     }
 
@@ -987,6 +1366,64 @@ pub async fn store_active_server_config(
 ) {
     let mut active_servers = active_servers_state.lock().await;
     active_servers.insert(name.to_string(), config.clone());
+}
+
+/// Materialise `mcp_config.json` from the default template when it is missing.
+///
+/// Startup migrations run before `setup_mcp` spawns, so any caller that reads
+/// the config during setup must guarantee its existence itself.
+pub fn ensure_mcp_config_exists<R: Runtime>(
+    app_handle: tauri::AppHandle<R>,
+) -> Result<std::path::PathBuf, String> {
+    let config_path = get_jan_data_folder_path(app_handle).join("mcp_config.json");
+    if config_path.exists() {
+        return Ok(config_path);
+    }
+
+    if let Some(parent) = config_path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("Failed to create MCP config directory: {e}"))?;
+    }
+
+    log::info!("mcp_config.json not found, creating default config");
+    std::fs::write(&config_path, default_mcp_config())
+        .map_err(|e| format!("Failed to create default MCP config: {e}"))?;
+
+    Ok(config_path)
+}
+
+/// Remove the untouched Serper entry from an existing MCP config.
+///
+/// The in-memory matcher deliberately recognizes only the exact default the
+/// app used to write. A user-edited Serper server is preserved. The file is
+/// rewritten only when that sentinel was actually removed, making repeated
+/// startup migrations a no-op.
+pub fn drop_retired_serper_default_from_config<R: Runtime>(
+    app_handle: tauri::AppHandle<R>,
+) -> Result<bool, String> {
+    let config_path = ensure_mcp_config_exists(app_handle)?;
+    let mut config: Value = serde_json::from_str(
+        &std::fs::read_to_string(&config_path)
+            .map_err(|e| format!("Failed to read MCP config: {e}"))?,
+    )
+    .map_err(|e| format!("Failed to parse MCP config: {e}"))?;
+
+    let servers = config
+        .get_mut("mcpServers")
+        .and_then(Value::as_object_mut)
+        .ok_or("No mcpServers found in config")?;
+    if !drop_retired_serper_default(servers) {
+        return Ok(false);
+    }
+
+    std::fs::write(
+        &config_path,
+        serde_json::to_string_pretty(&config)
+            .map_err(|e| format!("Failed to serialize MCP config: {e}"))?,
+    )
+    .map_err(|e| format!("Failed to write MCP config: {e}"))?;
+
+    Ok(true)
 }
 
 // Add a new server configuration to the MCP config file
@@ -1031,4 +1468,41 @@ pub fn add_server_config_with_path<R: Runtime>(
     .map_err(|e| format!("Failed to write config file: {e}"))?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalize_cwd_trims_and_unquotes() {
+        assert_eq!(
+            normalize_cwd("  \"C:\\Users\\Marc\\Documents\\Test 1\"  ").as_deref(),
+            Some("C:\\Users\\Marc\\Documents\\Test 1")
+        );
+        assert_eq!(normalize_cwd("'/tmp/work'").as_deref(), Some("/tmp/work"));
+        assert_eq!(normalize_cwd("/tmp/work").as_deref(), Some("/tmp/work"));
+    }
+
+    #[test]
+    fn normalize_cwd_drops_empty_values() {
+        assert_eq!(normalize_cwd(""), None);
+        assert_eq!(normalize_cwd("   "), None);
+        assert_eq!(normalize_cwd("\"\""), None);
+    }
+
+    #[test]
+    fn extract_command_args_reads_cwd() {
+        let config = serde_json::json!({
+            "command": "npx",
+            "args": ["-y", "@modelcontextprotocol/server-filesystem"],
+            "cwd": " \"/some/dir\" "
+        });
+        let parsed = extract_command_args(&config).expect("config parses");
+        assert_eq!(parsed.cwd.as_deref(), Some("/some/dir"));
+
+        let config = serde_json::json!({ "command": "npx", "args": [], "cwd": "" });
+        let parsed = extract_command_args(&config).expect("config parses");
+        assert_eq!(parsed.cwd, None);
+    }
 }

@@ -3,9 +3,344 @@ import https from 'https'
 import fs, { copyFile, mkdirSync } from 'fs'
 import os from 'os'
 import path from 'path'
+import crypto from 'crypto'
+import { execFileSync } from 'child_process'
 import unzipper from 'unzipper'
 import tar from 'tar'
 import { copySync } from 'cpx'
+
+// ----- cloudflared (Remote access sidecar) -----
+// The one bundled binary that opens public ingress to the user's machine, so
+// unlike bun/uv below it is pinned to a release and verified before it is
+// allowed anywhere near the bundle. A mismatch fails the build.
+//
+// Two independent sources, because they do not describe the same bytes:
+//   `sha256` / `size`  — the *release asset* as GitHub reports it
+//       (`gh api repos/cloudflare/cloudflared/releases/tags/<version>` → `digest`).
+//   `binarySha256`     — the executable *inside* a macOS `.tgz`, which is the
+//       value Cloudflare prints in the release notes. For those two assets the
+//       notes' checksum is NOT the archive's hash, so it cannot go in `sha256`.
+// Linux and Windows assets are the executable itself: one hash covers both.
+//
+// To update: change `version`, then every hash and size, in this one place.
+const CLOUDFLARED = {
+  version: '2026.9.1',
+  assets: {
+    'darwin-arm64': {
+      file: 'cloudflared-darwin-arm64.tgz',
+      size: 19217478,
+      sha256: 'c27ab8fd0aa489449e3d201eb02f957ef460a13b613662928b1b23394bf1bcfe',
+      binarySha256: '9a0b19f67dc7a3011bc6b972c7ce06a5fcea8784ac6bd599ffa382ea4aeb5a6e',
+    },
+    'darwin-amd64': {
+      file: 'cloudflared-darwin-amd64.tgz',
+      size: 21118723,
+      sha256: 'ff0d3b51d5ff70eceef89d6b32145fee985018a2174596a5dbe405e2766e2ac4',
+      binarySha256: '1ea07ae775b03236bd6be18ca1848d6bdc4af2f4f3bce398823b5a36e5761b75',
+    },
+    'linux-amd64': {
+      file: 'cloudflared-linux-amd64',
+      size: 39838488,
+      sha256: '03f1f25d1cc93b9ad6c60569d44060bc4f17ed97075760ed8cfca4b12dcd68cc',
+    },
+    'linux-arm64': {
+      file: 'cloudflared-linux-arm64',
+      size: 37466252,
+      sha256: '3d97437c71848bd8df68041e12436b484a661d95073ea1937f01a845ce88faa3',
+    },
+    'windows-amd64': {
+      file: 'cloudflared-windows-amd64.exe',
+      size: 54976432,
+      sha256: '2837888cc0f5d58f15b6dc478376de90b4d3ba5241c7947455d1e0a0df429712',
+    },
+  },
+}
+
+// ----- MXC (Windows sandbox for chat commands) -----
+// Microsoft's `wxc-exec.exe`, which chat's `run_command` / `run_script` run
+// under on Windows (src-tauri/src/core/chat_exec/mxc.rs). Taken from the
+// `@microsoft/mxc-sdk` npm package: its tarball (37 MB) carries the same
+// Microsoft-signed executors as the 536 MB GitHub release zip. Pinned like
+// cloudflared — the tarball against the size and sha256 of the published one,
+// the executor inside it against its own hash. Only the executor and the
+// license are unpacked; `wxc-host-prep.exe` is not shipped, because the app
+// never uses the administrator-prepared tier that rewrites folder ACLs.
+//
+// To update: change `version`, then the tarball and both executor hashes.
+const MXC = {
+  version: '1.0.0',
+  tarball: {
+    size: 37746375,
+    sha256: '39e59ffd9d0832334889b0cd583d0beb43b1bbbe9f783dd7c6980203d23e9602',
+  },
+  executors: {
+    x64: {
+      member: 'package/bin/x64/wxc-exec.exe',
+      sha256: '8a6d1db4dd1846981127d9014741be18b094d07be967765dff6754bda1d40259',
+    },
+    arm64: {
+      member: 'package/bin/arm64/wxc-exec.exe',
+      sha256: 'a1dc1218e26dfae2e463ebede99591ab9b4adcc4efe5d09cc3302b053997244e',
+    },
+  },
+}
+
+function sha256Of(filePath) {
+  return crypto.createHash('sha256').update(fs.readFileSync(filePath)).digest('hex')
+}
+
+// Unlike `download()` below, this resolves redirects *before* it opens the
+// output file, so no handle is left open on it. The caller renames the file
+// afterwards, which Windows refuses while any handle exists.
+function downloadFollowingRedirects(url, dest, redirectsLeft = 5) {
+  return new Promise((resolve, reject) => {
+    https
+      .get(url, { headers: { 'User-Agent': 'atomic-chat-build' } }, (response) => {
+        const { statusCode, headers } = response
+        if (statusCode >= 300 && statusCode < 400 && headers.location) {
+          response.resume()
+          if (redirectsLeft === 0) {
+            reject(new Error(`Too many redirects for ${url}`))
+            return
+          }
+          const next = new URL(headers.location, url).toString()
+          downloadFollowingRedirects(next, dest, redirectsLeft - 1).then(resolve, reject)
+          return
+        }
+        if (statusCode !== 200) {
+          response.resume()
+          reject(new Error(`GET ${url} failed with status ${statusCode}`))
+          return
+        }
+        const file = fs.createWriteStream(dest)
+        response.on('error', reject)
+        file.on('error', reject)
+        file.on('finish', () => file.close((err) => (err ? reject(err) : resolve())))
+        response.pipe(file)
+      })
+      .on('error', reject)
+  })
+}
+
+// Returns the path of a verified copy of the asset in `tempBinDir`.
+async function fetchCloudflaredAsset(key, tempBinDir) {
+  const asset = CLOUDFLARED.assets[key]
+  if (!asset) throw new Error(`No pinned cloudflared asset for ${key}`)
+  const cached = path.join(tempBinDir, `cloudflared-${CLOUDFLARED.version}-${asset.file}`)
+  // Hashed on every run, not just trusted because it exists: a truncated or
+  // tampered cache must never be bundled.
+  if (fs.existsSync(cached) && sha256Of(cached) === asset.sha256) {
+    console.log(`cloudflared ${CLOUDFLARED.version} (${key}) already downloaded and verified`)
+    return cached
+  }
+  const url = `https://github.com/cloudflare/cloudflared/releases/download/${CLOUDFLARED.version}/${asset.file}`
+  const partial = `${cached}.part`
+  fs.rmSync(partial, { force: true })
+  console.log(`Downloading ${url}`)
+  try {
+    await downloadFollowingRedirects(url, partial)
+    const size = fs.statSync(partial).size
+    const actual = sha256Of(partial)
+    if (size !== asset.size || actual !== asset.sha256) {
+      throw new Error(
+        `cloudflared ${asset.file} failed verification: ` +
+          `expected ${asset.size} bytes sha256 ${asset.sha256}, got ${size} bytes sha256 ${actual}`
+      )
+    }
+  } catch (err) {
+    fs.rmSync(partial, { force: true })
+    throw err
+  }
+  fs.renameSync(partial, cached)
+  return cached
+}
+
+// Puts the pinned executor for this Windows machine's architecture at
+// `resources/bin/mxc/wxc-exec.exe` (listed in tauri.windows*.conf.json).
+async function installMxc(binDir, tempBinDir) {
+  if (os.platform() !== 'win32') return
+  const executor = MXC.executors[os.arch() === 'arm64' ? 'arm64' : 'x64']
+  const targetDir = path.join(binDir, 'mxc')
+  const target = path.join(targetDir, 'wxc-exec.exe')
+  if (fs.existsSync(target) && sha256Of(target) === executor.sha256) {
+    console.log(`MXC ${MXC.version} already installed and verified, skipping download`)
+    return
+  }
+  fs.mkdirSync(targetDir, { recursive: true })
+  fs.mkdirSync(tempBinDir, { recursive: true })
+
+  const archive = path.join(tempBinDir, `mxc-sdk-${MXC.version}.tgz`)
+  if (!(fs.existsSync(archive) && sha256Of(archive) === MXC.tarball.sha256)) {
+    const url = `https://registry.npmjs.org/@microsoft/mxc-sdk/-/mxc-sdk-${MXC.version}.tgz`
+    const partial = `${archive}.part`
+    fs.rmSync(partial, { force: true })
+    console.log(`Downloading ${url}`)
+    try {
+      await downloadFollowingRedirects(url, partial)
+      const size = fs.statSync(partial).size
+      const actual = sha256Of(partial)
+      if (size !== MXC.tarball.size || actual !== MXC.tarball.sha256) {
+        throw new Error(
+          `mxc-sdk ${MXC.version} failed verification: expected ${MXC.tarball.size} bytes ` +
+            `sha256 ${MXC.tarball.sha256}, got ${size} bytes sha256 ${actual}`
+        )
+      }
+    } catch (err) {
+      fs.rmSync(partial, { force: true })
+      throw err
+    }
+    fs.renameSync(partial, archive)
+  }
+
+  const extractDir = path.join(tempBinDir, `mxc-sdk-${MXC.version}`)
+  fs.rmSync(extractDir, { recursive: true, force: true })
+  fs.mkdirSync(extractDir, { recursive: true })
+  await tar.x({ file: archive, cwd: extractDir }, [executor.member, 'package/LICENSE.md'])
+  const extracted = path.join(extractDir, executor.member)
+  const actual = fs.existsSync(extracted) ? sha256Of(extracted) : 'missing'
+  if (actual !== executor.sha256) {
+    throw new Error(
+      `${executor.member} in mxc-sdk ${MXC.version} failed verification: ` +
+        `expected sha256 ${executor.sha256}, got ${actual}`
+    )
+  }
+  fs.copyFileSync(extracted, target)
+  console.log(`MXC ${MXC.version} installed at ${target}`)
+}
+
+function installBinary(source, target) {
+  fs.copyFileSync(source, target)
+  if (os.platform() !== 'win32') fs.chmodSync(target, 0o755)
+  console.log(`cloudflared installed at ${target}`)
+}
+
+// File names Tauri expects for this machine: an `externalBin` entry resolves
+// as `<name>-<target triple>[.exe]`.
+function cloudflaredTargets() {
+  const platform = os.platform()
+  const isArm = os.arch() === 'arm64'
+  if (platform === 'darwin') {
+    return [
+      'cloudflared-aarch64-apple-darwin',
+      'cloudflared-x86_64-apple-darwin',
+      'cloudflared-universal-apple-darwin',
+    ]
+  }
+  if (platform === 'linux') {
+    return [`cloudflared-${isArm ? 'aarch64' : 'x86_64'}-unknown-linux-gnu`]
+  }
+  if (platform === 'win32') return ['cloudflared-x86_64-pc-windows-msvc.exe']
+  throw new Error(`Unsupported platform for cloudflared: ${platform}`)
+}
+
+// Written after an install that came from a verified archive. It records what
+// was installed, so a later run can tell "already there" from a missing file,
+// a truncated one, a `make stub-resources` placeholder, or an older pin —
+// without touching the network. Lives in the gitignored bin dir and is not
+// listed in any bundle's resources.
+const CLOUDFLARED_STAMP = '.cloudflared-installed.json'
+
+function isCloudflaredInstalled(binDir) {
+  let stamp
+  try {
+    stamp = JSON.parse(fs.readFileSync(path.join(binDir, CLOUDFLARED_STAMP), 'utf8'))
+  } catch {
+    return false
+  }
+  if (!stamp || stamp.version !== CLOUDFLARED.version || !stamp.files) return false
+  return cloudflaredTargets().every((name) => {
+    const file = path.join(binDir, name)
+    return (
+      typeof stamp.files[name] === 'string' &&
+      fs.existsSync(file) &&
+      sha256Of(file) === stamp.files[name]
+    )
+  })
+}
+
+function writeCloudflaredStamp(binDir) {
+  const files = {}
+  for (const name of cloudflaredTargets()) {
+    files[name] = sha256Of(path.join(binDir, name))
+  }
+  fs.writeFileSync(
+    path.join(binDir, CLOUDFLARED_STAMP),
+    JSON.stringify({ version: CLOUDFLARED.version, files }, null, 2) + '\n'
+  )
+}
+
+// Installs the pinned cloudflared for this machine, downloading only when it
+// has to: verified files already in place → nothing to do; verified archive in
+// the `scripts/dist` cache → reinstall offline; otherwise fetch and verify.
+async function installCloudflared(binDir, tempBinDir) {
+  const platform = os.platform()
+  const arch = os.arch()
+  // Cloudflare publishes no Windows arm64 build; that bundle ships without
+  // the tunnel and the app hides Remote access there.
+  if (platform === 'win32' && arch === 'arm64') {
+    console.log('cloudflared: no Windows arm64 release, skipping')
+    return
+  }
+  fs.mkdirSync(binDir, { recursive: true })
+  fs.mkdirSync(tempBinDir, { recursive: true })
+
+  if (isCloudflaredInstalled(binDir)) {
+    console.log(`cloudflared ${CLOUDFLARED.version} already installed and verified, skipping download`)
+    return
+  }
+
+  if (platform === 'darwin') {
+    // The release build targets `universal-apple-darwin`, which needs a fat
+    // binary; both slices are fetched and merged for real (bun/uv above ship
+    // one architecture under the universal name).
+    const slices = []
+    for (const [key, triple] of [
+      ['darwin-arm64', 'aarch64-apple-darwin'],
+      ['darwin-amd64', 'x86_64-apple-darwin'],
+    ]) {
+      const archive = await fetchCloudflaredAsset(key, tempBinDir)
+      const extractDir = path.join(tempBinDir, `cloudflared-${CLOUDFLARED.version}-${key}`)
+      fs.rmSync(extractDir, { recursive: true, force: true })
+      fs.mkdirSync(extractDir, { recursive: true })
+      // `.tgz` is a gzipped tar; node-tar detects that from the content and
+      // refuses absolute and `..` paths by default.
+      await tar.x({ file: archive, cwd: extractDir })
+      const binary = path.join(extractDir, 'cloudflared')
+      if (!fs.existsSync(binary)) {
+        throw new Error(`No cloudflared binary inside ${archive}`)
+      }
+      // Second, independent check: the executable itself against the checksum
+      // Cloudflare publishes (the archive was checked against GitHub's digest).
+      const expectedBinary = CLOUDFLARED.assets[key].binarySha256
+      const actualBinary = sha256Of(binary)
+      if (actualBinary !== expectedBinary) {
+        throw new Error(
+          `cloudflared inside ${archive} failed verification: ` +
+            `expected sha256 ${expectedBinary}, got ${actualBinary}`
+        )
+      }
+      const target = path.join(binDir, `cloudflared-${triple}`)
+      installBinary(binary, target)
+      slices.push(target)
+    }
+    const universal = path.join(binDir, 'cloudflared-universal-apple-darwin')
+    fs.rmSync(universal, { force: true })
+    execFileSync('lipo', ['-create', '-output', universal, ...slices], { stdio: 'inherit' })
+    fs.chmodSync(universal, 0o755)
+    console.log(`cloudflared installed at ${universal}`)
+  } else if (platform === 'linux') {
+    const isArm = arch === 'arm64'
+    const binary = await fetchCloudflaredAsset(isArm ? 'linux-arm64' : 'linux-amd64', tempBinDir)
+    const triple = isArm ? 'aarch64-unknown-linux-gnu' : 'x86_64-unknown-linux-gnu'
+    installBinary(binary, path.join(binDir, `cloudflared-${triple}`))
+  } else if (platform === 'win32') {
+    const binary = await fetchCloudflaredAsset('windows-amd64', tempBinDir)
+    installBinary(binary, path.join(binDir, 'cloudflared-x86_64-pc-windows-msvc.exe'))
+  } else {
+    throw new Error(`Unsupported platform for cloudflared: ${platform}`)
+  }
+  writeCloudflaredStamp(binDir)
+}
 
 function download(url, dest) {
   return new Promise((resolve, reject) => {
@@ -125,6 +460,16 @@ async function fetchLatestSqliteVecUrl(platform, arch) {
   }
 }
 
+// Tauri `externalBin` suffix on Windows; also the uv release name.
+function windowsTriple() {
+  return os.arch() === 'arm64' ? 'aarch64-pc-windows-msvc' : 'x86_64-pc-windows-msvc'
+}
+
+// The same on Linux.
+function linuxTriple() {
+  return os.arch() === 'arm64' ? 'aarch64-unknown-linux-gnu' : 'x86_64-unknown-linux-gnu'
+}
+
 function getPlatformArch() {
   const platform = os.platform() // 'darwin', 'linux', 'win32'
   const arch = os.arch() // 'x64', 'arm64', etc.
@@ -137,13 +482,10 @@ function getPlatformArch() {
       arch === 'arm64' ? 'aarch64-apple-darwin' : 'x86_64-apple-darwin'
   } else if (platform === 'linux') {
     bunPlatform = arch === 'arm64' ? 'linux-aarch64' : 'linux-x64'
-    uvPlatform =
-      arch === 'arm64'
-        ? 'aarch64-unknown-linux-gnu'
-        : 'x86_64-unknown-linux-gnu'
+    uvPlatform = linuxTriple()
   } else if (platform === 'win32') {
-    bunPlatform = 'windows-x64' // Bun has limited Windows support
-    uvPlatform = 'x86_64-pc-windows-msvc'
+    bunPlatform = arch === 'arm64' ? 'windows-aarch64' : 'windows-x64'
+    uvPlatform = windowsTriple()
   } else {
     throw new Error(`Unsupported platform: ${platform}`)
   }
@@ -155,6 +497,19 @@ async function main() {
   if (process.env.SKIP_BINARIES) {
     console.log('Skipping binaries download.')
     process.exit(0)
+  }
+  // `--only=cloudflared` (yarn download:cloudflared, make download-cloudflared):
+  // just the Remote access sidecar, leaving bun/uv/sqlite-vec alone.
+  const only = process.argv
+    .slice(2)
+    .find((arg) => arg.startsWith('--only='))
+    ?.slice('--only='.length)
+  if (only !== undefined) {
+    if (only !== 'cloudflared') {
+      throw new Error(`Unknown --only target '${only}' (supported: cloudflared)`)
+    }
+    await installCloudflared('src-tauri/resources/bin', 'scripts/dist')
+    return
   }
   console.log('Starting main function')
   const platform = os.platform()
@@ -231,7 +586,7 @@ async function main() {
     } else if (platform === 'linux') {
       copyFile(
         path.join(binDir, 'bun'),
-        path.join(binDir, 'bun-x86_64-unknown-linux-gnu'),
+        path.join(binDir, `bun-${linuxTriple()}`),
         (err) => {
           if (err) {
             console.log('Error Found:', err)
@@ -250,7 +605,7 @@ async function main() {
     if (platform === 'win32') {
       copyFile(
         path.join(binDir, 'bun.exe'),
-        path.join(binDir, 'bun-x86_64-pc-windows-msvc.exe'),
+        path.join(binDir, `bun-${windowsTriple()}.exe`),
         (err) => {
           if (err) {
             console.log('Error Found:', err)
@@ -310,7 +665,7 @@ async function main() {
     } else if (platform === 'linux') {
       copyFile(
         path.join(binDir, 'uv'),
-        path.join(binDir, 'uv-x86_64-unknown-linux-gnu'),
+        path.join(binDir, `uv-${linuxTriple()}`),
         (err) => {
           if (err) {
             console.log('Error Found:', err)
@@ -326,7 +681,7 @@ async function main() {
     if (platform === 'win32') {
       copyFile(
         path.join(binDir, 'uv.exe'),
-        path.join(binDir, 'uv-x86_64-pc-windows-msvc.exe'),
+        path.join(binDir, `uv-${windowsTriple()}.exe`),
         (err) => {
           if (err) {
             console.log('Error Found:', err)
@@ -338,6 +693,13 @@ async function main() {
     // Expect EEXIST error
   }
   console.log('UV downloaded.')
+
+  // Fatal on purpose (see `CLOUDFLARED` above): the bundle lists it as an
+  // `externalBin`, and an unverified tunnel binary must not ship.
+  await installCloudflared(binDir, tempBinDir)
+
+  // Fatal for the same reason: an unverified sandbox executor must not ship.
+  await installMxc(binDir, tempBinDir)
 
   // ----- sqlite-vec (optional, ANN acceleration) -----
   try {

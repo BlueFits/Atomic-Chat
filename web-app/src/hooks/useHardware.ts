@@ -10,6 +10,8 @@ export interface CPU {
   name: string
   usage: number
   instructions?: string[] // Cortex migration: ensure instructions data ready
+  /** False when the core could not read the CPU flags (then `extensions` is empty, not "none"). */
+  extensions_known?: boolean
 }
 
 export interface GPUAdditionalInfo {
@@ -54,6 +56,10 @@ export interface HardwareData {
   total_memory: number
   os?: OS
   ram?: RAM
+  /** Where the core got these facts: its own probe, or an override injected by a host. */
+  source?: 'probe' | 'override'
+  /** Unix ms of the probe (or override) that produced these facts. */
+  probed_at?: number
 }
 
 export interface SystemUsage {
@@ -92,6 +98,8 @@ const defaultSystemUsage: SystemUsage = {
 interface HardwareStore {
   // Hardware data
   hardwareData: HardwareData
+  /** Fresh hardware enumeration completed during this app session. */
+  hardwareReady: boolean
   systemUsage: SystemUsage
 
   // Update functions
@@ -123,6 +131,7 @@ export const useHardware = create<HardwareStore>()(
   persist(
     (set) => ({
       hardwareData: defaultHardwareData,
+      hardwareReady: false,
       systemUsage: defaultSystemUsage,
       gpuLoading: {},
       pollingPaused: false,
@@ -170,6 +179,7 @@ export const useHardware = create<HardwareStore>()(
 
       setHardwareData: (data) =>
         set({
+          hardwareReady: true,
           hardwareData: {
             ...data,
             cpu: {
@@ -210,6 +220,13 @@ export const useHardware = create<HardwareStore>()(
     {
       name: localStorageKey.settingHardware,
       storage: createJSONStorage(() => localStorage),
+      // Readiness is session-scoped: persisted hardware is useful for drawing
+      // immediately, but must not drive a new optimal-backend decision until
+      // the hardware plugin has completed a fresh enumeration.
+      partialize: ({ hardwareReady, ...state }) => {
+        void hardwareReady
+        return state
+      },
     }
   )
 )

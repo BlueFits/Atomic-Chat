@@ -24,11 +24,15 @@ vi.mock('@tanstack/react-router', () => ({
 // test asserts the real wiring without pulling in the full sidebar context.
 vi.mock('@/components/ui/sidebar', () => ({
   useSidebar: () => ({ isMobile: false }),
-  SidebarMenuItem: ({ children, className }: any) => (
-    <li className={className}>{children}</li>
+  SidebarMenuItem: ({ children, className, ...props }: any) => (
+    <li className={className} {...props}>
+      {children}
+    </li>
   ),
-  SidebarMenuSubItem: ({ children, className }: any) => (
-    <li className={className}>{children}</li>
+  SidebarMenuSubItem: ({ children, className, ...props }: any) => (
+    <li className={className} {...props}>
+      {children}
+    </li>
   ),
   SidebarMenuButton: ({ children, isActive }: any) => (
     <div data-testid="thread-button" data-active={String(!!isActive)}>
@@ -48,10 +52,13 @@ vi.mock('@/components/ui/sidebar', () => ({
 // Dropdown menu and dialogs are not under test — collapse them to passthroughs.
 vi.mock('@/components/ui/dropdown-menu', () => {
   const Pass = ({ children }: any) => <div>{children}</div>
+  const Item = ({ children, onSelect }: any) => (
+    <div onClick={onSelect}>{children}</div>
+  )
   return {
     DropdownMenu: Pass,
     DropdownMenuContent: Pass,
-    DropdownMenuItem: Pass,
+    DropdownMenuItem: Item,
     DropdownMenuSeparator: Pass,
     DropdownMenuTrigger: Pass,
     DropdownMenuSub: Pass,
@@ -69,6 +76,9 @@ vi.mock('@/i18n/react-i18next-compat', () => ({
   useTranslation: () => ({ t: (key: string) => key }),
 }))
 
+// "Open in new window" only exists on the desktop build.
+vi.mock('@/lib/platform/utils', () => ({ isPlatformTauri: () => true }))
+
 vi.mock('@/lib/utils', () => ({
   cn: (...args: any[]) => args.filter(Boolean).join(' '),
   LOCAL_LLAMACPP_PROVIDER: 'llamacpp-upstream',
@@ -83,16 +93,23 @@ vi.mock('@/hooks/useThreads', () => ({
     }),
 }))
 
-vi.mock('@/hooks/useMessages', () => ({
-  useMessages: (selector: any) =>
-    selector({
-      getMessages: () => [],
-      setMessages: vi.fn(),
-    }),
-}))
+// Mirror the real store: a stable state object backed by actual storage. Handing
+// out fresh closures per render would retrigger the row's fetch effect.
+vi.mock('@/hooks/useMessages', () => {
+  const byThread = new Map<string, unknown[]>()
+  const state = {
+    getMessages: (threadId: string) => byThread.get(threadId) ?? [],
+    setMessages: (threadId: string, messages: unknown[]) => {
+      byThread.set(threadId, messages)
+    },
+    reset: () => byThread.clear(),
+  }
+  return { useMessages: (selector: any) => selector(state), __messages: state }
+})
 
 vi.mock('@/hooks/useThreadManagement', () => ({
-  useThreadManagement: () => ({ getFolderById: vi.fn(), folders: [] }),
+  useThreadManagementStore: (selector: any) =>
+    selector({ getFolderById: vi.fn(), folders: [] }),
 }))
 
 vi.mock('sonner', () => ({
@@ -106,12 +123,28 @@ const threads: Thread[] = [
   { id: 'thread-2', title: 'Second chat', updated: 1 },
 ]
 
+const PREVIEW_TEXT = 'Which quant fits my GPU?'
+
+const previewMessages = [
+  {
+    role: 'user',
+    content: [{ type: 'text', text: { value: PREVIEW_TEXT } }],
+  },
+]
+
+let fetchMessages: ReturnType<typeof vi.fn>
+
 describe('ThreadList active highlight', () => {
-  beforeEach(() => {
+  beforeEach(async () => {
     vi.clearAllMocks()
+    const { __messages } = (await import('@/hooks/useMessages')) as unknown as {
+      __messages: { reset: () => void }
+    }
+    __messages.reset()
+    fetchMessages = vi.fn().mockResolvedValue(previewMessages)
     seedServiceHub({
       messages: {
-        fetchMessages: vi.fn().mockResolvedValue([]),
+        fetchMessages,
       } as unknown as MessagesService,
     })
   })
@@ -165,6 +198,30 @@ describe('ThreadList active highlight', () => {
     expect(inactiveCard?.className.split(' ')).not.toContain('bg-secondary')
   })
 
+  it('does not hydrate messages for history rows', async () => {
+    vi.mocked(useParams).mockReturnValue({} as never)
+
+    await act(async () => {
+      render(<ThreadList threads={threads} />)
+    })
+
+    // History rows render a title only, so fetching their message history would
+    // be one pointless round-trip per row.
+    expect(screen.queryByText(PREVIEW_TEXT)).not.toBeInTheDocument()
+    expect(fetchMessages.mock.calls).toEqual([])
+  })
+
+  it('hydrates messages for project cards, which render a preview', async () => {
+    vi.mocked(useParams).mockReturnValue({} as never)
+
+    await act(async () => {
+      render(<ThreadList threads={threads} currentProjectId="project-1" />)
+    })
+
+    expect(screen.getAllByText(PREVIEW_TEXT)).toHaveLength(threads.length)
+    expect(fetchMessages.mock.calls.flat()).toEqual(['thread-1', 'thread-2'])
+  })
+
   it('does not render chat type icons', async () => {
     vi.mocked(useParams).mockReturnValue({} as never)
 
@@ -178,5 +235,67 @@ describe('ThreadList active highlight', () => {
     expect(
       screen.queryByLabelText('chat:threadType.agent')
     ).not.toBeInTheDocument()
+  })
+})
+
+describe('ThreadList right-click menu', () => {
+  let openWindow: ReturnType<typeof vi.fn>
+
+  beforeEach(() => {
+    vi.clearAllMocks()
+    vi.mocked(useParams).mockReturnValue({} as never)
+    openWindow = vi.fn().mockResolvedValue(undefined)
+    seedServiceHub({
+      messages: { fetchMessages: vi.fn() } as unknown as MessagesService,
+      window: { openWindow } as never,
+    })
+  })
+
+  // Issue #254: the row is a real <a>, so without preventDefault the embedding
+  // WebView shows its own link menu — whose "Open link in new window" it then
+  // silently drops.
+  it('suppresses the native context menu and opens our own', async () => {
+    await act(async () => {
+      render(<ThreadList threads={threads} />)
+    })
+
+    const row = screen.getByText('First chat').closest('li')!
+    const event = new MouseEvent('contextmenu', {
+      bubbles: true,
+      cancelable: true,
+    })
+    await act(async () => {
+      row.dispatchEvent(event)
+    })
+
+    expect(event.defaultPrevented).toBe(true)
+  })
+
+  it('opens the thread in its own window', async () => {
+    await act(async () => {
+      render(<ThreadList threads={threads} />)
+    })
+
+    const item = screen
+      .getAllByText('common:openInNewWindow')[0]
+      .closest('div')!
+    await act(async () => {
+      item.click()
+    })
+
+    expect(openWindow).toHaveBeenCalledWith(
+      expect.objectContaining({
+        url: '/threads/thread-1',
+        label: 'thread-thread-1',
+      })
+    )
+    // Exactly one window, for the row that was clicked, titled after the
+    // thread so the user can tell the windows apart.
+    expect(openWindow.mock.calls).toHaveLength(1)
+    expect(openWindow.mock.calls[0][0]).toMatchObject({
+      url: '/threads/thread-1',
+      label: 'thread-thread-1',
+      title: 'First chat',
+    })
   })
 })

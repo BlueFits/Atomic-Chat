@@ -14,7 +14,10 @@ vi.hoisted(() => {
   g.DecompressionStream = undefined
 })
 
-import { DefaultModelsService } from '../models/default'
+import {
+  DefaultModelsService,
+  parseHuggingFaceNextCursor,
+} from '../models/default'
 import type { HuggingFaceRepo, CatalogModel } from '../models/types'
 import { EngineManager, events, DownloadEvent } from '@janhq/core'
 import { BASELINE_MODEL_CATALOG } from '@/constants/models'
@@ -36,6 +39,7 @@ vi.mock('@janhq/core', () => ({
   },
   events: mockEvents,
   DownloadEvent: mockDownloadEvent,
+  ContentType: { Text: 'text', Image: 'image_url' },
 }))
 
 vi.mock('@tauri-apps/plugin-http', () => ({
@@ -103,8 +107,8 @@ describe('DefaultModelsService', () => {
     // the bundled baseline and never throws. These tests assert that
     // contract.
 
-    beforeEach(() => {
-      clearCatalogCache()
+    beforeEach(async () => {
+      await clearCatalogCache()
     })
 
     it('should fetch model catalog successfully', async () => {
@@ -217,7 +221,61 @@ describe('DefaultModelsService', () => {
     })
   })
 
+  describe('pullModelWithMetadata under another provider', () => {
+    it('imports through that provider with the hashes and sizes it was given, and keeps them for a resume', async () => {
+      const prism = { ...mockEngine, import: vi.fn().mockResolvedValue(undefined) }
+      mockEngineManager.get.mockImplementation((provider?: string) =>
+        provider === 'atomic-prism' ? prism : mockEngine
+      )
+      const { useDownloadStore } = await import('@/hooks/useDownloadStore')
+      const known = {
+        provider: 'atomic-prism',
+        modelSha256: 'a'.repeat(64),
+        modelSize: 2_000,
+        mmprojSha256: 'c'.repeat(64),
+        mmprojSize: 500,
+      }
+
+      await modelsService.pullModelWithMetadata(
+        'prism-ml/Bonsai-8B-PQ2_0',
+        'https://huggingface.co/prism-ml/Bonsai-8B-gguf/resolve/b072e1d/Bonsai-8B-PQ2_0.gguf',
+        'https://huggingface.co/prism-ml/Bonsai-8B-gguf/resolve/b072e1d/mmproj-Q8_0.gguf',
+        'hf_token',
+        true,
+        false,
+        known
+      )
+
+      expect(prism.import).toHaveBeenCalledWith('prism-ml/Bonsai-8B-PQ2_0', {
+        modelPath:
+          'https://huggingface.co/prism-ml/Bonsai-8B-gguf/resolve/b072e1d/Bonsai-8B-PQ2_0.gguf',
+        mmprojPath:
+          'https://huggingface.co/prism-ml/Bonsai-8B-gguf/resolve/b072e1d/mmproj-Q8_0.gguf',
+        modelSha256: 'a'.repeat(64),
+        modelSize: 2_000,
+        mmprojSha256: 'c'.repeat(64),
+        mmprojSize: 500,
+        resume: false,
+      })
+      expect(mockEngine.import).not.toHaveBeenCalled()
+      expect(
+        useDownloadStore.getState().resumeParams['prism-ml/Bonsai-8B-PQ2_0']
+      ).toMatchObject({ provider: 'atomic-prism', modelSha256: 'a'.repeat(64) })
+    })
+  })
+
   describe('abortDownload', () => {
+    it('stops a PrismML download too: Bonsai files download under atomic-prism', async () => {
+      const prism = { ...mockEngine, abortImport: vi.fn() }
+      mockEngineManager.get.mockImplementation((provider?: string) =>
+        provider === 'atomic-prism' ? prism : mockEngine
+      )
+
+      await modelsService.abortDownload('prism-ml/Bonsai-8B-PQ2_0')
+
+      expect(prism.abortImport).toHaveBeenCalledWith('prism-ml/Bonsai-8B-PQ2_0')
+    })
+
     it('should abort download successfully', async () => {
       const id = 'model1'
 
@@ -241,6 +299,28 @@ describe('DefaultModelsService', () => {
       await modelsService.deleteModel(id)
 
       expect(mockEngine.delete).toHaveBeenCalledWith(id)
+    })
+
+    it('answers what an engine that measures its deletes freed (TensorRT-LLM, task 3.15)', async () => {
+      const engine = {
+        delete: vi.fn(),
+        deleteWithReport: vi.fn().mockResolvedValue({ freedBytes: 4_100_000_000 }),
+      }
+      mockEngineManager.get.mockReturnValueOnce(engine)
+
+      await expect(
+        modelsService.deleteModel('Qwen/Qwen3-1.7B', 'tensorrt-llm')
+      ).resolves.toEqual({ freedBytes: 4_100_000_000 })
+      expect(engine.deleteWithReport).toHaveBeenCalledWith('Qwen/Qwen3-1.7B')
+      expect(engine.delete).not.toHaveBeenCalled()
+    })
+
+    it('rejects instead of reporting success when the provider has no engine', async () => {
+      mockEngineManager.get.mockReturnValueOnce(undefined)
+
+      await expect(
+        modelsService.deleteModel('model1', 'llamacpp-upstream')
+      ).rejects.toThrow('llamacpp-upstream')
     })
   })
 
@@ -274,6 +354,40 @@ describe('DefaultModelsService', () => {
       expect(result).toEqual(['llama-model', 'mlx-model'])
       expect(llamaEngine.getLoadedModels).toHaveBeenCalled()
       expect(mlxEngine.getLoadedModels).toHaveBeenCalled()
+    })
+  })
+
+  describe('getTokensCount', () => {
+    const message = (role: 'user' | 'assistant', text: string) =>
+      ({
+        role,
+        content: [{ type: 'text', text: { value: text, annotations: [] } }],
+      }) as never
+
+    it('counts nothing without a non-assistant message', async () => {
+      const getTokensCount = vi.fn().mockResolvedValue(42)
+      mockEngineManager.get.mockReturnValue({
+        ...mockEngine,
+        getLoadedModels: vi.fn().mockResolvedValue(['gemma']),
+        getTokensCount,
+      })
+
+      // llama-server drops a trailing assistant message as a prefill, so
+      // the chat template would see no messages at all.
+      expect(
+        await modelsService.getTokensCount('gemma', [
+          message('assistant', 'The answer.'),
+        ])
+      ).toBe(0)
+      expect(getTokensCount).not.toHaveBeenCalled()
+
+      expect(
+        await modelsService.getTokensCount('gemma', [
+          message('user', 'Question?'),
+          message('assistant', 'The answer.'),
+        ])
+      ).toBe(42)
+      expect(getTokensCount).toHaveBeenCalledTimes(1)
     })
   })
 
@@ -315,7 +429,7 @@ describe('DefaultModelsService', () => {
     it('should stop all active models from all providers', async () => {
       const mockActiveModels = ['model1', 'model2']
       const engines = {
-        llamacpp: {
+        'llamacpp': {
           ...mockEngine,
           getLoadedModels: vi.fn().mockResolvedValue(mockActiveModels),
           unload: vi.fn(),
@@ -325,7 +439,7 @@ describe('DefaultModelsService', () => {
           getLoadedModels: vi.fn().mockResolvedValue(mockActiveModels),
           unload: vi.fn(),
         },
-        mlx: {
+        'mlx': {
           ...mockEngine,
           getLoadedModels: vi.fn().mockResolvedValue(mockActiveModels),
           unload: vi.fn(),
@@ -344,12 +458,112 @@ describe('DefaultModelsService', () => {
       }
     })
 
+    // The provider page's Stop runs `stopAllModels` and then redraws from
+    // `getActiveModels()`; an engine missing from both left a TensorRT-LLM
+    // model running while its row said stopped (task 3.14, F-9).
+    it('stops a TensorRT-LLM model by its full id and counts it as active until then', async () => {
+      let loaded = ['Qwen/Qwen3-1.7B']
+      const tensorrt = {
+        ...mockEngine,
+        getLoadedModels: vi.fn(async () => loaded),
+        unload: vi.fn(async () => {
+          loaded = []
+          return { success: true }
+        }),
+      }
+      const idle = {
+        ...mockEngine,
+        getLoadedModels: vi.fn().mockResolvedValue([]),
+        unload: vi.fn(),
+      }
+      mockEngineManager.get.mockImplementation((provider: string) =>
+        provider === 'tensorrt-llm' ? tensorrt : idle
+      )
+
+      expect(await modelsService.getActiveModels()).toEqual(['Qwen/Qwen3-1.7B'])
+
+      await modelsService.stopAllModels()
+
+      expect(tensorrt.unload).toHaveBeenCalledTimes(1)
+      expect(tensorrt.unload).toHaveBeenCalledWith('Qwen/Qwen3-1.7B')
+      expect(idle.unload).not.toHaveBeenCalled()
+      expect(await modelsService.getActiveModels()).toEqual([])
+    })
+
+    // change add-foundry-local: the composer's status dot and Stop read `getActiveModels()`; a
+    // Foundry Local variant missing from it showed a loaded model as not loaded.
+    it('counts a loaded Foundry Local variant as active and stops it', async () => {
+      let loaded = ['qwen3.5-0.8b-generic-gpu']
+      const foundry = {
+        ...mockEngine,
+        getLoadedModels: vi.fn(async () => loaded),
+        unload: vi.fn(async () => {
+          loaded = []
+          return { success: true }
+        }),
+      }
+      const idle = {
+        ...mockEngine,
+        getLoadedModels: vi.fn().mockResolvedValue([]),
+        unload: vi.fn(),
+      }
+      mockEngineManager.get.mockImplementation((provider: string) =>
+        provider === 'foundry-local' ? foundry : idle
+      )
+
+      expect(await modelsService.getActiveModels()).toEqual(['qwen3.5-0.8b-generic-gpu'])
+
+      await modelsService.stopAllModels()
+
+      expect(foundry.unload).toHaveBeenCalledWith('qwen3.5-0.8b-generic-gpu')
+      expect(await modelsService.getActiveModels()).toEqual([])
+    })
+
     it('should handle empty active models', async () => {
       mockEngine.getLoadedModels.mockResolvedValue(null)
 
       await modelsService.stopAllModels()
 
       expect(mockEngine.unload).not.toHaveBeenCalled()
+    })
+  })
+
+  describe('stopAllModelsExcept', () => {
+    it('unloads every local model except the kept (provider, model) pair', async () => {
+      const engines = {
+        'llamacpp': {
+          ...mockEngine,
+          getLoadedModels: vi.fn().mockResolvedValue(['shared-model']),
+          unload: vi.fn(),
+        },
+        'llamacpp-upstream': {
+          ...mockEngine,
+          getLoadedModels: vi
+            .fn()
+            .mockResolvedValue(['shared-model', 'other-model']),
+          unload: vi.fn(),
+        },
+        'mlx': {
+          ...mockEngine,
+          getLoadedModels: vi.fn().mockResolvedValue([]),
+          unload: vi.fn(),
+        },
+      }
+      mockEngineManager.get.mockImplementation(
+        (provider: keyof typeof engines) => engines[provider]
+      )
+
+      await modelsService.stopAllModelsExcept(
+        'shared-model',
+        'llamacpp-upstream'
+      )
+
+      expect(engines['llamacpp'].unload).toHaveBeenCalledWith('shared-model')
+      expect(engines['llamacpp-upstream'].unload).toHaveBeenCalledTimes(1)
+      expect(engines['llamacpp-upstream'].unload).toHaveBeenCalledWith(
+        'other-model'
+      )
+      expect(engines['mlx'].unload).not.toHaveBeenCalled()
     })
   })
 
@@ -381,7 +595,8 @@ describe('DefaultModelsService', () => {
           n_gpu_layers: 32,
         },
         false,
-        false
+        false,
+        undefined
       )
     })
 
@@ -921,6 +1136,8 @@ describe('DefaultModelsService', () => {
         num_safetensors: 0,
         is_mlx: true,
         created_at: '2021-01-01T00:00:00Z',
+        likes: 75,
+        last_modified: '2021-12-01T00:00:00Z',
         readme:
           'https://huggingface.co/microsoft/DialoGPT-medium/resolve/main/README.md',
       }
@@ -1266,5 +1483,239 @@ describe('DefaultModelsService', () => {
 
       expect(result).toBe('GREY')
     })
+  })
+})
+
+describe('listHuggingFaceFeed', () => {
+  const service = new DefaultModelsService()
+
+  it('asks Hugging Face for one page of a format in its order and reads the next cursor', async () => {
+    ;(global.fetch as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
+      ok: true,
+      headers: {
+        get: (name: string) =>
+          name.toLowerCase() === 'link'
+            ? '<https://huggingface.co/api/models?filter=gguf&sort=trendingScore&direction=-1&limit=50&cursor=eyJfaWQiOjF9>; rel="next"'
+            : null,
+      },
+      json: async () => [
+        {
+          id: 'bartowski/Llama-4-8B-GGUF',
+          downloads: 1200,
+          likes: 34,
+          tags: ['gguf', 'llama'],
+          createdAt: '2026-09-01T00:00:00.000Z',
+          lastModified: '2026-09-10T00:00:00.000Z',
+        },
+      ],
+    })
+
+    const page = await service.listHuggingFaceFeed({
+      format: 'gguf',
+      sort: 'trending',
+      cursor: null,
+    })
+
+    expect(fetch).toHaveBeenCalledWith(
+      'https://huggingface.co/api/models?filter=gguf&sort=trendingScore&direction=-1&limit=50',
+      { headers: undefined }
+    )
+    expect(page.nextCursor).toBe('eyJfaWQiOjF9')
+    expect(page.models).toHaveLength(1)
+    expect(page.models[0]).toMatchObject({
+      model_name: 'bartowski/Llama-4-8B-GGUF',
+      developer: 'bartowski',
+      downloads: 1200,
+      likes: 34,
+      is_mlx: false,
+      last_modified: '2026-09-10T00:00:00.000Z',
+      num_quants: 0,
+    })
+  })
+
+  it('passes the cursor on, sends the token, and ends the listing without a next link', async () => {
+    ;(global.fetch as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
+      ok: true,
+      headers: { get: () => null },
+      json: async () => [
+        { id: 'mlx-community/Qwen3.5-4B-4bit', tags: ['mlx'] },
+      ],
+    })
+
+    const page = await service.listHuggingFaceFeed({
+      format: 'mlx',
+      sort: 'downloads',
+      search: 'uncensored',
+      cursor: 'abc',
+      limit: 20,
+      hfToken: 'hf_test',
+    })
+
+    expect(fetch).toHaveBeenCalledWith(
+      'https://huggingface.co/api/models?filter=mlx&sort=downloads&direction=-1&limit=20&search=uncensored&cursor=abc',
+      { headers: { Authorization: 'Bearer hf_test' } }
+    )
+    expect(page.nextCursor).toBeNull()
+    expect(page.models[0]).toMatchObject({
+      model_name: 'mlx-community/Qwen3.5-4B-4bit',
+      is_mlx: true,
+    })
+  })
+
+  it('parses the next cursor out of a Link header, and only from rel=next', () => {
+    expect(
+      parseHuggingFaceNextCursor(
+        '<https://huggingface.co/api/models?cursor=one>; rel="prev", <https://huggingface.co/api/models?cursor=two>; rel="next"'
+      )
+    ).toBe('two')
+    expect(
+      parseHuggingFaceNextCursor('<https://x/?cursor=one>; rel="prev"')
+    ).toBeNull()
+    expect(parseHuggingFaceNextCursor(null)).toBeNull()
+  })
+})
+
+describe('Hugging Face search formats', () => {
+  it.each(['gguf', 'mlx'] as const)(
+    'returns only %s candidates with their format',
+    async (format) => {
+      vi.mocked(fetch).mockResolvedValueOnce({
+        ok: true,
+        json: async () => [
+          { id: 'community/Qwen-Mixed', tags: ['gguf', 'mlx'] },
+          { id: 'community/Qwen-GGUF', tags: ['gguf'] },
+          { id: 'mlx-community/Qwen-4bit', tags: ['mlx'] },
+          { id: 'upstream/Qwen', tags: ['transformers'] },
+        ],
+      } as Response)
+      const result =
+        await new DefaultModelsService().searchHuggingFaceCandidates(
+          'Qwen',
+          undefined,
+          6,
+          format
+        )
+      expect(result.map((m) => [m.model_name, m.is_mlx]).sort()).toEqual(
+        format === 'mlx'
+          ? [
+              ['community/Qwen-Mixed', true],
+              ['mlx-community/Qwen-4bit', true],
+            ]
+          : [
+              ['community/Qwen-GGUF', false],
+              ['community/Qwen-Mixed', false],
+            ]
+      )
+      const url = new URL(String(vi.mocked(fetch).mock.calls.at(-1)?.[0]))
+      expect(url.searchParams.get('filter')).toBe(format)
+      expect(url.searchParams.get('search')).toBe('Qwen')
+    }
+  )
+})
+
+describe('Hugging Face for the TensorRT-LLM format', () => {
+  // `/api/models?expand[]=config&expand[]=safetensors` as Hugging Face answers it (trimmed):
+  // an NVFP4 checkpoint keeps its packed weights as U8 and its scales as F8_E4M3.
+  const listing = [
+    {
+      id: 'nvidia/Qwen3.5-35B-A3B-NVFP4',
+      downloads: 5400,
+      likes: 120,
+      tags: ['safetensors', 'qwen3_5', 'image-text-to-text', 'modelopt'],
+      createdAt: '2026-09-01T00:00:00.000Z',
+      lastModified: '2026-09-20T00:00:00.000Z',
+      config: {
+        architectures: ['Qwen3_5ForConditionalGeneration'],
+        model_type: 'qwen3_5',
+      },
+      safetensors: {
+        parameters: { U8: 9_000_000_000, F8_E4M3: 1_100_000_000, BF16: 2_000_000_000 },
+        total: 12_100_000_000,
+      },
+    },
+    // No `config.json` in the listing: kept as is, the prefilter decides.
+    { id: 'someone/raw-weights', downloads: 3, tags: ['safetensors'] },
+  ]
+
+  const expectTensorrtQuery = (url: URL) => {
+    expect(url.searchParams.get('filter')).toBe('safetensors')
+    expect(url.searchParams.getAll('expand[]')).toEqual(
+      expect.arrayContaining([
+        'config',
+        'safetensors',
+        'downloads',
+        'likes',
+        'tags',
+        'createdAt',
+        'lastModified',
+      ])
+    )
+    // New Qwen and Gemma 4 checkpoints are `image-text-to-text`: no pipeline filter.
+    expect(url.searchParams.has('pipeline_tag')).toBe(false)
+  }
+
+  it('lists safetensors repositories with their architectures and parameters by dtype', async () => {
+    vi.mocked(fetch).mockResolvedValueOnce({
+      ok: true,
+      headers: { get: () => null },
+      json: async () => listing,
+    } as unknown as Response)
+
+    const page = await new DefaultModelsService().listHuggingFaceFeed({
+      format: 'safetensors',
+      sort: 'trending',
+      cursor: null,
+    })
+
+    const url = new URL(String(vi.mocked(fetch).mock.calls.at(-1)?.[0]))
+    expectTensorrtQuery(url)
+    expect(url.searchParams.get('sort')).toBe('trendingScore')
+    expect(page.models[0]).toMatchObject({
+      model_name: 'nvidia/Qwen3.5-35B-A3B-NVFP4',
+      developer: 'nvidia',
+      downloads: 5400,
+      likes: 120,
+      is_mlx: false,
+      is_managed: true,
+      last_modified: '2026-09-20T00:00:00.000Z',
+      managed: {
+        architectures: ['Qwen3_5ForConditionalGeneration'],
+        parameters: { U8: 9_000_000_000, F8_E4M3: 1_100_000_000, BF16: 2_000_000_000 },
+      },
+    })
+    expect(page.models[1]).toMatchObject({
+      model_name: 'someone/raw-weights',
+      is_managed: true,
+      managed: { architectures: undefined, parameters: undefined },
+    })
+  })
+
+  it('searches the same way, every safetensors repository a candidate', async () => {
+    vi.mocked(fetch).mockResolvedValueOnce({
+      ok: true,
+      json: async () => listing,
+    } as Response)
+
+    const result = await new DefaultModelsService().searchHuggingFaceCandidates(
+      'Qwen3.5',
+      'hf_test',
+      10,
+      'safetensors'
+    )
+
+    const [requested, init] = vi.mocked(fetch).mock.calls.at(-1)!
+    const url = new URL(String(requested))
+    expectTensorrtQuery(url)
+    expect(url.searchParams.get('search')).toBe('Qwen3.5')
+    expect(init).toEqual({ headers: { Authorization: 'Bearer hf_test' } })
+    expect(result.map((model) => model.model_name).sort()).toEqual([
+      'nvidia/Qwen3.5-35B-A3B-NVFP4',
+      'someone/raw-weights',
+    ])
+    expect(result.every((model) => model.is_managed && !model.is_mlx)).toBe(true)
+    expect(
+      result.find((model) => model.model_name === 'nvidia/Qwen3.5-35B-A3B-NVFP4')?.managed
+        ?.architectures
+    ).toEqual(['Qwen3_5ForConditionalGeneration'])
   })
 })

@@ -3,19 +3,16 @@ import {
   getBackendDir,
   getBackendExePath,
   isBackendInstalled,
-  fetchRemoteBackends,
-  getBackendDownloadUrl,
-  TURBOQUANT_BACKEND_MANIFEST_REVISION,
-  TURBOQUANT_BACKEND_MANIFEST_URL,
+  assertDeletableBackendPack,
+  isTurboQuantRelease,
+  isStableReleaseTag,
+  compareBackendVersions,
+  satisfiesMinAppVersion,
+  defaultAssetName,
+  mergeBackendOptions,
 } from '../backend'
-import { getSystemInfo } from '../hardware'
-import { fetch as tauriFetch } from '@tauri-apps/plugin-http'
 import { fs, getJanDataFolderPath } from '@janhq/core'
-import {
-  determineSupportedBackends,
-  getSupportedFeaturesFromRust,
-  normalizeFeatures,
-} from '../../../../src-tauri/plugins/tauri-plugin-llamacpp/guest-js/index'
+import type { CoreBackendCatalog } from '../adapter/coreRuntime'
 
 // Mock constants: Hardcode path string directly inside the mock to avoid hoisting issues
 const MOCK_JAN_PATH_STRING = '/path/to/jan'
@@ -26,6 +23,8 @@ vi.mock('@janhq/core', () => ({
   fs: {
     existsSync: vi.fn(),
     readdirSync: vi.fn().mockResolvedValue([]),
+    readFileSync: vi.fn().mockResolvedValue(''),
+    writeFileSync: vi.fn().mockResolvedValue(undefined),
     rm: vi.fn().mockResolvedValue(undefined),
   },
   joinPath: vi.fn(async (paths: string[]) => paths.join('/')),
@@ -33,14 +32,15 @@ vi.mock('@janhq/core', () => ({
     emit: vi.fn(),
   },
 }))
-vi.mock('../hardware', () => ({
-  getSystemInfo: vi.fn(),
-}))
-vi.mock('@tauri-apps/plugin-http', () => ({
-  fetch: vi.fn(),
+vi.mock('@tauri-apps/api/app', () => ({
+  getVersion: vi.fn().mockResolvedValue('1.0.0'),
 }))
 vi.mock('../util', () => ({
   getProxyConfig: vi.fn(() => undefined),
+}))
+// The catalog comes from the core (ADR 2026-09-27); nothing here fetches an index.
+vi.mock('../adapter/coreRuntime', () => ({
+  getBackendCatalog: vi.fn(),
 }))
 vi.mock(
   '../../../../src-tauri/plugins/tauri-plugin-llamacpp/guest-js/index',
@@ -50,9 +50,7 @@ vi.mock(
     >('../../../../src-tauri/plugins/tauri-plugin-llamacpp/guest-js/index')
     return {
       ...actual,
-      determineSupportedBackends: vi.fn(),
-      getSupportedFeaturesFromRust: vi.fn(),
-      normalizeFeatures: vi.fn((features) => features),
+      getLocalInstalledBackendsInternal: vi.fn(),
     }
   }
 )
@@ -64,15 +62,6 @@ describe('Backend functions', () => {
     vi.clearAllMocks()
     // Mock getJanDataFolderPath explicitly to a simple path
     vi.mocked(getJanDataFolderPath).mockResolvedValue('/path/to/jan')
-
-    vi.mocked(getSystemInfo).mockResolvedValue({
-      os_type: 'linux',
-      cpu: {
-        arch: 'x86_64',
-        extensions: [],
-      },
-      gpus: [],
-    } as any)
 
     // Default mock for isBackendInstalled dependencies
     vi.mocked(fs.existsSync).mockImplementation(async (path: string) => {
@@ -234,148 +223,428 @@ describe('Backend functions', () => {
     })
   })
 
-  describe('getBackendDownloadUrl (TurboQuant manifest)', () => {
+  describe('TurboQuant asset names', () => {
     afterEach(() => {
       vi.stubGlobal('IS_WINDOWS', false)
     })
 
-    it('resolves to the AtomicBot-ai releases CDN, never api.github.com', () => {
-      vi.stubGlobal('IS_WINDOWS', true)
-      const url = getBackendDownloadUrl(
-        'turboquant-windows-x64-cuda-12.4-d86eb0b',
-        'windows-x64-cuda-12.4'
-      )
-      expect(url).not.toContain('api.github.com')
-      expect(url).toContain(
-        'github.com/AtomicBot-ai/atomic-llama-cpp-turboquant/releases/download'
-      )
-    })
-
-    it('pins the backend index to an immutable atomic-chat-conf revision', () => {
-      expect(TURBOQUANT_BACKEND_MANIFEST_REVISION).toMatch(/^[0-9a-f]{40}$/)
-      expect(TURBOQUANT_BACKEND_MANIFEST_URL).toContain(
-        `/atomic-chat-conf/${TURBOQUANT_BACKEND_MANIFEST_REVISION}/`
-      )
-      expect(TURBOQUANT_BACKEND_MANIFEST_URL).not.toContain('/main/')
-    })
-
-    it('uses the per-backend manifest tag verbatim + .zip on Windows', () => {
-      vi.stubGlobal('IS_WINDOWS', true)
-      const url = getBackendDownloadUrl(
-        'turboquant-windows-x64-cpu-d86eb0b',
-        'windows-x64-cpu'
-      )
-      expect(url).toBe(
-        'https://github.com/AtomicBot-ai/atomic-llama-cpp-turboquant/releases/download/turboquant-windows-x64-cpu-d86eb0b/llama-turboquant-windows-x64-cpu.zip'
-      )
-    })
-
-    it('uses .tar.gz on Linux with the per-backend tag', () => {
+    it('derives the archive extension from the backend id, not the host', () => {
       vi.stubGlobal('IS_WINDOWS', false)
-      const url = getBackendDownloadUrl(
-        'turboquant-linux-x64-vulkan-d86eb0b',
-        'linux-x64-vulkan'
+      expect(defaultAssetName('windows-x64-cuda-13.3')).toBe(
+        'llama-turboquant-windows-x64-cuda-13.3.zip'
       )
-      expect(url).toBe(
-        'https://github.com/AtomicBot-ai/atomic-llama-cpp-turboquant/releases/download/turboquant-linux-x64-vulkan-d86eb0b/llama-turboquant-linux-x64-vulkan.tar.gz'
+      expect(defaultAssetName('macos-arm64')).toBe(
+        'llama-turboquant-macos-arm64.tar.gz'
       )
     })
   })
 })
 
-describe('fetchRemoteBackends (TurboQuant manifest)', () => {
-  const manifest = {
-    commit: '61ee3eb',
-    backends: [
+describe('isTurboQuantRelease', () => {
+  it('accepts both the unified tag and the legacy per-backend tags', () => {
+    expect(isTurboQuantRelease('b10018-1.3.0')).toBe(true)
+    expect(isTurboQuantRelease('b10018-1.3.0/linux-x64-rocm')).toBe(true)
+    expect(isTurboQuantRelease('turboquant-linux-x64-vulkan-d86eb0b')).toBe(
+      true
+    )
+  })
+
+  it('rejects stock upstream builds so fork-only flags stay contained', () => {
+    expect(isTurboQuantRelease('b10018')).toBe(false)
+    expect(isTurboQuantRelease('b10205/win-cuda-13.3-x64')).toBe(false)
+    expect(isTurboQuantRelease('')).toBe(false)
+  })
+})
+
+describe('assertDeletableBackendPack', () => {
+  it('returns the cleaned ids of a build that is not selected', () => {
+    expect(
+      assertDeletableBackendPack(
+        'b10018-1.3.0/windows-x64-cpu',
+        '﻿b9937-1.2.0 ',
+        ' windows-x64-cuda-13.3'
+      )
+    ).toEqual({ version: 'b9937-1.2.0', backend: 'windows-x64-cuda-13.3' })
+  })
+
+  it('refuses the selected build, whatever BOM or whitespace it carries', () => {
+    expect(() =>
+      assertDeletableBackendPack(
+        '﻿b10018-1.3.0/windows-x64-cpu',
+        'b10018-1.3.0',
+        'windows-x64-cpu '
+      )
+    ).toThrow('Cannot remove the backend that is currently selected')
+  })
+
+  it('refuses ids that could leave the pack directory', () => {
+    for (const [version, backend] of [
+      ['', 'windows-x64-cpu'],
+      ['b10018-1.3.0', '  '],
+      ['../b10018', 'windows-x64-cpu'],
+      ['b10018-1.3.0', 'windows\\x64'],
+      ['..', 'windows-x64-cpu'],
+      ['b10018-1.3.0', '.'],
+    ]) {
+      expect(() => assertDeletableBackendPack('', version, backend)).toThrow(
+        'Invalid backend pack'
+      )
+    }
+  })
+})
+
+describe('stable release tags', () => {
+  it('accepts only the unified release scheme', () => {
+    expect(isStableReleaseTag('b10269-1.4.0')).toBe(true)
+    expect(isStableReleaseTag('b10269-1.4.0/linux-x64-rocm')).toBe(true)
+    expect(isStableReleaseTag('﻿ b10269-1.4.0 ')).toBe(true)
+  })
+
+  it('rejects prereleases, including the legacy per-variant tags', () => {
+    expect(isStableReleaseTag('turboquant-linux-x64-vulkan-d86eb0b')).toBe(
+      false
+    )
+    expect(isStableReleaseTag('dev-latest')).toBe(false)
+    expect(isStableReleaseTag('b10205')).toBe(false)
+    expect(isStableReleaseTag('')).toBe(false)
+    // Reached with an absent `config.version_backend` on a fresh profile.
+    expect(isStableReleaseTag(undefined as unknown as string)).toBe(false)
+    expect(
+      compareBackendVersions(
+        undefined as unknown as string,
+        undefined as unknown as string
+      )
+    ).toBe(0)
+  })
+
+  it('orders releases by build then fork semver, stable over legacy', () => {
+    // b9937 < b10018 numerically, which string ordering gets backwards.
+    expect(
+      compareBackendVersions('b10018-1.3.0', 'b9937-1.2.0')
+    ).toBeGreaterThan(0)
+    expect(
+      compareBackendVersions('b10269-1.4.0', 'b10269-1.3.9')
+    ).toBeGreaterThan(0)
+    expect(compareBackendVersions('b10018-1.3.0', 'b10018-1.3.0')).toBe(0)
+    expect(
+      compareBackendVersions('b10018-1.3.0', 'turboquant-macos-arm64-e3dad20')
+    ).toBeGreaterThan(0)
+    // Two legacy SHAs carry no order at all — neither supersedes the other.
+    expect(
+      compareBackendVersions(
+        'turboquant-macos-arm64-e3dad20',
+        'turboquant-macos-arm64-18a8ef1'
+      )
+    ).toBe(0)
+  })
+})
+
+// Kept for callers that still hold a reference; the core applies the gate.
+describe('satisfiesMinAppVersion', () => {
+  it('lets a new enough app through and holds an old one back', () => {
+    expect(satisfiesMinAppVersion('1.2.0', '1.3.0')).toBe(true)
+    expect(satisfiesMinAppVersion('1.2.0', '1.2.0')).toBe(true)
+    expect(satisfiesMinAppVersion('1.3.0', '1.2.9')).toBe(false)
+    expect(satisfiesMinAppVersion('1.3.0', '1.3.0-beta.2')).toBe(true)
+  })
+
+  it('passes when the requirement or the app version is unknown', () => {
+    expect(satisfiesMinAppVersion(undefined, '1.0.0')).toBe(true)
+    expect(satisfiesMinAppVersion('not-a-version', '1.0.0')).toBe(true)
+    expect(satisfiesMinAppVersion('9.9.9', null)).toBe(true)
+  })
+})
+
+/// The release index, the hardware gate and the merge with what is on disk
+/// moved to the core (ADR 2026-09-27) and are tested there; this side only
+/// has to hand the core's catalog out under the names the extension already
+/// used, and ask once.
+describe('catalog wrappers over the core', () => {
+  const LATEST = 'b10269-1.4.0'
+  const PREVIOUS = 'b10018-1.3.0'
+
+  const CATALOG: CoreBackendCatalog = {
+    provider: 'llamacpp',
+    os_type: 'linux',
+    arch_suffix: 'x64',
+    hardware_source: 'probe',
+    features: { vulkan: true },
+    supported_backends: ['linux-x64-cpu', 'linux-x64-vulkan'],
+    remote: [
+      { version: LATEST, backend: 'linux-x64-cpu', order: 0 },
+      { version: LATEST, backend: 'linux-x64-vulkan', order: 0 },
+      { version: PREVIOUS, backend: 'linux-x64-vulkan', order: 0 },
+    ],
+    installed: [
+      { version: 'turboquant-linux-x64-vulkan-d86eb0b', backend: 'linux', order: 1 },
+    ],
+    available: [
+      { version: LATEST, backend: 'linux-x64-vulkan', order: 0 },
+      { version: LATEST, backend: 'linux-x64-cpu', order: 0 },
+      { version: PREVIOUS, backend: 'linux-x64-vulkan', order: 0 },
+      { version: 'turboquant-linux-x64-vulkan-d86eb0b', backend: 'linux', order: 1 },
+    ],
+    recommended: `${LATEST}/linux-x64-vulkan`,
+    recommended_installed: 'turboquant-linux-x64-vulkan-d86eb0b/linux',
+    latest_by_type: {
+      'linux-x64-vulkan': `${LATEST}/linux-x64-vulkan`,
+      'linux-x64-cpu': `${LATEST}/linux-x64-cpu`,
+    },
+    static_variants: [],
+    source: 'index',
+    releases: [
       {
-        id: 'windows-x64-cpu',
-        tag: 'turboquant-windows-x64-cpu-61ee3eb',
-        asset: 'llama-turboquant-windows-x64-cpu.zip',
+        tag: LATEST,
+        title: `TurboQuant ${LATEST}`,
+        highlights: ['DeepSeek V4 Flash support'],
+        variants: [
+          {
+            id: 'linux-x64-vulkan',
+            asset: 'llama-turboquant-linux-x64-vulkan.tar.gz',
+            size: 120_000_000,
+          },
+          { id: 'linux-x64-cpu', asset: 'llama-turboquant-linux-x64-cpu.tar.gz' },
+        ],
       },
       {
-        id: 'windows-x64-cuda-13.3',
-        tag: 'turboquant-windows-x64-cuda-13.3-61ee3eb',
-        asset: 'llama-turboquant-windows-x64-cuda-13.3.zip',
-      },
-      {
-        id: 'linux-x64-vulkan',
-        tag: 'turboquant-linux-x64-vulkan-61ee3eb',
-        asset: 'llama-turboquant-linux-x64-vulkan.tar.gz',
+        tag: PREVIOUS,
+        variants: [
+          {
+            id: 'linux-x64-vulkan',
+            asset: 'llama-turboquant-linux-x64-vulkan.tar.gz',
+            size: 0,
+          },
+        ],
       },
     ],
   }
-  const okResponse = {
-    ok: true,
-    status: 200,
-    json: async () => manifest,
-  } as Response
 
-  beforeEach(() => {
-    vi.clearAllMocks()
-    vi.stubGlobal('fetch', vi.fn())
-    vi.mocked(getSupportedFeaturesFromRust).mockResolvedValue({} as any)
-    vi.mocked(normalizeFeatures).mockImplementation(
-      (features) => features as any
-    )
-    vi.mocked(globalThis.fetch).mockResolvedValue(okResponse)
-    vi.mocked(tauriFetch).mockResolvedValue(okResponse)
+  type BackendModule = typeof import('../backend')
+  let backend: BackendModule
+  let getBackendCatalog: ReturnType<typeof vi.fn>
+
+  // The module memoizes the catalog, so every test starts from a cold module.
+  beforeEach(async () => {
+    vi.resetModules()
+    backend = await import('../backend')
+    const adapter = await import('../adapter/coreRuntime')
+    getBackendCatalog = vi.mocked(adapter.getBackendCatalog) as unknown as ReturnType<typeof vi.fn>
+    getBackendCatalog.mockReset()
+    getBackendCatalog.mockResolvedValue(CATALOG)
+    // Earlier suites restore every mock, which strips the factory's answer.
+    const { getVersion } = await import('@tauri-apps/api/app')
+    vi.mocked(getVersion).mockResolvedValue('1.0.0')
   })
 
   afterEach(() => {
     vi.restoreAllMocks()
-    vi.unstubAllGlobals()
-    vi.stubGlobal('IS_WINDOWS', false)
   })
 
-  it('returns only manifest entries supported by Windows hardware', async () => {
-    vi.mocked(getSystemInfo).mockResolvedValue({
-      os_type: 'windows',
-      cpu: { arch: 'x86_64', extensions: [] },
-      gpus: [],
-    } as any)
-    vi.mocked(determineSupportedBackends).mockResolvedValue([
-      'windows-x64-cpu',
-      'windows-x64-cuda-13.3',
-    ])
+  it('asks the core with the app version, no proxy and no force by default', async () => {
+    const catalog = await backend.loadCatalog()
 
-    await expect(fetchRemoteBackends()).resolves.toEqual([
+    expect(catalog).toEqual(CATALOG)
+    expect(getBackendCatalog).toHaveBeenCalledTimes(1)
+    expect(getBackendCatalog).toHaveBeenCalledWith({
+      app_version: '1.0.0',
+      proxy: null,
+      force: false,
+    })
+  })
+
+  it('fetchStableIndex reflects the releases the core resolved, newest first', async () => {
+    await expect(backend.fetchStableIndex()).resolves.toEqual({
+      latest: LATEST,
+      releases: CATALOG.releases,
+      source: 'index',
+    })
+  })
+
+  it('fetchRemoteBackends is the remote list, listSupportedBackends the available one', async () => {
+    await expect(backend.fetchRemoteBackends()).resolves.toEqual(CATALOG.remote)
+    await expect(backend.listSupportedBackends()).resolves.toEqual(
+      CATALOG.available
+    )
+    // Three readers, one question.
+    expect(getBackendCatalog).toHaveBeenCalledTimes(1)
+  })
+
+  it('memoizes the answer until something asks to force', async () => {
+    await backend.fetchStableIndex()
+    await backend.listSupportedBackends()
+    expect(getBackendCatalog).toHaveBeenCalledTimes(1)
+
+    await backend.listSupportedBackends({ force: true })
+    expect(getBackendCatalog).toHaveBeenCalledTimes(2)
+    expect(getBackendCatalog).toHaveBeenLastCalledWith(
+      expect.objectContaining({ force: true })
+    )
+
+    // An explicit invalidation forces the next read, and only that one.
+    backend.invalidateStableIndexCache()
+    expect(backend.catalogSnapshot()).toBeNull()
+    await backend.fetchRemoteBackends()
+    await backend.fetchRemoteBackends()
+    expect(getBackendCatalog).toHaveBeenCalledTimes(3)
+    expect(getBackendCatalog).toHaveBeenLastCalledWith(
+      expect.objectContaining({ force: true })
+    )
+  })
+
+  it('asks the core again on refresh without forcing a refetch of the release index', async () => {
+    // A backend installed from a file never passes through the core; only a new answer sees it.
+    await backend.loadCatalog()
+    await backend.loadCatalog({ refresh: true })
+    expect(getBackendCatalog).toHaveBeenCalledTimes(2)
+    expect(getBackendCatalog).toHaveBeenLastCalledWith(
+      expect.objectContaining({ force: false })
+    )
+    await backend.loadCatalog()
+    expect(getBackendCatalog).toHaveBeenCalledTimes(2)
+  })
+
+  it('shares one in-flight request between concurrent readers', async () => {
+    let release!: (catalog: CoreBackendCatalog) => void
+    getBackendCatalog.mockReturnValue(
+      new Promise<CoreBackendCatalog>((resolve) => {
+        release = resolve
+      })
+    )
+
+    const pending = Promise.all([
+      backend.fetchStableIndex(),
+      backend.fetchRemoteBackends(),
+      backend.listSupportedBackends(),
+    ])
+    release(CATALOG)
+    const [index, remote, available] = await pending
+
+    expect(getBackendCatalog).toHaveBeenCalledTimes(1)
+    expect(index.latest).toBe(LATEST)
+    expect(remote).toEqual(CATALOG.remote)
+    expect(available).toEqual(CATALOG.available)
+  })
+
+  it('reads asset names off the memoized catalog', async () => {
+    // Cold: no catalog yet, so the naming convention takes over upstream.
+    expect(
+      backend.getIndexedAssetName(LATEST, 'linux-x64-vulkan')
+    ).toBeUndefined()
+
+    await backend.loadCatalog()
+
+    expect(backend.getIndexedAssetName(`﻿${LATEST} `, 'linux-x64-vulkan')).toBe(
+      'llama-turboquant-linux-x64-vulkan.tar.gz'
+    )
+    expect(backend.getIndexedAssetName(LATEST, 'linux-x64-rocm')).toBeUndefined()
+  })
+
+  it('treats a core without a release index as an empty one', async () => {
+    getBackendCatalog.mockResolvedValue({
+      ...CATALOG,
+      releases: undefined,
+      source: 'none',
+    })
+
+    await expect(backend.fetchStableIndex()).resolves.toEqual({
+      latest: null,
+      releases: [],
+      source: 'none',
+    })
+  })
+
+  describe('when the core does not answer', () => {
+    beforeEach(() => {
+      getBackendCatalog.mockRejectedValue(new Error('core unreachable'))
+    })
+
+    it('fetchStableIndex and fetchRemoteBackends fall back to local backends only', async () => {
+      await expect(backend.fetchStableIndex()).resolves.toEqual({
+        latest: null,
+        releases: [],
+        source: 'none',
+      })
+      await expect(backend.fetchRemoteBackends()).resolves.toEqual([])
+    })
+
+    it('listSupportedBackends throws so configureBackends can keep the bundled build', async () => {
+      await expect(backend.listSupportedBackends()).rejects.toThrow(
+        'core unreachable'
+      )
+      expect(backend.catalogSnapshot()).toBeNull()
+    })
+
+    it('asks again on the next read instead of caching the failure', async () => {
+      await backend.fetchRemoteBackends()
+      getBackendCatalog.mockResolvedValue(CATALOG)
+
+      await expect(backend.fetchRemoteBackends()).resolves.toEqual(CATALOG.remote)
+      expect(getBackendCatalog).toHaveBeenCalledTimes(2)
+    })
+  })
+})
+
+describe('mergeBackendOptions', () => {
+  const catalog = [
+    { value: 'b10269-1.5.1/macos-arm64', name: 'Apple Silicon · 1.5.1' },
+    { value: 'b10269-1.5.0/macos-arm64', name: 'Apple Silicon · 1.5.0' },
+  ]
+
+  // A prerelease build that left the stable index still runs, so hiding it
+  // would mean the dropdown lists fewer versions than the packs dialog does.
+  it('keeps an installed build the release index no longer carries', () => {
+    const installed = [
       {
-        version: 'turboquant-windows-x64-cpu-61ee3eb',
-        backend: 'windows-x64-cpu',
-        order: 0,
+        value: 'turboquant-macos-arm64-d785414/macos-arm64',
+        name: 'Apple Silicon · d785414 — installed locally',
       },
+    ]
+
+    expect(
+      mergeBackendOptions([catalog, installed]).map((o) => o.value)
+    ).toEqual([
+      'b10269-1.5.1/macos-arm64',
+      'b10269-1.5.0/macos-arm64',
+      'turboquant-macos-arm64-d785414/macos-arm64',
+    ])
+  })
+
+  it('keeps the catalog label when a build is also installed', () => {
+    const installed = [
       {
-        version: 'turboquant-windows-x64-cuda-13.3-61ee3eb',
-        backend: 'windows-x64-cuda-13.3',
-        order: 0,
+        value: 'b10269-1.5.1/macos-arm64',
+        name: 'Apple Silicon · 1.5.1 — installed locally',
       },
+    ]
+
+    const merged = mergeBackendOptions([catalog, installed])
+    expect(merged.map((o) => o.name)).toEqual([
+      'Apple Silicon · 1.5.1',
+      'Apple Silicon · 1.5.0',
     ])
   })
 
-  it('returns local-only fallback when every manifest transport fails', async () => {
-    vi.mocked(getSystemInfo).mockResolvedValue({
-      os_type: 'linux',
-      cpu: { arch: 'x86_64', extensions: [] },
-      gpus: [],
-    } as any)
-    vi.mocked(determineSupportedBackends).mockResolvedValue([
-      'linux-x64-vulkan',
-    ])
-    vi.mocked(globalThis.fetch).mockRejectedValue(new Error('offline'))
-    vi.mocked(tauriFetch).mockRejectedValue(new Error('offline'))
+  it('forces a recommendation the tiers missed into the list', () => {
+    const merged = mergeBackendOptions([catalog], {
+      value: 'b10300-1.6.0/macos-arm64',
+      name: 'Apple Silicon · 1.6.0',
+    })
 
-    await expect(fetchRemoteBackends()).resolves.toEqual([])
+    expect(merged[0]).toEqual({
+      value: 'b10300-1.6.0/macos-arm64',
+      name: 'Apple Silicon · 1.6.0',
+    })
   })
 
-  it('skips manifest transport on macOS', async () => {
-    vi.mocked(getSystemInfo).mockResolvedValue({
-      os_type: 'macos',
-      cpu: { arch: 'arm64', extensions: [] },
-      gpus: [],
-    } as any)
+  it('drops blank ids and the BOM a manifest read can leave behind', () => {
+    const merged = mergeBackendOptions([
+      [
+        { value: '  ', name: 'blank' },
+        { value: '﻿b10269-1.5.1/macos-arm64', name: 'bom' },
+        { value: 'b10269-1.5.1/macos-arm64', name: 'clean' },
+      ],
+    ])
 
-    await expect(fetchRemoteBackends()).resolves.toEqual([])
-    expect(globalThis.fetch).not.toHaveBeenCalled()
-    expect(tauriFetch).not.toHaveBeenCalled()
+    expect(merged).toEqual([{ value: 'b10269-1.5.1/macos-arm64', name: 'bom' }])
   })
 })

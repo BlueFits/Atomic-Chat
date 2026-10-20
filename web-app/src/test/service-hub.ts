@@ -3,6 +3,10 @@ import {
   initializeServiceHubStore,
   useServiceStore,
 } from '@/hooks/useServiceHub'
+import { DefaultEmbeddingService } from '@/services/embedding/default'
+import { DefaultMediaService } from '@/services/media/default'
+import { DefaultModelSetupService } from '@/services/model-setup/default'
+import { DefaultChatExecService } from '@/services/chat-exec/default'
 
 type ServiceInstances = {
   [Name in keyof ServiceHub]: ReturnType<ServiceHub[Name]>
@@ -34,6 +38,7 @@ export function createMockServiceHub(
       overrides.assistants ?? (emptyService as ServiceInstances['assistants']),
     dialog: overrides.dialog ?? (emptyService as ServiceInstances['dialog']),
     opener: overrides.opener ?? (emptyService as ServiceInstances['opener']),
+    auth: overrides.auth ?? (emptyService as ServiceInstances['auth']),
     updater: overrides.updater ?? (emptyService as ServiceInstances['updater']),
     path: overrides.path ?? (emptyService as ServiceInstances['path']),
     core: overrides.core ?? (emptyService as ServiceInstances['core']),
@@ -43,6 +48,17 @@ export function createMockServiceHub(
       overrides.projects ?? (emptyService as ServiceInstances['projects']),
     rag: overrides.rag ?? (emptyService as ServiceInstances['rag']),
     uploads: overrides.uploads ?? (emptyService as ServiceInstances['uploads']),
+    voice: overrides.voice ?? (emptyService as ServiceInstances['voice']),
+    diffusion:
+      overrides.diffusion ?? (emptyService as ServiceInstances['diffusion']),
+    decision:
+      overrides.decision ?? (emptyService as ServiceInstances['decision']),
+    // Unsupported unless a test says otherwise: the API page and the server
+    // control ask it on every render.
+    embedding: overrides.embedding ?? new DefaultEmbeddingService(),
+    media: overrides.media ?? new DefaultMediaService(),
+    modelSetup: overrides.modelSetup ?? new DefaultModelSetupService(),
+    chatExec: overrides.chatExec ?? new DefaultChatExecService(),
   }
 
   return {
@@ -60,6 +76,7 @@ export function createMockServiceHub(
     assistants: () => services.assistants,
     dialog: () => services.dialog,
     opener: () => services.opener,
+    auth: () => services.auth,
     updater: () => services.updater,
     path: () => services.path,
     core: () => services.core,
@@ -67,6 +84,13 @@ export function createMockServiceHub(
     projects: () => services.projects,
     rag: () => services.rag,
     uploads: () => services.uploads,
+    voice: () => services.voice,
+    diffusion: () => services.diffusion,
+    decision: () => services.decision,
+    embedding: () => services.embedding,
+    media: () => services.media,
+    modelSetup: () => services.modelSetup,
+    chatExec: () => services.chatExec,
   }
 }
 

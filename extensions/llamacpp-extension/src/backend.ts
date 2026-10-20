@@ -1,40 +1,133 @@
 import { getJanDataFolderPath, fs, joinPath } from '@janhq/core'
-import { fetch as tauriFetch } from '@tauri-apps/plugin-http'
-import { getSystemInfo } from './hardware'
+import { getVersion } from '@tauri-apps/api/app'
 import { getProxyConfig } from './util'
 import {
   getLocalInstalledBackendsInternal,
-  normalizeFeatures,
-  determineSupportedBackends,
-  listSupportedBackendsFromRust,
   BackendVersion,
-  getSupportedFeaturesFromRust,
-  mapOldBackendToNew,
 } from '../../../src-tauri/plugins/tauri-plugin-llamacpp/guest-js/index'
+import { getBackendCatalog } from './adapter/coreRuntime'
+import type {
+  CoreBackendCatalog,
+  CoreProxyConfig,
+} from './adapter/coreRuntime'
 
 // The TurboQuant provider (this extension) points at our llama.cpp fork
-// AtomicBot-ai/atomic-llama-cpp-turboquant. Unlike the upstream provider
-// (a single ggml-org release), the fork ships *each* backend variant in its
-// OWN release with its OWN tag (all on the same SHA), so a /releases/latest
-// lookup is useless and a /releases scan would hammer the rate-limited
-// api.github.com. Instead the backend *index* (which variants exist + at
-// which tag) is resolved from a static manifest in our atomic-chat-conf repo,
-// served via raw.githubusercontent.com (no per-IP rate limit) — the same
-// channel llamacpp-upstream uses (ADR 2026-06-17). The only shape difference
-// from the upstream manifest is that each turboquant entry carries its own
-// `tag`. The backend *archives* themselves are still downloaded from the
-// GitHub releases CDN via LLAMACPP_DOWNLOAD_BASE.
-export const TURBOQUANT_BACKEND_MANIFEST_REVISION =
-  'f149c30e55a3dfcdcbcc5d4a72be7c691db8f5e2'
-export const TURBOQUANT_BACKEND_MANIFEST_URL = `https://raw.githubusercontent.com/AtomicBot-ai/atomic-chat-conf/${TURBOQUANT_BACKEND_MANIFEST_REVISION}/backends/turboquant-manifest.json`
-const LLAMACPP_DOWNLOAD_BASE =
-  'https://github.com/AtomicBot-ai/atomic-llama-cpp-turboquant/releases/download'
-const MANIFEST_FETCH_TIMEOUT_MS = 8_000
+// AtomicBot-ai/atomic-llama-cpp-turboquant. Since ADR 2026-09-27 the backend
+// *index* — which releases exist and which variants each one carries — is
+// resolved by `atomic-chat-core` (`index.json` of the latest release, the
+// `/releases/latest` redirect, the legacy conf manifest, then the disk cache),
+// gated on this app's version and on the hardware the core measured, and
+// handed to this extension as one catalog (`loadCatalog`). Nothing here fetches
+// or parses the index any more; the wrappers below keep the names the rest of
+// the extension grew up with.
+//
+// Only stable releases of the unified `b<upstream-build>-<fork-semver>` scheme
+// are installable. `dev-latest` and the legacy per-variant
+// `turboquant-<id>-<sha>` releases are prereleases: they are never offered for
+// download, although an already-installed legacy build keeps working.
+//
+// The backend *archives* themselves are downloaded by `atomic-chat-core`, under
+// the asset names this index gives (`getIndexedAssetName`).
 
-interface TurboquantManifestEntry {
+/** How long one catalog answer is reused before the core is asked again. */
+const CATALOG_TTL_MS = 60 * 60 * 1000
+
+/** Unified fork release tag: `b<upstream-build>-<fork-semver>`. */
+const TQ_UNIFIED_TAG_RE = /^b\d+-\d+\.\d+\.\d+$/
+
+/**
+ * Whether a version string names a build from the TurboQuant fork's release
+ * train — either a legacy per-variant tag (`turboquant-<id>-<sha>`) or a
+ * unified release tag (`b10018-1.3.0`).
+ *
+ * A plain upstream tag (`b8149`) is deliberately not one: those can end up in
+ * this provider's backend tree from an old install and must still be treated as
+ * a foreign build that needs migrating.
+ *
+ * Accepts either a bare version or a full `version/backend` string.
+ */
+export function isTurboQuantRelease(versionOrPair: string): boolean {
+  const version = versionOrPair.split('/')[0]
+  return version.startsWith('turboquant-') || TQ_UNIFIED_TAG_RE.test(version)
+}
+
+/**
+ * Whether a tag names an installable *stable* release. Narrower than
+ * `isTurboQuantRelease`: legacy `turboquant-<id>-<sha>` tags and the rolling
+ * `dev-latest` tag are prereleases of the fork, so they must never be offered
+ * for download — but a legacy build already sitting on disk stays recognised
+ * as ours by `isTurboQuantRelease` and keeps running.
+ */
+export function isStableReleaseTag(versionOrPair: string): boolean {
+  const version = (versionOrPair ?? '')
+    .replace(/﻿/g, '')
+    .trim()
+    .split('/')[0]
+  return TQ_UNIFIED_TAG_RE.test(version)
+}
+
+/**
+ * Orders two release tags, newest first: `>0` when `a` supersedes `b`.
+ *
+ * Stable tags compare numerically on `(upstream build, fork major, minor,
+ * patch)`. A stable tag always supersedes a legacy `turboquant-<id>-<sha>` one,
+ * whose short SHA carries no order at all — two legacy tags therefore compare
+ * equal rather than pretending one is newer.
+ */
+export function compareBackendVersions(a: string, b: string): number {
+  const rank = (tag: string): number[] => {
+    const match = /^b(\d+)-(\d+)\.(\d+)\.(\d+)$/.exec(
+      (tag ?? '').replace(/﻿/g, '').trim()
+    )
+    return match
+      ? [1, ...match.slice(1).map((n) => Number.parseInt(n, 10))]
+      : [0, 0, 0, 0, 0]
+  }
+  const left = rank(a)
+  const right = rank(b)
+  for (let i = 0; i < left.length; i++) {
+    if (left[i] !== right[i]) return left[i] - right[i]
+  }
+  return 0
+}
+
+/** One platform/backend archive inside a release. */
+export interface TurboquantVariant {
   id: string
+  asset?: string
+  size?: number
+  sha256?: string
+}
+
+/** One release of the fork, as described by `index.json`. */
+export interface TurboquantRelease {
   tag: string
-  asset: string
+  published_at?: string
+  commit?: string
+  prerelease?: boolean
+  /** Minimum Atomic Chat version that can run this build; absent = any. */
+  min_app_version?: string
+  title?: string
+  highlights?: string[]
+  variants: TurboquantVariant[]
+}
+
+export interface TurboquantCatalog {
+  /** Newest stable tag the core accepted, or null when nothing is usable. */
+  latest: string | null
+  /** Stable, app-compatible releases, newest first. */
+  releases: TurboquantRelease[]
+  /**
+   * Where the core got the index: `index`, `redirect`, `legacy-manifest`,
+   * `disk-cache`, or `none` when it had nothing (or could not be reached).
+   */
+  source: string
+}
+
+const EMPTY_CATALOG: TurboquantCatalog = {
+  latest: null,
+  releases: [],
+  source: 'none',
 }
 
 export async function getLocalInstalledBackends(): Promise<BackendVersion[]> {
@@ -45,302 +138,310 @@ export async function getLocalInstalledBackends(): Promise<BackendVersion[]> {
 // folder structure
 // <Jan's data folder>/llamacpp/backends/<backend_version>/<backend_type>
 
-/**
- * Maps the app's stored proxy config (`getProxyConfig`, shaped for the Rust
- * `download_files` command) onto the option shape `@tauri-apps/plugin-http`'s
- * `fetch` expects. Returns `{}` when no proxy is enabled so the caller can
- * spread it unconditionally.
- */
-function buildHttpProxyOptions(): {
-  proxy?: {
-    all: {
-      url: string
-      basicAuth?: { username: string; password: string }
-      noProxy?: string
-    }
-  }
-  danger?: { acceptInvalidCerts?: boolean; acceptInvalidHostnames?: boolean }
-} {
-  const cfg = getProxyConfig()
-  if (!cfg || typeof cfg.url !== 'string' || !cfg.url) {
-    return {}
-  }
-
-  const proxyConfig: {
-    url: string
-    basicAuth?: { username: string; password: string }
-    noProxy?: string
-  } = { url: cfg.url }
-
-  if (typeof cfg.username === 'string' && typeof cfg.password === 'string') {
-    proxyConfig.basicAuth = { username: cfg.username, password: cfg.password }
-  }
-  if (Array.isArray(cfg.no_proxy) && cfg.no_proxy.length > 0) {
-    proxyConfig.noProxy = (cfg.no_proxy as string[]).join(',')
-  }
-
-  if (cfg.ignore_ssl === true) {
-    return {
-      proxy: { all: proxyConfig },
-      danger: { acceptInvalidCerts: true, acceptInvalidHostnames: true },
-    }
-  }
-  return { proxy: { all: proxyConfig } }
+export interface InstalledBackendPack {
+  version: string
+  backend: string
+  path: string
+  active: boolean
 }
 
-async function fetchManifestWithTimeout(useProxy: boolean): Promise<Response> {
-  // Guard each request with a hard Promise timeout because some
-  // `@tauri-apps/plugin-http` code paths may ignore AbortSignal under certain
-  // network/proxy failures.
-  let timeoutHandle: ReturnType<typeof setTimeout> | null = null
-  const request = tauriFetch(TURBOQUANT_BACKEND_MANIFEST_URL, {
-    headers: { 'User-Agent': 'atomic-chat' },
-    connectTimeout: MANIFEST_FETCH_TIMEOUT_MS,
-    ...(useProxy ? buildHttpProxyOptions() : {}),
-  })
-  const timeout = new Promise<Response>((_, reject) => {
-    timeoutHandle = setTimeout(() => {
-      reject(
-        new Error(`Manifest fetch timed out after ${MANIFEST_FETCH_TIMEOUT_MS}ms`)
-      )
-    }, MANIFEST_FETCH_TIMEOUT_MS)
-  })
-  try {
-    return await Promise.race([request, timeout])
-  } finally {
-    if (timeoutHandle) clearTimeout(timeoutHandle)
-  }
-}
+const clean = (value: string) => value.replace(/﻿/g, '').trim()
 
-async function fetchManifestWithWebFetch(): Promise<Response> {
-  const controller = new AbortController()
-  let timeoutHandle: ReturnType<typeof setTimeout> | null = null
-  // `globalThis.fetch` (NOT bare `fetch`) is mandatory here: the production
-  // rolldown build injects `fetch` -> `@tauri-apps/plugin-http`'s fetch (see
-  // rolldown.config.mjs), so a bare `fetch` call would silently route through
-  // plugin-http too. `globalThis.fetch` is the real WebView fetch, which the
-  // registry loaders prove resolves reliably against raw.githubusercontent.com.
-  const request = globalThis.fetch(TURBOQUANT_BACKEND_MANIFEST_URL, {
-    headers: { Accept: 'application/json', 'User-Agent': 'atomic-chat' },
-    signal: controller.signal,
-  })
-  const timeout = new Promise<Response>((_, reject) => {
-    timeoutHandle = setTimeout(() => {
-      controller.abort()
-      reject(
-        new Error(
-          `Manifest web fetch timed out after ${MANIFEST_FETCH_TIMEOUT_MS}ms`
-        )
-      )
-    }, MANIFEST_FETCH_TIMEOUT_MS)
-  })
-  try {
-    return await Promise.race([request, timeout])
-  } finally {
-    if (timeoutHandle) clearTimeout(timeoutHandle)
-  }
-}
-
-async function fetchManifestWithFallbacks(): Promise<Response> {
-  // WebView fetch is the proven-reliable primary path; the two plugin-http
-  // variants are fallbacks for air-gapped/corporate-proxy setups where the
-  // WebView fetch is intercepted but the Rust HTTP client is allowed through.
-  const attempts: Array<{ label: string; runner: () => Promise<Response> }> = [
-    { label: 'webview fetch', runner: () => fetchManifestWithWebFetch() },
-    {
-      label: 'proxy-aware tauri fetch',
-      runner: () => fetchManifestWithTimeout(true),
-    },
-    { label: 'direct tauri fetch', runner: () => fetchManifestWithTimeout(false) },
-  ]
-
-  const wrapped = attempts.map(({ label, runner }) =>
-    runner()
-      .then((resp) => ({ label, resp }))
-      .catch((err) => {
-        const reason = err instanceof Error ? err.message : String(err)
-        throw new Error(`${label}: ${reason}`)
-      })
-  )
-
-  try {
-    const winner = await Promise.any(wrapped)
-    console.info(
-      `[fetchRemoteBackends] TurboQuant manifest fetch succeeded via ${winner.label}`
-    )
-    return winner.resp
-  } catch (aggregateErr) {
-    const reasons =
-      aggregateErr instanceof AggregateError
-        ? aggregateErr.errors
-            .map((e) => (e instanceof Error ? e.message : String(e)))
-            .join(' | ')
-        : aggregateErr instanceof Error
-          ? aggregateErr.message
-          : String(aggregateErr)
-    throw new Error(`All manifest fetch attempts failed: ${reasons}`)
-  }
+export interface BackendOption {
+  value: string
+  name: string
 }
 
 /**
- * Resolves the list of available TurboQuant backend builds from the static
- * manifest in atomic-chat-conf, filtered to the hardware-supported ids for
- * the current OS/arch.
+ * Flattens the version-dropdown tiers into one list.
  *
- * macOS uses the bundled (re-codesigned) build that ships with each release;
- * its `macos-arm64` id may be present in the manifest but the bundled flow
- * (configureBackends) owns it, so a network failure here is harmless.
- *
- * Each entry carries its own release `tag` (the variants live in separate
- * releases), surfaced as `BackendVersion.version`. Returns `[]` on any
- * failure so the app can still work offline with only bundled/local backends.
+ * The tiers are passed most-preferred first and the first spelling of a
+ * `version/backend` wins, so a build that appears in several tiers keeps its
+ * richest label. `recommended` is forced into the list because a
+ * recommendation the dropdown cannot offer is a dead end: the UI would mark a
+ * version the user has no way to select.
  */
-export async function fetchRemoteBackends(): Promise<BackendVersion[]> {
-  const sysInfo = await getSystemInfo()
-  const osType = sysInfo.os_type
-  const arch = sysInfo.cpu.arch
+export function mergeBackendOptions(
+  tiers: BackendOption[][],
+  recommended?: BackendOption
+): BackendOption[] {
+  const merged: BackendOption[] = []
+  const seen = new Set<string>()
 
-  if (osType !== 'windows' && osType !== 'linux') {
-    return []
+  for (const tier of tiers) {
+    for (const option of tier) {
+      const value = clean(option.value)
+      if (!value || seen.has(value)) continue
+      seen.add(value)
+      merged.push({ value, name: option.name })
+    }
   }
 
-  // The supported-id set already encodes OS/arch + hardware features, so we
-  // keep only manifest entries the current machine can actually run.
-  const rawFeatures = await _getSupportedFeatures()
-  const features = normalizeFeatures(rawFeatures)
-  const supportedBackends = await determineSupportedBackends(
-    osType,
-    arch,
-    features
-  )
-  const supportedSet = new Set(supportedBackends)
-
-  try {
-    console.info(
-      `[fetchRemoteBackends] Fetching TurboQuant manifest ${TURBOQUANT_BACKEND_MANIFEST_URL}...`
-    )
-    const resp = await fetchManifestWithFallbacks()
-    if (!resp.ok) {
-      console.warn(
-        `[fetchRemoteBackends] TurboQuant manifest returned ${resp.status}, using local backends only`
-      )
-      return []
-    }
-
-    const manifest = await resp.json()
-    const entries: TurboquantManifestEntry[] = Array.isArray(manifest?.backends)
-      ? manifest.backends
-      : []
-
-    const backends: BackendVersion[] = []
-    for (const entry of entries) {
-      if (
-        !entry ||
-        typeof entry.id !== 'string' ||
-        typeof entry.tag !== 'string'
-      ) {
-        continue
-      }
-      if (!supportedSet.has(entry.id)) continue
-      backends.push({ version: entry.tag, backend: entry.id, order: 0 })
-    }
-
-    console.info(
-      `[fetchRemoteBackends] Found ${backends.length} supported TurboQuant backends for ${osType}/${arch}:`,
-      backends.map((b) => `${b.version}/${b.backend}`)
-    )
-    return backends
-  } catch (err) {
-    console.warn(
-      '[fetchRemoteBackends] Failed to fetch TurboQuant manifest:',
-      err
-    )
-    return []
+  const recommendedValue = recommended ? clean(recommended.value) : ''
+  if (recommendedValue && !seen.has(recommendedValue)) {
+    merged.unshift({ value: recommendedValue, name: recommended!.name })
   }
+
+  return merged
 }
 
 /**
- * Builds the download URL for a specific TurboQuant backend from the
- * AtomicBot-ai/atomic-llama-cpp-turboquant releases CDN.
- *
- * `version` is the per-backend release tag carried from the manifest (each
- * variant lives in its own release), so the scattered-release URL is exact.
- * Windows variants are `.zip`, Linux/macOS are `.tar.gz`. CUDA zips already
- * bundle the cudart/cublas DLLs inline — no separate cudart companion.
+ * Validates a backend build for removal and returns its cleaned ids. The
+ * selected build is refused rather than silently skipped: deleting it would
+ * leave `version_backend` pointing at a directory that no longer exists and the
+ * next model load would fail with a missing-binary error instead of anything
+ * actionable. Ids carrying path separators or made of dots are refused so a
+ * removal can never reach outside the pack's own directory.
  */
-export function getBackendDownloadUrl(
+export function assertDeletableBackendPack(
+  currentVersionBackend: string,
   version: string,
   backend: string
-): string {
-  version = version.replace(/\uFEFF/g, '').trim()
-  backend = backend.replace(/\uFEFF/g, '').trim()
-  const ext = IS_WINDOWS ? 'zip' : 'tar.gz'
-  return `${LLAMACPP_DOWNLOAD_BASE}/${version}/llama-turboquant-${backend}.${ext}`
+): { version: string; backend: string } {
+  const cleanVersion = clean(version)
+  const cleanBackend = clean(backend)
+  if (
+    !cleanVersion ||
+    !cleanBackend ||
+    /[/\\]/.test(cleanVersion) ||
+    /[/\\]/.test(cleanBackend) ||
+    /^\.+$/.test(cleanVersion) ||
+    /^\.+$/.test(cleanBackend)
+  ) {
+    throw new Error(`Invalid backend pack: '${version}/${backend}'`)
+  }
+  if (`${cleanVersion}/${cleanBackend}` === clean(currentVersionBackend)) {
+    throw new Error('Cannot remove the backend that is currently selected')
+  }
+  return { version: cleanVersion, backend: cleanBackend }
 }
 
-export async function listSupportedBackends(): Promise<BackendVersion[]> {
-  const sysInfo = await getSystemInfo()
-  const osType = sysInfo.os_type
-  const arch = sysInfo.cpu.arch
+// ---------------------------------------------------------------------------
+// The catalog, asked of the core
+// ---------------------------------------------------------------------------
 
-  console.info('[listSupportedBackends] sysInfo:', osType, arch)
-
-  const rawFeatures = await _getSupportedFeatures()
-  const features = normalizeFeatures(rawFeatures)
-
-  const supportedBackends = await determineSupportedBackends(
-    osType,
-    arch,
-    features
-  )
-  console.info('[listSupportedBackends] supportedBackends:', supportedBackends)
-
-  const [localBackendVersions, remoteBackendVersions] = await Promise.all([
-    getLocalInstalledBackends(),
-    fetchRemoteBackends(),
-  ])
-  console.info(
-    '[listSupportedBackends] local backends:',
-    localBackendVersions.length,
-    localBackendVersions
-  )
-  console.info(
-    '[listSupportedBackends] remote backends:',
-    remoteBackendVersions.length,
-    remoteBackendVersions.map((b) => `${b.version}/${b.backend}`)
-  )
-
-  const mergedBackends = await listSupportedBackendsFromRust(
-    remoteBackendVersions,
-    localBackendVersions
-  )
-
-  // Windows and Linux use the hardware-gated TurboQuant backend matrix. macOS
-  // stays on its bundled flow (configureBackends owns the single macos-arm64
-  // build), so leave it unfiltered.
-  if (osType !== 'windows' && osType !== 'linux') {
-    return mergedBackends
+/**
+ * Numeric semver comparison over the leading `major.minor.patch`, ignoring any
+ * prerelease/build suffix. Returns <0, 0 or >0.
+ */
+function compareSemver(a: string, b: string): number {
+  const parse = (v: string) =>
+    v
+      .replace(/﻿/g, '')
+      .trim()
+      .replace(/^v/, '')
+      .split(/[-+]/)[0]
+      .split('.')
+      .map((part) => Number.parseInt(part, 10))
+  const left = parse(a)
+  const right = parse(b)
+  for (let i = 0; i < Math.max(left.length, right.length); i++) {
+    const l = Number.isFinite(left[i]) ? left[i] : 0
+    const r = Number.isFinite(right[i]) ? right[i] : 0
+    if (l !== r) return l - r
   }
+  return 0
+}
 
-  const supportedSet = new Set(supportedBackends)
-  const filteredBackends = await Promise.all(
-    mergedBackends.map(async (backendInfo) => ({
-      backendInfo,
-      normalizedBackend: await mapOldBackendToNew(backendInfo.backend),
-    }))
-  )
+/**
+ * Whether this app build satisfies a release's `min_app_version`.
+ *
+ * Missing or unparseable requirements pass: the field exists to stop an engine
+ * that needs newer CLI wiring from auto-installing, not to gate on metadata the
+ * client failed to read. An unknown app version also passes — refusing every
+ * release because `getVersion()` is unavailable would be worse than the risk it
+ * guards against.
+ *
+ * @deprecated The core applies this gate from the `app_version` that
+ * `loadCatalog` passes it; the releases it returns already satisfy it.
+ */
+export function satisfiesMinAppVersion(
+  minAppVersion: string | undefined,
+  appVersion: string | null
+): boolean {
+  if (!minAppVersion || typeof minAppVersion !== 'string') return true
+  if (!appVersion) return true
+  if (!/^\d+(\.\d+)*/.test(minAppVersion.trim().replace(/^v/, ''))) return true
+  return compareSemver(appVersion, minAppVersion) >= 0
+}
 
-  const supportedMergedBackends = filteredBackends
-    .filter(({ normalizedBackend }) => supportedSet.has(normalizedBackend))
-    .map(({ backendInfo }) => backendInfo)
+export async function getAppVersion(): Promise<string | null> {
+  try {
+    return await getVersion()
+  } catch (err) {
+    console.warn('[loadCatalog] app version unavailable:', err)
+    return null
+  }
+}
 
+/**
+ * What every advisor question carries to the core: the app version its
+ * `min_app_version` gate reads, and the user's proxy for the index fetch. The
+ * body travels as a POST because the proxy may carry credentials.
+ */
+export async function catalogRequestContext(): Promise<{
+  app_version: string | null
+  proxy: CoreProxyConfig | null
+}> {
+  return {
+    app_version: await getAppVersion(),
+    proxy: (getProxyConfig() as unknown as CoreProxyConfig | null) ?? null,
+  }
+}
+
+let _catalog: { fetched_at: number; catalog: CoreBackendCatalog } | null = null
+let _inFlight: Promise<CoreBackendCatalog> | null = null
+let _forceNextLoad = false
+
+/**
+ * The backend catalog for this machine, from the core: the release index it
+ * resolved, the remote and installed builds, what this hardware can run
+ * (`available`) and what it should run (`recommended`). One answer is reused
+ * for an hour or until something asks to `force`; concurrent callers share one
+ * request. Throws when the core cannot be reached — the callers decide whether
+ * that means "no catalog" (`fetchStableIndex`) or "fall back to the bundled
+ * build" (`configureBackends`).
+ */
+export async function loadCatalog(
+  options: {
+    /** Ask the core to refetch the release index too (a user-driven check). */
+    force?: boolean
+    /**
+     * Ask the core again instead of answering from this module's memo, without forcing a
+     * refetch: the core rescans the packs on disk (a backend installed from a file never passes
+     * through it), while its own index cache still answers the remote half.
+     */
+    refresh?: boolean
+  } = {}
+): Promise<CoreBackendCatalog> {
+  const force = options.force === true || _forceNextLoad
+  const fresh =
+    !options.refresh &&
+    _catalog !== null &&
+    Date.now() - _catalog.fetched_at < CATALOG_TTL_MS
+  if (!force && fresh) return _catalog!.catalog
+  if (_inFlight) return _inFlight
+
+  _inFlight = (async () => {
+    const context = await catalogRequestContext()
+    const catalog = await getBackendCatalog({ ...context, force })
+    _catalog = { fetched_at: Date.now(), catalog }
+    _forceNextLoad = false
+    console.info(
+      `[loadCatalog] ${catalog.available.length} installable backend(s) for this machine from ${catalog.source}, recommended ${catalog.recommended ?? '(none)'}`
+    )
+    return catalog
+  })().finally(() => {
+    _inFlight = null
+  })
+
+  return _inFlight
+}
+
+/** The last catalog `loadCatalog` returned, for synchronous readers; null while cold. */
+export function catalogSnapshot(): CoreBackendCatalog | null {
+  return _catalog?.catalog ?? null
+}
+
+/**
+ * Makes the next `loadCatalog` ask the core with `force`, so an explicit
+ * user-driven check sees releases published since the index was last cached.
+ */
+export function invalidateStableIndexCache(): void {
+  _catalog = null
+  _forceNextLoad = true
+}
+
+/**
+ * The stable, app-compatible releases of the fork, newest first, as the core
+ * resolved them. Never throws: an unreachable core is an empty catalog, and the
+ * bundled/local backends still work.
+ */
+export async function fetchStableIndex(
+  options: { force?: boolean } = {}
+): Promise<TurboquantCatalog> {
+  try {
+    const catalog = await loadCatalog(options)
+    const releases: TurboquantRelease[] = catalog.releases ?? []
+    return {
+      latest: releases[0]?.tag ?? null,
+      releases,
+      source: catalog.source,
+    }
+  } catch (err) {
+    console.warn(
+      '[fetchStableIndex] the core did not answer, falling back to local backends only:',
+      err
+    )
+    return EMPTY_CATALOG
+  }
+}
+
+/**
+ * The archive name the fork publishes for a backend id. Windows ships `.zip`,
+ * everything else `.tar.gz`. The id prefix decides, so a legacy `win-*` id
+ * resolved on another host still picks the right extension; ids with no
+ * platform prefix fall back to the running OS.
+ */
+export function defaultAssetName(backend: string): string {
+  const id = backend.replace(/﻿/g, '').trim()
+  const isWindowsAsset = /^win(dows)?-/.test(id)
+    ? true
+    : /^(linux|macos|mac)-/.test(id)
+      ? false
+      : IS_WINDOWS
+  return `llama-turboquant-${id}.${isWindowsAsset ? 'zip' : 'tar.gz'}`
+}
+
+/**
+ * The installable stable builds for this machine, as `BackendVersion[]`: the
+ * core's `remote` list, already gated on OS/arch and the detected GPU tier so
+ * the user never sees a variant their hardware cannot run. Returns `[]` on any
+ * failure so the app still works offline with bundled/local backends only.
+ */
+export async function fetchRemoteBackends(
+  options: { force?: boolean } = {}
+): Promise<BackendVersion[]> {
+  try {
+    const catalog = await loadCatalog(options)
+    return catalog.remote
+  } catch (err) {
+    console.warn('[fetchRemoteBackends] the core did not answer:', err)
+    return []
+  }
+}
+
+/**
+ * The published asset name for `tag/backend`, read from the last catalog the
+ * core returned. Returns `undefined` when no catalog has been loaded yet or it
+ * does not describe this pair, leaving the caller on the naming convention.
+ */
+export function getIndexedAssetName(
+  version: string,
+  backend: string
+): string | undefined {
+  const tag = version.replace(/﻿/g, '').trim()
+  const id = backend.replace(/﻿/g, '').trim()
+  const release = catalogSnapshot()?.releases?.find((r) => r.tag === tag)
+  return release?.variants.find((v) => v.id === id)?.asset
+}
+
+/**
+ * The builds this machine can run — remote releases merged with what is on
+ * disk, filtered by the hardware the core measured and sorted — as the core's
+ * `available` list. Throws when the core cannot be reached, so
+ * `configureBackends` can fall back to the bundled build.
+ */
+export async function listSupportedBackends(
+  options: { force?: boolean } = {}
+): Promise<BackendVersion[]> {
+  const catalog = await loadCatalog(options)
   console.info(
-    `[listSupportedBackends] ${osType} filtered backends:`,
-    supportedMergedBackends.length,
-    supportedMergedBackends.map((b) => `${b.version}/${b.backend}`)
+    `[listSupportedBackends] ${catalog.os_type} filtered backends:`,
+    catalog.available.length,
+    catalog.available.map((b) => `${b.version}/${b.backend}`)
   )
-
-  return supportedMergedBackends
+  return catalog.available
 }
 
 export async function getBackendDir(
@@ -352,8 +453,8 @@ export async function getBackendDir(
     janDataFolderPath,
     'llamacpp',
     'backends',
-    version.replace(/\uFEFF/g, '').trim(),
-    backend.replace(/\uFEFF/g, '').trim(),
+    version.replace(/﻿/g, '').trim(),
+    backend.replace(/﻿/g, '').trim(),
   ])
   return backendDir
 }
@@ -377,14 +478,15 @@ export async function getBackendExePath(
 /**
  * Windows-only defense-in-depth: a correctly packaged TurboQuant Windows
  * backend ships `llama-server.exe` alongside its dependency DLLs
- * (`llama-server-impl.dll`, `ggml*.dll`, cudart/cublas, ...) extracted from
- * the same archive into the same `build/bin` directory. A CI packaging
- * regression could relocate the exe without its DLLs, leaving a directory
- * that looks "installed" (the exe exists) but crashes on load with a
- * missing-DLL error ([LLAMA_CPP_PROCESS_ERROR]). Detect that shape
- * generically - without hardcoding DLL names, which vary per backend
- * variant (CPU/CUDA/Vulkan) - by requiring at least one `.dll` sibling
- * next to the exe.
+ * (`llama-server-impl.dll`, `ggml*.dll`, …) extracted into the same
+ * `build/bin` directory. A CI packaging regression could relocate the exe
+ * without its DLLs, leaving a directory that looks "installed" (the exe
+ * exists) but crashes on load with a missing-DLL error
+ * ([LLAMA_CPP_PROCESS_ERROR]). Detect that shape generically — without
+ * hardcoding DLL names, which vary per backend variant (CPU/CUDA/Vulkan) —
+ * by requiring at least one `.dll` sibling next to the exe. Missing CUDA
+ * *runtime* DLLs (cudart/cublas) are repaired separately by the core and are
+ * not required for this presence check.
  */
 async function windowsBackendHasDlls(exePath: string): Promise<boolean> {
   const lastSlash = Math.max(
@@ -422,13 +524,4 @@ export async function isBackendInstalled(
     return false
   }
   return true
-}
-
-async function _getSupportedFeatures() {
-  const sysInfo = await getSystemInfo()
-  return await getSupportedFeaturesFromRust(
-    sysInfo.os_type,
-    sysInfo.cpu.extensions,
-    sysInfo.gpus
-  )
 }

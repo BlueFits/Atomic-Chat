@@ -3,8 +3,11 @@ import { create } from "zustand";
 import type { Chat, UIMessage } from "@ai-sdk/react";
 import type { ChatStatus } from "ai";
 import { CustomChatTransport } from "@/lib/custom-chat-transport";
-import { notifyThreadCompleted } from "@/lib/notifications";
-import { useThreadNotifications } from "@/hooks/useThreadNotifications";
+import {
+  desktopNotificationsEnabled,
+  isWindowAway,
+  showDesktopNotification,
+} from "@/lib/notifications";
 import { useThreadReadStatus } from "@/stores/thread-read-store";
 import i18n from "@/i18n/setup";
 
@@ -12,6 +15,8 @@ export type SessionData = {
   tools: any[];
   messages: UIMessage[];
   idMap: Map<string, string>;
+  /** Aborts the tool calls this thread's last step is running; null when none run. */
+  toolAbort: AbortController | null;
 };
 
 export type ChatSession = {
@@ -26,6 +31,14 @@ export type ChatSession = {
 
 interface ChatSessionState {
   sessions: Record<string, ChatSession>;
+  /**
+   * Per thread: a turn was sent and has not finished (its tool calls and
+   * follow-up steps included). Kept here, not in the thread page: the thread's
+   * Chat outlives the page that sent the turn (ATO-538), and one page instance
+   * shows every thread it is navigated to.
+   */
+  requestActive: Record<string, boolean>;
+  setRequestActive: (sessionId: string, active: boolean) => void;
   activeConversationId?: string;
   setActiveConversationId: (conversationId?: string) => void;
   ensureSession: (
@@ -52,10 +65,20 @@ export function isSessionBusy(session: ChatSession | undefined): boolean {
   return session?.isStreaming || (session?.data?.tools?.length ?? 0) > 0;
 }
 
+/**
+ * `true` while any chat session is streaming or still running tool calls.
+ * Model auto-switch paths use it to avoid unloading an engine that is in the
+ * middle of answering (a `stopAllModels` mid-stream SIGKILLs the server).
+ */
+export function isAnyChatBusy(): boolean {
+  return Object.values(useChatSessions.getState().sessions).some(isSessionBusy);
+}
+
 const createSessionData = (): SessionData => ({
   tools: [],
   messages: [],
   idMap: new Map<string, string>(),
+  toolAbort: null,
 });
 
 // Standalone data store for sessions that don't have a Chat yet
@@ -63,6 +86,13 @@ const standaloneData: Record<string, SessionData> = {};
 
 export const useChatSessions = create<ChatSessionState>((set, get) => ({
   sessions: {},
+  requestActive: {},
+  setRequestActive: (sessionId, active) => {
+    if ((get().requestActive[sessionId] === true) === active) return;
+    set((state) => ({
+      requestActive: { ...state.requestActive, [sessionId]: active },
+    }));
+  },
   activeConversationId: undefined,
   setActiveConversationId: (conversationId) =>
     set({ activeConversationId: conversationId }),
@@ -167,26 +197,11 @@ export const useChatSessions = create<ChatSessionState>((set, get) => ({
       if (justFinished) {
         const hasMessages = existing.chat.messages.length > 0;
         const hasPendingTools = existing.data.tools.length > 0;
-        const hasDocument = typeof document !== "undefined";
-        const isVisible = hasDocument
-          ? document.visibilityState === "visible"
-          : true;
-        // On macOS a background Tauri window stays "visible"; use hasFocus()
-        // to detect the user switching to another app.
-        const hasFocus = hasDocument
-          ? typeof document.hasFocus === "function"
-            ? document.hasFocus()
-            : true
-          : true;
         const notFocusedHere =
-          !isVisible || !hasFocus || state.activeConversationId !== sessionId;
-        // Treat undefined (pre-feature or lost during rehydration) as ON, so
-        // the master switch only suppresses notifications when explicitly OFF.
-        const globallyEnabled =
-          useThreadNotifications.getState().globallyEnabled !== false;
+          isWindowAway() || state.activeConversationId !== sessionId;
 
         if (
-          globallyEnabled &&
+          desktopNotificationsEnabled() &&
           hasMessages &&
           !hasPendingTools &&
           notFocusedHere
@@ -199,7 +214,7 @@ export const useChatSessions = create<ChatSessionState>((set, get) => ({
             "settings:threadNotifications.notificationBody",
             { title: threadTitle }
           );
-          void notifyThreadCompleted(notificationTitle, notificationBody);
+          void showDesktopNotification(notificationTitle, notificationBody);
         }
 
         if (
@@ -254,7 +269,9 @@ export const useChatSessions = create<ChatSessionState>((set, get) => ({
       }
       const rest = { ...state.sessions };
       delete rest[sessionId];
-      return { sessions: rest };
+      const active = { ...state.requestActive };
+      delete active[sessionId];
+      return { sessions: rest, requestActive: active };
     });
 
     // Then cleanup (existing is a copy, safe to use after removal)
@@ -295,6 +312,6 @@ export const useChatSessions = create<ChatSessionState>((set, get) => ({
       delete standaloneData[key];
     });
 
-    set({ sessions: {}, activeConversationId: undefined });
+    set({ sessions: {}, requestActive: {}, activeConversationId: undefined });
   },
 }));

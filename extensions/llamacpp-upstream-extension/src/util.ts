@@ -41,81 +41,30 @@ export function isConcreteVersionBackend(
 }
 
 /**
- * ATO-185: structured error code for "host CPU lacks the SIMD baseline the
- * shipped ggml-org CPU build requires". Surfaced to the web-app load-error
- * handler so it can render a clear, actionable message instead of the opaque
- * generic LLAMA_CPP_PROCESS_ERROR a silent SIGILL crash produces.
+ * `general.architecture` values whose llama.cpp graph builds the embedded MTP
+ * head (`LLM_GRAPH_TYPE_DECODER_MTP` in `src/models/*.cpp`), as of upstream
+ * b10809 (5266f24da). Keep in step with the core's copy in
+ * `src/models/gguf/classify.ts`, which gates the MTP flag at load time.
  */
-export const CPU_NO_AVX_ERROR_CODE = 'CPU_NO_AVX'
+const EMBEDDED_MTP_ARCHITECTURES = new Set([
+  'bailingmoe3',
+  'cohere2moe',
+  'deepseek2',
+  'deepseek32',
+  'deepseek4',
+  'glm-dsa',
+  'glm4moe',
+  'hy_v3',
+  'mimo2',
+  'nemotron_h_moe',
+  'qwen35',
+  'qwen35moe',
+  'qwen3next',
+  'step35',
+])
 
 /**
- * True iff `backend` is one of the CPU-only backend builds (no GPU offload).
- * Matches `win-cpu-x64`, `win-cpu-arm64`, `linux-cpu-x64`, `linux-cpu-arm64`.
- * The macOS backends (`macos-x64` / `macos-arm64`) deliberately do NOT match —
- * macOS is unaffected by the AVX issue (Apple Silicon has no AVX concept and
- * Intel Macs all ship AVX).
- */
-export function isCpuBackend(backend: string | undefined | null): boolean {
-  const b = (backend ?? '').replace(/\uFEFF/g, '').trim().toLowerCase()
-  return b.includes('-cpu-')
-}
-
-/**
- * True iff the detected CPU extension list reports at least AVX. The shipped
- * ggml-org CPU build's lowest variant requires AVX (the "sandybridge" tier);
- * AVX2 / AVX-512 imply AVX. Mirrors the web-app `cpuAvxLevel` classification.
- */
-export function cpuHasAvx(extensions: string[] | undefined | null): boolean {
-  if (!extensions || extensions.length === 0) return false
-  return extensions.some((e) => {
-    const x = e.toLowerCase()
-    return x === 'avx' || x === 'avx2' || x.startsWith('avx512')
-  })
-}
-
-/**
- * ATO-185: decide whether to block a CPU-backend load because the host CPU is
- * too old to run the shipped binary. The shipped ggml-org CPU build executes
- * AVX instructions unconditionally, so an x86 CPU with no AVX at all dies with
- * SIGILL (Unix signal 4 / Windows STATUS_ILLEGAL_INSTRUCTION) the moment it
- * starts — leaving empty stderr that only surfaced as the opaque generic
- * LLAMA_CPP_PROCESS_ERROR (PostHog 30d: cpu_avx='none' fails 31.6% vs avx
- * 0.39%). We block only when we have a POSITIVE no-AVX signal: x86 arch, a
- * CPU backend, and a non-empty extension list that lacks AVX. An empty list
- * (non-x86 host or a hardware-probe failure) is never treated as "no AVX", so
- * we never false-block a capable machine.
- */
-export function isUnsupportedNoAvxCpu(
-  arch: string | undefined | null,
-  backend: string | undefined | null,
-  extensions: string[] | undefined | null
-): boolean {
-  const a = (arch ?? '').trim().toLowerCase()
-  const isX86 = a === 'x86_64' || a === 'x86' || a === 'amd64'
-  if (!isX86) return false
-  if (!isCpuBackend(backend)) return false
-  if (!extensions || extensions.length === 0) return false
-  return !cpuHasAvx(extensions)
-}
-
-/**
- * True iff the load-error text is an MTP-rejection (MTP requested on a model
- * with no MTP layers / no draft head). llama.cpp surfaces no structured error
- * code for this, so we match the stderr text (ATO-125).
- */
-export function matchesMtpLoadFailure(text: string): boolean {
-  if (!text) return false
-  return (
-    /failed to create MTP context/i.test(text) ||
-    /context type MTP requested/i.test(text) ||
-    /doesn'?t contain MTP layers/i.test(text)
-  )
-}
-
-const EMBEDDED_MTP_ARCHITECTURES = new Set(['qwen35', 'qwen35moe'])
-
-/**
- * Detect a combined Qwen GGUF whose MTP head is embedded in the target file.
+ * Detect a GGUF whose MTP head is embedded in the target file.
  * llama.cpp derives the same split from `{arch}.block_count` and
  * `{arch}.nextn_predict_layers`; filenames and repository names are not part
  * of the model format contract.
@@ -144,13 +93,6 @@ export function hasEmbeddedMtp(
     nextnPredictLayers > 0 &&
     blockCount > nextnPredictLayers
   )
-}
-
-export function isMtpCapable(
-  metadata: Record<string, unknown> | undefined | null,
-  mtpDraftPath: string
-): boolean {
-  return mtpDraftPath.length > 0 || hasEmbeddedMtp(metadata)
 }
 
 // Zustand proxy state structure
@@ -242,102 +184,190 @@ export function getProxyConfig(): Record<
   }
 }
 
-// --- Embedding batching helpers ---
+/**
+ * A GGUF quant too large for one file is published as `-00001-of-000NN` shards.
+ * llama.cpp only accepts the *first* shard on `-m`: handed any other one it
+ * bails with "illegal split file idx: N ... model must be loaded with the first
+ * split", which reached users as an opaque "The model process encountered an
+ * unexpected error".
+ *
+ * The marker shows up in two shapes, and both have to be recognised:
+ *   - in the file name, as published:  `.../Model-00002-of-00003.gguf`
+ *   - in the directory name, as this app stores a downloaded shard:
+ *     `.../models/author/Model-00002-of-00003/model.gguf`
+ */
+const GGUF_SHARD_RE = /-(\d{5})-of-(\d{5})(?=\.gguf$|\/|$)/gi
 
-export type EmbedBatch = { batch: string[]; offset: number }
-export type EmbedUsage = { prompt_tokens?: number; total_tokens?: number }
-export type EmbedData = { embedding: number[]; index: number }
-
-export type EmbedBatchResult = {
-  data: EmbedData[]
-  usage?: EmbedUsage
+export interface GgufShardRef {
+  /** Position of this shard in the set, 1-based. */
+  index: number
+  /** How many shards the complete set has. */
+  total: number
 }
 
-// Embedding batching constants
-const DEFAULT_CHARS_PER_TOKEN = 3
-const UBATCH_SAFETY_MARGIN = 0.5
+/** Locate the shard marker, or `null` when the path is not part of a set. */
+function matchGgufShard(
+  path: string
+): (GgufShardRef & { start: number; end: number }) | null {
+  // Reset: the regex is global, so `lastIndex` survives between calls.
+  GGUF_SHARD_RE.lastIndex = 0
+  let last: RegExpExecArray | null = null
+  for (
+    let match = GGUF_SHARD_RE.exec(path);
+    match;
+    match = GGUF_SHARD_RE.exec(path)
+  ) {
+    // A repo name may itself carry a `-00001-of-00002`-shaped token; the marker
+    // that decides which file llama.cpp gets is the last one.
+    last = match
+  }
+  if (!last) return null
 
-export function estimateTokensFromText(text: string, charsPerToken = DEFAULT_CHARS_PER_TOKEN): number {
-  return Math.max(1, Math.ceil(text.length / Math.max(charsPerToken, 1)))
+  const index = Number(last[1])
+  const total = Number(last[2])
+  // `-00000-of-00003` is not a shard set anyone can load; treat it as a plain name.
+  if (!index || !total || index > total) return null
+
+  return { index, total, start: last.index, end: last.index + last[0].length }
 }
 
-export function buildEmbedBatches(
-  inputs: string[],
-  ubatchSize: number,
-  charsPerToken = DEFAULT_CHARS_PER_TOKEN
-): EmbedBatch[] {
-  // Ensure ubatch_size is large enough for at least 1 token with safety margin
-  const minUbatchSize = Math.ceil(1 / UBATCH_SAFETY_MARGIN)
-  if (ubatchSize < minUbatchSize) {
-    throw new Error(
-      `ubatch_size (${ubatchSize}) is too small. Minimum required: ${minUbatchSize}`
-    )
+/** Shard position of `path`, or `null` when it is a standalone model. */
+const LOOPBACK_HOSTS: ReadonlySet<string> = new Set(['127.0.0.1', 'localhost', '[::1]'])
+
+/**
+ * Whether a model path is something to download rather than a file on disk.
+ * `https://` always. Plain `http://` only from a loopback host — a mirror on
+ * this machine, or a test fixture — where there is no network between the two
+ * ends for anyone to stand in. Any other `http://` address stays what it was
+ * before: not a URL this extension fetches, so it is looked up as a local path
+ * and refused as a missing file.
+ */
+export function isDownloadableUrl(path: string): boolean {
+  if (path.startsWith('https://')) return true
+  if (!path.startsWith('http://')) return false
+  try {
+    return LOOPBACK_HOSTS.has(new URL(path).hostname.toLowerCase())
+  } catch {
+    return false
   }
-
-  const safeLimit = Math.floor(ubatchSize * UBATCH_SAFETY_MARGIN)
-
-  const batches: EmbedBatch[] = []
-  let current: string[] = []
-  let currentTokens = 0
-  let offset = 0
-
-  const push = () => {
-    if (current.length) {
-      batches.push({ batch: current, offset })
-      offset += current.length
-      current = []
-      currentTokens = 0
-    }
-  }
-
-  for (const text of inputs) {
-    const estTokens = estimateTokensFromText(text, charsPerToken)
-
-    // If single text exceeds safe limit, still allow it as single batch
-    // (ensure at least one text per batch)
-    if (estTokens > safeLimit) {
-      if (current.length) push()
-      batches.push({ batch: [text], offset })
-      offset += 1
-      continue
-    }
-
-    if (currentTokens + estTokens > safeLimit && current.length) {
-      push()
-    }
-
-    current.push(text)
-    currentTokens += estTokens
-  }
-
-  push()
-
-  // Validate that no batch is empty
-  if (batches.some(b => b.batch.length === 0)) {
-    throw new Error('Internal error: empty batch detected')
-  }
-
-  return batches
 }
 
-export function mergeEmbedResponses(
-  model: string,
-  batchResults: Array<{ result: EmbedBatchResult; offset: number }>
-) {
-  const aggregated = {
-    model,
-    object: 'list',
-    usage: { prompt_tokens: 0, total_tokens: 0 },
-    data: [] as EmbedData[],
-  }
+export function parseGgufShard(path: string): GgufShardRef | null {
+  const match = matchGgufShard(path)
+  return match ? { index: match.index, total: match.total } : null
+}
 
-  for (const { result, offset } of batchResults) {
-    aggregated.usage.prompt_tokens += result.usage?.prompt_tokens ?? 0
-    aggregated.usage.total_tokens += result.usage?.total_tokens ?? 0
-    for (const item of result.data || []) {
-      aggregated.data.push({ ...item, index: item.index + offset })
-    }
-  }
+/**
+ * The same path with its shard marker pointed at `index`. Returns `path`
+ * untouched when it carries no marker.
+ */
+export function ggufShardPath(path: string, index: number): string {
+  const match = matchGgufShard(path)
+  if (!match) return path
+  const marker = `-${String(index).padStart(5, '0')}-of-${String(
+    match.total
+  ).padStart(5, '0')}`
+  return path.slice(0, match.start) + marker + path.slice(match.end)
+}
 
-  return aggregated
+/**
+ * Every path in the shard set `path` belongs to, first shard first. A
+ * standalone model yields just itself, so callers need no special case.
+ */
+export function ggufShardSetPaths(path: string): string[] {
+  const match = matchGgufShard(path)
+  if (!match) return [path]
+  return Array.from({ length: match.total }, (_, i) =>
+    ggufShardPath(path, i + 1)
+  )
+}
+
+/**
+ * The path llama.cpp has to be handed for this model: the first shard of the
+ * set, or the path itself when it is not sharded.
+ */
+export function firstGgufShardPath(path: string): string {
+  return ggufShardPath(path, 1)
+}
+
+/**
+ * llama.cpp architectures that cannot generate text: encoder-only embedding
+ * backbones and projector / audio side-models. Started as a chat model one
+ * trips a GGML assertion and takes the server process down with it — the crash
+ * users saw as "The model process crashed unexpectedly (access violation /
+ * segfault)". Mirrors `NON_TEXT_GGUF_ARCHITECTURES` in the web-app's local
+ * model scanner, which keeps the same weights out of onboarding.
+ */
+const NON_TEXT_GGUF_ARCHITECTURES = new Set([
+  'bert',
+  'modern-bert',
+  'nomic-bert',
+  'nomic-bert-moe',
+  'neo-bert',
+  'jina-bert-v2',
+  'jina-bert-v3',
+  'eurobert',
+  'gemma-embedding',
+  'llama-embed',
+  't5encoder',
+])
+
+/**
+ * Whether GGUF metadata describes weights that produce embeddings rather than
+ * text. Such a model is still usable — it just has to be loaded in embedding
+ * mode instead of being handed to the chat path.
+ */
+export function isEmbeddingGguf(
+  metadata: Record<string, unknown> | undefined | null
+): boolean {
+  const raw = metadata?.['general.architecture']
+  const arch = typeof raw === 'string' ? raw.trim().toLowerCase() : ''
+  if (!arch) return false
+  if (NON_TEXT_GGUF_ARCHITECTURES.has(arch)) return true
+
+  // Embedding / reranker conversions of a generative architecture (the
+  // Qwen3-Embedding family and friends) keep the arch name and are only
+  // distinguishable by a pooling type or a classifier head. Pooling type 0 is
+  // NONE, i.e. a plain decoder.
+  const pooling = metadata?.[`${arch}.pooling_type`]
+  const poolingStr = pooling == null ? '' : String(pooling).trim()
+  if (poolingStr !== '' && poolingStr !== '0') return true
+
+  return metadata?.[`${arch}.classifier.output_labels`] !== undefined
+}
+
+/**
+ * Which modality an mmproj carries.
+ *
+ * `general.architecture` is `clip` for *every* projector — vision and audio
+ * alike — so the arch tells us nothing. The modality lives in the `clip.*` keys
+ * that `libmtmd` writes, and until now the extension simply assumed any mmproj
+ * meant vision. That is wrong for Voxtral, whose projector is a Whisper-style
+ * audio encoder.
+ *
+ * Unknown metadata falls back to vision, which is what the code did before this
+ * function existed — a projector we cannot classify must not silently lose its
+ * existing capability.
+ */
+export function classifyProjector(
+  metadata: Record<string, unknown> | undefined | null
+): { vision: boolean; audio: boolean } {
+  if (!metadata) return { vision: true, audio: false }
+
+  const truthy = (value: unknown): boolean =>
+    String(value ?? '')
+      .trim()
+      .toLowerCase() === 'true'
+  const present = (value: unknown): boolean =>
+    value !== undefined && value !== null && String(value).trim() !== ''
+
+  const vision =
+    truthy(metadata['clip.has_vision_encoder']) ||
+    present(metadata['clip.vision.projector_type'])
+  const audio =
+    truthy(metadata['clip.has_audio_encoder']) ||
+    present(metadata['clip.audio.projector_type'])
+
+  if (!vision && !audio) return { vision: true, audio: false }
+  return { vision, audio }
 }

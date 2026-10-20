@@ -15,7 +15,14 @@ fn load_dotenv() {
     let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".to_string());
     let env_path = Path::new(&manifest_dir).join(".env");
 
-    println!("cargo:rerun-if-changed={}", env_path.display());
+    // Watch `.env` only when it exists: Cargo treats a missing `rerun-if-changed`
+    // path as always stale, which reran this script — and so recompiled the
+    // whole crate — on every cargo call in a checkout without `.env` (CI,
+    // fresh clones). The cost: creating `.env` later is not noticed on its own;
+    // `touch src-tauri/build.rs` once after creating it (DEVELOP.md).
+    if env_path.exists() {
+        println!("cargo:rerun-if-changed={}", env_path.display());
+    }
     for key in DOTENV_KEYS {
         println!("cargo:rerun-if-env-changed={key}");
     }
@@ -43,6 +50,52 @@ fn load_dotenv() {
         let val = raw_val.trim().trim_matches(|c| c == '"' || c == '\'');
         println!("cargo:rustc-env={key}={val}");
     }
+}
+
+/// Stamp the pinned `atomic-chat-core` version into the binary as
+/// `ATOMIC_CORE_VERSION`.
+///
+/// The supervisor refuses to attach to a core whose version does not match this
+/// string (PLAN.md §3.4: "With an incompatible version of the live owner — a clear
+/// refusal"). The pin lives in one place, `package.json` → `atomicCore.version`,
+/// because that is what `scripts/download-core.mjs` downloads and verifies; a
+/// second copy here would let the bundled binary and the expectation drift.
+///
+/// A missing or unreadable `package.json` is not a build failure: the var is
+/// read with `option_env!`, and a build without it simply cannot handshake —
+/// which is the right outcome for a tree that has no pin.
+fn stamp_core_version() {
+    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".to_string());
+    let pkg_path = Path::new(&manifest_dir).join("../package.json");
+    println!("cargo:rerun-if-changed={}", pkg_path.display());
+
+    let Ok(contents) = fs::read_to_string(&pkg_path) else {
+        return;
+    };
+    if let Some(version) = core_version_from_package_json(&contents) {
+        println!("cargo:rustc-env=ATOMIC_CORE_VERSION={version}");
+    }
+}
+
+/// Pull `atomicCore.version` out of `package.json` without a JSON dependency:
+/// `build.rs` runs before the crate's own dependency graph is useful, and the
+/// shape we need is one string at a known key.
+fn core_version_from_package_json(contents: &str) -> Option<String> {
+    let after_key = contents.split_once("\"atomicCore\"")?.1;
+    // Stop at the end of the `atomicCore` object, so an absent pin cannot pick
+    // up the `"version"` of whatever block follows it.
+    let block = after_key
+        .split_once('}')
+        .map_or(after_key, |(head, _)| head);
+    let after_version = block.split_once("\"version\"")?.1;
+    let after_colon = after_version.split_once(':')?.1;
+    let rest = after_colon.trim_start();
+    let quoted = rest.strip_prefix('"')?;
+    let (value, _) = quoted.split_once('"')?;
+    if value.is_empty() {
+        return None;
+    }
+    Some(value.to_string())
 }
 
 /// Embed Common Controls v6 so Windows libtest harnesses can start.
@@ -75,10 +128,10 @@ fn build_tauri() {
 
 fn main() {
     load_dotenv();
+    stamp_core_version();
 
     #[cfg(all(windows, feature = "test-tauri"))]
     embed_windows_test_manifest();
 
-    #[cfg(not(feature = "cli"))]
     build_tauri()
 }

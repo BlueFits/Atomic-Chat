@@ -2,8 +2,17 @@
  * Default Models Service - Web implementation
  */
 
-import { sanitizeModelId, LOCAL_LLAMACPP_PROVIDER } from '@/lib/utils'
-import { isMtpCompanionFile } from '@/lib/models'
+import { managedEngines } from '@/lib/managed-engines'
+import {
+  sanitizeModelId,
+  LOCAL_LLAMACPP_PROVIDER,
+  formatBytes,
+} from '@/lib/utils'
+import {
+  ggufShardGroupKey,
+  groupGgufShards,
+  isNonWeightGgufFile,
+} from '@/lib/models'
 import {
   AIEngine,
   EngineManager,
@@ -15,25 +24,39 @@ import {
   events,
   DownloadEvent,
   UnloadResult,
+  type ModelLoadOptions,
 } from '@janhq/core'
 import { Model as CoreModel } from '@janhq/core'
 import type {
+  DownloadRefusal,
+  PullModelOptions,
   ModelsService,
   ModelCatalog,
   HuggingFaceRepo,
+  HuggingFaceFeedPage,
+  HuggingFaceFeedParams,
+  HuggingFaceFeedSort,
+  HuggingFaceFeedFormat,
   CatalogModel,
+  ModelDeletionReport,
   ModelValidationResult,
 } from './types'
+import { fetch as fetchTauri } from '@tauri-apps/plugin-http'
 import { getCatalogOrFallback } from '@/services/model-catalog-registry'
 import { useDownloadStore } from '@/hooks/useDownloadStore'
-import posthog from 'posthog-js'
 import {
   isHfUrl,
   markDownloadStart,
+  normalizeModelId,
   quantFromModelId,
   sizeBucket,
   urlHost,
 } from '@/lib/telemetry'
+import { queuedCapture } from '@/lib/telemetry-queue'
+import { toast } from 'sonner'
+import i18n from '@/i18n/setup'
+import { preflightDownloadDiskSpace } from './downloadPreflight'
+import { makeRoomForChatModel } from './gpuRoom'
 
 // Platform-active llama.cpp provider id. Windows registers only the
 // upstream extension ('llamacpp-upstream') after the 2026-05-22 ADR;
@@ -43,15 +66,140 @@ import {
 // silently no-op because the EngineManager has no 'llamacpp' entry.
 const defaultProvider = LOCAL_LLAMACPP_PROVIDER
 const HUGGING_FACE_SEARCH_LIMIT = 10
-const localProviders = ['llamacpp', 'llamacpp-upstream', 'mlx'] as const
-type LocalProviderName = (typeof localProviders)[number]
+const HUGGING_FACE_FEED_LIMIT = 50
+
+/** `sort=` values Hugging Face's `/api/models` understands. */
+const HUGGING_FACE_FEED_SORT: Record<HuggingFaceFeedSort, string> = {
+  trending: 'trendingScore',
+  downloads: 'downloads',
+  likes: 'likes',
+  lastModified: 'lastModified',
+}
+
+/**
+ * The `cursor` of the `rel="next"` link, or `null` when the listing ends.
+ * Hugging Face paginates `/api/models` with a `Link` header only.
+ */
+export function parseHuggingFaceNextCursor(
+  linkHeader: string | null | undefined
+): string | null {
+  if (!linkHeader) return null
+  for (const part of linkHeader.split(',')) {
+    const match = part.match(/<([^>]+)>\s*;\s*rel="?next"?/)
+    if (!match) continue
+    try {
+      return new URL(match[1]).searchParams.get('cursor')
+    } catch {
+      return null
+    }
+  }
+  return null
+}
+
+const isTauriRuntime = (): boolean => {
+  try {
+    return typeof IS_TAURI !== 'undefined' && Boolean(IS_TAURI)
+  } catch {
+    return false
+  }
+}
+// Engines whose loaded models count as the app's active local models: what
+// `getActiveModels()` reports and what `stopAllModels()` / `stopAllModelsExcept()`
+// unload. An engine missing here is invisible to the provider page's Stop, which
+// then shows its model stopped while it keeps running (task 3.14, F-9).
+// The managed engines (`lib/managed-engines.ts`: vLLM, SGLang, TensorRT-LLM) and Foundry Local
+// (change add-foundry-local) are local too.
+const localProviders = (): string[] => [
+  'llamacpp',
+  'llamacpp-upstream',
+  'atomic-prism',
+  'mlx',
+  'foundry-local',
+  ...managedEngines().map((engine) => engine.id),
+]
+type LocalProviderName = string
+
+/** What `expand[]=config` and `expand[]=safetensors` add to a listing entry. */
+type HuggingFaceManagedExpansion = {
+  config?: { architectures?: unknown }
+  safetensors?: { parameters?: unknown }
+}
+
+type HuggingFaceFeedEntry = Pick<
+  HuggingFaceRepo,
+  'downloads' | 'likes' | 'tags'
+> &
+  HuggingFaceManagedExpansion & {
+    id?: string
+    modelId?: string
+    createdAt?: string
+    lastModified?: string
+    trendingScore?: number
+  }
 
 type HuggingFaceRepoSearchResult = Pick<
   HuggingFaceRepo,
   'downloads' | 'likes' | 'tags'
-> & {
-  id?: string
-  modelId?: string
+> &
+  HuggingFaceManagedExpansion & {
+    id?: string
+    modelId?: string
+  }
+
+/**
+ * Asking for any `expand[]` makes Hugging Face answer with only the fields named, so the ones the
+ * Hub already reads are named too.
+ */
+const MANAGED_LISTING_EXPAND = [
+  'config',
+  'safetensors',
+  'downloads',
+  'likes',
+  'tags',
+  'createdAt',
+  'lastModified',
+] as const
+
+/** `filter=` and `expand[]` of a listing or search of one format, after `leading` params. */
+function huggingFaceFormatParams(
+  format: HuggingFaceFeedFormat,
+  leading: Record<string, string>,
+  trailing: Record<string, string> = {}
+): URLSearchParams {
+  const params = new URLSearchParams({
+    ...leading,
+    filter: format,
+    ...trailing,
+  })
+  if (format === 'safetensors') {
+    for (const field of MANAGED_LISTING_EXPAND) params.append('expand[]', field)
+  }
+  return params
+}
+
+/** A listing entry's architectures and parameters by dtype; anything malformed reads as absent. */
+function managedListingFields(repo: HuggingFaceManagedExpansion): Pick<
+  CatalogModel,
+  'is_managed' | 'managed'
+> {
+  const architectures = repo.config?.architectures
+  const parameters = repo.safetensors?.parameters
+  return {
+    is_managed: true,
+    managed: {
+      architectures:
+        Array.isArray(architectures) &&
+        architectures.every((name) => typeof name === 'string')
+          ? (architectures as string[])
+          : undefined,
+      parameters:
+        parameters &&
+        typeof parameters === 'object' &&
+        Object.values(parameters).every((count) => typeof count === 'number')
+          ? (parameters as Record<string, number>)
+          : undefined,
+    },
+  }
 }
 
 const normalizeHuggingFaceSearchValue = (value: string) =>
@@ -115,13 +263,15 @@ export class DefaultModelsService implements ModelsService {
     { provider: LocalProviderName; models: string[] }[]
   > {
     const results = await Promise.all(
-      localProviders.map(async (provider) => ({
+      localProviders().map(async (provider) => ({
         provider,
         models: (await this.getEngine(provider)?.getLoadedModels()) ?? [],
       }))
     )
 
-    return results.filter(({ models }) => Array.isArray(models) && models.length > 0)
+    return results.filter(
+      ({ models }) => Array.isArray(models) && models.length > 0
+    )
   }
 
   private getHuggingFaceHeaders(hfToken?: string): HeadersInit | undefined {
@@ -225,21 +375,37 @@ export class DefaultModelsService implements ModelsService {
   async searchHuggingFaceCandidates(
     query: string,
     hfToken?: string,
-    limit = HUGGING_FACE_SEARCH_LIMIT
+    limit = HUGGING_FACE_SEARCH_LIMIT,
+    format: HuggingFaceFeedFormat = 'gguf'
   ): Promise<CatalogModel[]> {
     const trimmed = query.trim()
     if (trimmed.length < 3) return []
     try {
-      const ggufQuery = /\bgguf\b/i.test(trimmed) ? trimmed : `${trimmed} GGUF`
+      const params = huggingFaceFormatParams(
+        format,
+        { search: trimmed },
+        { limit: String(limit) }
+      )
       const response = await fetch(
-        `https://huggingface.co/api/models?search=${encodeURIComponent(ggufQuery)}&limit=${limit}`,
+        `https://huggingface.co/api/models?${params.toString()}`,
         { headers: this.getHuggingFaceHeaders(hfToken) }
       )
-      if (!response.ok) return []
+      if (!response.ok) {
+        throw new Error(
+          `Failed to search Hugging Face: ${response.status} ${response.statusText}`
+        )
+      }
       const raw = (await response.json()) as HuggingFaceRepoSearchResult[]
       const ranked = raw
         .filter((repo) => getHuggingFaceRepoId(repo))
-        .filter(isLikelyGgufRepo)
+        .filter((repo) =>
+          format === 'gguf'
+            ? isLikelyGgufRepo(repo)
+            : format === 'mlx'
+              ? repo.tags?.some((tag) => tag.toLowerCase() === 'mlx')
+              : // Every safetensors repository: the Hub narrows it, the core decides.
+                true
+        )
         .sort(
           (a, b) =>
             scoreHuggingFaceRepoMatch(trimmed, b) -
@@ -263,13 +429,91 @@ export class DefaultModelsService implements ModelsService {
           mmproj_models: [],
           num_safetensors: 0,
           safetensors_files: [],
-          is_mlx: (repo.tags ?? []).some((t) => t.toLowerCase() === 'mlx'),
+          is_mlx: format === 'mlx',
+          ...(format === 'safetensors' ? managedListingFields(repo) : {}),
           readme: `https://huggingface.co/${repoId}/resolve/main/README.md`,
         } satisfies CatalogModel
       })
     } catch (error) {
+      // Rethrown, not swallowed: a caller that shows "nothing found" for a
+      // request that never reached Hugging Face is lying to the user. The Hub
+      // catches and shows its curated results alone; the composer's model
+      // list says the search could not be made.
       console.warn('searchHuggingFaceCandidates failed:', error)
-      return []
+      throw error
+    }
+  }
+
+  async listHuggingFaceFeed({
+    format,
+    sort,
+    search,
+    cursor,
+    limit = HUGGING_FACE_FEED_LIMIT,
+    hfToken,
+  }: HuggingFaceFeedParams): Promise<HuggingFaceFeedPage> {
+    const params = huggingFaceFormatParams(format, {}, {
+      sort: HUGGING_FACE_FEED_SORT[sort],
+      direction: '-1',
+      limit: String(limit),
+    })
+    if (search?.trim()) params.set('search', search.trim())
+    if (cursor) params.set('cursor', cursor)
+    const url = `https://huggingface.co/api/models?${params.toString()}`
+    // The next page lives in the `Link` header. Hugging Face exposes it to
+    // cross-origin fetches; the Tauri HTTP plugin is the fallback for a
+    // webview whose plain fetch fails, as the registries do.
+    let response: Response
+    try {
+      response = await fetch(url, {
+        headers: this.getHuggingFaceHeaders(hfToken),
+      })
+    } catch (primaryError) {
+      if (!isTauriRuntime()) throw primaryError
+      response = await (fetchTauri as typeof fetch)(url, {
+        headers: this.getHuggingFaceHeaders(hfToken),
+      })
+    }
+    if (!response.ok) {
+      throw new Error(
+        `Failed to list Hugging Face models: ${response.status} ${response.statusText}`
+      )
+    }
+    const raw = (await response.json()) as HuggingFaceFeedEntry[]
+    const models = raw
+      .filter((repo) => getHuggingFaceRepoId(repo))
+      .map((repo) => {
+        const repoId = getHuggingFaceRepoId(repo)
+        const developer = repoId.includes('/')
+          ? repoId.split('/', 1)[0]
+          : undefined
+        const tags = repo.tags ?? []
+        return {
+          model_name: repoId,
+          developer,
+          downloads: repo.downloads ?? 0,
+          likes: repo.likes ?? 0,
+          description: `**Tags**: ${tags.join(', ')}`,
+          // No quants / mmproj here — the list endpoint carries no file sizes;
+          // the row's detail fetch fills them in once it is on screen.
+          num_quants: 0,
+          quants: [],
+          num_mmproj: 0,
+          mmproj_models: [],
+          num_safetensors: 0,
+          safetensors_files: [],
+          is_mlx:
+            format === 'mlx' ||
+            (format === 'gguf' && tags.some((t) => t.toLowerCase() === 'mlx')),
+          ...(format === 'safetensors' ? managedListingFields(repo) : {}),
+          created_at: repo.createdAt,
+          last_modified: repo.lastModified,
+          readme: `https://huggingface.co/${repoId}/resolve/main/README.md`,
+        } satisfies CatalogModel
+      })
+    return {
+      models,
+      nextCursor: parseHuggingFaceNextCursor(response.headers.get('link')),
     }
   }
 
@@ -314,26 +558,33 @@ export class DefaultModelsService implements ModelsService {
         file.rfilename.toLowerCase().endsWith('.gguf')
       ) || []
 
-    // Separate regular GGUF files from mmproj and MTP companion files
+    // Keep only files that are runnable weights: drop the projectors, the MTP
+    // heads, and everything else a repo ships alongside its quants (imatrix
+    // dumps, DFlash/EAGLE drafts, vocab-only and audio-companion GGUFs) — none
+    // of those load as a model, and offering them is a download the user has to
+    // throw away.
     const regularGgufFiles = ggufFiles.filter(
       (file) =>
         !file.rfilename.toLowerCase().includes('mmproj') &&
-        !isMtpCompanionFile(file.rfilename)
+        !isNonWeightGgufFile(file.rfilename)
     )
 
     const mmprojFiles = ggufFiles.filter((file) =>
       file.rfilename.toLowerCase().includes('mmproj')
     )
 
-    // Convert regular GGUF files to quants format
-    const quants = regularGgufFiles.map((file) => {
+    // Convert regular GGUF files to quants format. A quant split across shards
+    // is one downloadable variant, quoted at the size of the whole set.
+    const quants = groupGgufShards(regularGgufFiles).map((shards) => {
+      const first = shards[0]
       // Generate model_id from filename (remove .gguf extension, case-insensitive)
-      const modelId = file.rfilename.replace(/\.gguf$/i, '')
+      const modelId = ggufShardGroupKey(first.rfilename).replace(/\.gguf$/i, '')
+      const totalSize = shards.reduce((sum, file) => sum + (file.size ?? 0), 0)
 
       return {
         model_id: `${repo.author}/${sanitizeModelId(modelId)}`,
-        path: `https://huggingface.co/${repo.modelId}/resolve/main/${file.rfilename}`,
-        file_size: formatFileSize(file.size),
+        path: `https://huggingface.co/${repo.modelId}/resolve/main/${first.rfilename}`,
+        file_size: formatFileSize(totalSize),
       }
     })
 
@@ -374,7 +625,9 @@ export class DefaultModelsService implements ModelsService {
       model_name: repo.modelId,
       developer: repo.author,
       downloads: repo.downloads || 0,
+      likes: repo.likes || 0,
       created_at: repo.createdAt,
+      last_modified: repo.last_modified,
       num_quants: quants.length,
       quants: quants,
       num_mmproj: mmprojModels.length,
@@ -406,9 +659,10 @@ export class DefaultModelsService implements ModelsService {
     mmprojPath?: string,
     mmprojSha256?: string,
     mmprojSize?: number,
-    resume: boolean = false
+    resume: boolean = false,
+    provider?: string
   ): Promise<void> {
-    return this.getEngine()?.import(id, {
+    return this.getEngine(provider)?.import(id, {
       modelPath,
       mmprojPath,
       modelSha256,
@@ -425,12 +679,10 @@ export class DefaultModelsService implements ModelsService {
     mmprojPath?: string,
     hfToken?: string,
     skipVerification: boolean = true,
-    resume: boolean = false
-  ): Promise<void> {
-    let modelSha256: string | undefined
-    let modelSize: number | undefined
-    let mmprojSha256: string | undefined
-    let mmprojSize: number | undefined
+    resume: boolean = false,
+    options: PullModelOptions = {}
+  ): Promise<DownloadRefusal | undefined> {
+    let { modelSha256, modelSize, mmprojSha256, mmprojSize } = options
 
     // Extract repo ID from model URL
     // URL format: https://huggingface.co/{repo}/resolve/main/{filename}
@@ -481,11 +733,43 @@ export class DefaultModelsService implements ModelsService {
       }
     }
 
+    // Will it fit? Asked here, before anything is recorded or started, so a
+    // model that cannot fit is declined with the list still on screen instead
+    // of surfacing as a failed download a moment after the row said
+    // "Downloading". Every entry point sets `localDownloadingModels` (and the
+    // Hub its origin) before calling; on a refusal that is undone here, since
+    // most of them do not await the pull. A resume is left to the Rust check,
+    // which knows how much of the partial already counts.
+    if (!resume) {
+      const refusal = await preflightDownloadDiskSpace({
+        modelPath,
+        mmprojPath,
+        modelSize,
+        mmprojSize,
+      })
+      if (refusal) {
+        const store = useDownloadStore.getState()
+        store.removeLocalDownloadingModel(id)
+        store.clearDownloadOrigin(id)
+        toast.error(i18n.t('common:toast.downloadWontFit.title'), {
+          id: 'download-wont-fit',
+          description: i18n.t('common:toast.downloadWontFit.description', {
+            model: id,
+            needed: formatBytes(refusal.needed),
+            available: formatBytes(refusal.available) || '0 B',
+          }),
+          duration: 15000,
+        })
+        return refusal
+      }
+    }
+
     // ATO-154: record resume parameters at the single GGUF download-start
     // choke point so the global Download popover can resume a paused download
     // (it only knows the model id, not these HF paths/token). MLX downloads go
     // through `engine.import` directly and are pause/resume-gated out.
     useDownloadStore.getState().setResumeParams(id, {
+      ...options,
       modelPath,
       mmprojPath,
       hfToken,
@@ -496,11 +780,18 @@ export class DefaultModelsService implements ModelsService {
     // DownloadManagement listeners; this records the start (+ duration anchor).
     try {
       markDownloadStart(id)
-      posthog.capture('model_download', {
-        status: 'started',
+      queuedCapture('model_download', {
+        // NOT `status` — globally typed numeric in PostHog by
+        // `api_server_request.status`, which silently nulls string values.
+        // Must stay in sync with the terminal event in DownloadManagement.
+        download_status: 'started',
         download_kind: 'model',
-        model_id: id,
+        model_id: normalizeModelId(id),
         quant: quantFromModelId(id),
+        // Usually `unknown` here: the byte count comes from HuggingFace
+        // metadata that is only fetched when `skipVerification` is false, and
+        // it defaults to true. The terminal event carries the real size from
+        // the downloader, so read `size_bucket` off that.
         size_bucket: sizeBucket(modelSize),
         is_hf_url: isHfUrl(modelPath),
         resolved_asset_url_host: urlHost(modelPath),
@@ -512,7 +803,7 @@ export class DefaultModelsService implements ModelsService {
 
     // Call the original pullModel with the fetched metadata
     try {
-      return await this.pullModel(
+      await this.pullModel(
         id,
         modelPath,
         modelSha256,
@@ -520,8 +811,10 @@ export class DefaultModelsService implements ModelsService {
         mmprojPath,
         mmprojSha256,
         mmprojSize,
-        resume
+        resume,
+        options.provider
       )
+      return undefined
     } catch (error) {
       // ATO-154: a paused download stops the underlying transfer (which rejects
       // this promise with a cancellation error). Swallow it so the initiator's
@@ -542,13 +835,14 @@ export class DefaultModelsService implements ModelsService {
   }
 
   async abortDownload(id: string): Promise<void> {
-    const llamacppEngine = this.getEngine(LOCAL_LLAMACPP_PROVIDER)
-    const mlxEngine = this.getEngine('mlx')
+    // A Bonsai file downloads under PrismML's own task id: every engine that
+    // may hold `id` is asked, and the ones that do not hold it ignore it.
+    const engines = [LOCAL_LLAMACPP_PROVIDER, 'atomic-prism', 'mlx'].map(
+      (provider) => this.getEngine(provider)
+    )
     try {
       await Promise.allSettled(
-        [llamacppEngine?.abortImport(id), mlxEngine?.abortImport(id)].filter(
-          Boolean
-        )
+        engines.map((engine) => engine?.abortImport(id)).filter(Boolean)
       )
     } finally {
       events.emit(DownloadEvent.onFileDownloadStopped, {
@@ -558,8 +852,23 @@ export class DefaultModelsService implements ModelsService {
     }
   }
 
-  async deleteModel(id: string, provider?: string): Promise<void> {
-    return this.getEngine(provider)?.delete(id)
+  async deleteModel(
+    id: string,
+    provider?: string
+  ): Promise<ModelDeletionReport | void> {
+    const engine = this.getEngine(provider)
+    // `getEngine()?.delete()` used to resolve to `undefined` when the provider
+    // had no engine registered, so the caller reported a successful delete and
+    // the weights stayed on disk. Fail loudly instead — same reasoning as the
+    // `LOCAL_LLAMACPP_PROVIDER` note above.
+    if (!engine) {
+      throw new Error(
+        `No engine registered for provider "${provider ?? defaultProvider}"`
+      )
+    }
+    // `AIEngine.delete` answers nothing; an engine that can say what it freed offers this too.
+    if (reportsDeletion(engine)) return engine.deleteWithReport(id)
+    return engine.delete(id)
   }
 
   async getActiveModels(provider?: string): Promise<string[]> {
@@ -634,10 +943,32 @@ export class DefaultModelsService implements ModelsService {
     )
   }
 
+  async stopAllModelsExcept(
+    modelId: string,
+    providerName: string
+  ): Promise<void> {
+    const activeByProvider = await this.getLocalActiveModelsByProvider()
+    await Promise.all(
+      activeByProvider.flatMap(({ provider, models }) =>
+        models
+          .filter((model) => !(provider === providerName && model === modelId))
+          .map((model) => this.stopModel(model, provider))
+      )
+    )
+  }
+
+  async cancelModelLoad(provider: string, model: string): Promise<boolean> {
+    const engine = this.getEngine(provider)
+    // An extension bundled against an older core has no `cancelLoad`.
+    if (typeof engine?.cancelLoad !== 'function') return false
+    return engine.cancelLoad(model)
+  }
+
   async startModel(
     provider: ProviderObject,
     model: string,
-    bypassAutoUnload: boolean = false
+    bypassAutoUnload: boolean = false,
+    options?: ModelLoadOptions
   ): Promise<SessionInfo | undefined> {
     const engine = this.getEngine(provider.provider)
     if (!engine) return undefined
@@ -666,8 +997,12 @@ export class DefaultModelsService implements ModelsService {
         )
       : undefined
 
+    // A chat model and an image model share one GPU: the image side makes
+    // room before it loads (lib/diffusion/arbiter.ts), and so does this side.
+    await makeRoomForChatModel(engine, model)
+
     return engine
-      .load(model, settings, false, bypassAutoUnload)
+      .load(model, settings, false, bypassAutoUnload, options)
       .catch((error) => {
         console.error(
           `Failed to start model ${model} for provider ${provider.provider}:`,
@@ -996,7 +1331,10 @@ export class DefaultModelsService implements ModelsService {
               : Array.isArray(msg.content) && msg.content.length > 0
           ) // Filter out empty messages
 
-        if (transformedMessages.length === 0) {
+        // llama-server treats a trailing assistant message as a prefill and
+        // drops it, so assistant turns alone reach the chat template as an
+        // empty list, which Gemma's template rejects with a 500.
+        if (!transformedMessages.some((msg) => msg.role !== 'assistant')) {
           return 0
         }
 
@@ -1033,4 +1371,14 @@ export class DefaultModelsService implements ModelsService {
       return 0
     }
   }
+}
+
+/** An engine whose delete reports the space it freed (the TensorRT-LLM extension, task 3.15). */
+function reportsDeletion(engine: unknown): engine is {
+  deleteWithReport(modelId: string): Promise<ModelDeletionReport>
+} {
+  return (
+    typeof (engine as { deleteWithReport?: unknown }).deleteWithReport ===
+    'function'
+  )
 }

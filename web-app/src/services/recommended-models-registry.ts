@@ -14,7 +14,11 @@
  */
 
 import { fetch as fetchTauri } from '@tauri-apps/plugin-http'
-import { BASELINE_RECOMMENDED_MODELS } from '@/constants/models'
+import { isHardwareTier, type HardwareTier } from '@/lib/hardware-tier'
+import {
+  BASELINE_RECOMMENDED_MODELS,
+  BASELINE_TIER_RECOMMENDATIONS,
+} from '@/constants/models'
 
 export type RecommendationPlatform = 'macos' | 'windows' | 'linux'
 
@@ -23,14 +27,24 @@ export type Recommendation = {
   description_key: string
   platforms?: RecommendationPlatform[]
   active?: boolean
+  /**
+   * Pins which quant to download, matched against the quant token parsed out of
+   * the GGUF filename (see `quantLabel`). Omitted = the client picks its house
+   * default. Only meaningful for entries the client is expected to download
+   * unattended, i.e. the onboarding recommendations.
+   */
+  quant?: string
+  /** Vision models only: pins the multimodal projector quant. */
+  mmproj_quant?: string
 }
 
 export const DEFAULT_REGISTRY_URL =
   'https://raw.githubusercontent.com/AtomicBot-ai/atomic-chat-conf/main/models/recommended.json'
 
 export const REGISTRY_URL: string =
-  (import.meta.env.VITE_RECOMMENDED_MODELS_REGISTRY_URL as string | undefined) ??
-  DEFAULT_REGISTRY_URL
+  (import.meta.env.VITE_RECOMMENDED_MODELS_REGISTRY_URL as
+    | string
+    | undefined) ?? DEFAULT_REGISTRY_URL
 
 /** Highest manifest schema_version this client understands. */
 export const SUPPORTED_SCHEMA_VERSION = 1
@@ -53,12 +67,41 @@ export type RegistryManifest = {
   schema_version: number
   updated_at: string
   recommendations: Recommendation[]
+  /**
+   * REPLACES `recommendations` on machines classified as low-spec — it does not
+   * extend them.
+   *
+   * Superseded by {@link RegistryManifest.tiers}, which covers the same ground
+   * with eleven rungs instead of two. Still parsed and still written to the
+   * manifest, because clients shipped before `tiers` existed read it and
+   * nothing else; this client ignores it.
+   */
+  low_spec_recommendations?: Recommendation[]
+  /**
+   * The one model to offer, per hardware tier — the ladder from ATO-463.
+   *
+   * Deliberately a sibling key rather than a `schema_version` bump: `fetchManifest`
+   * rebuilds the manifest from a fixed key whitelist, so a client built before
+   * this key existed simply ignores it and keeps reading `recommendations` /
+   * `low_spec_recommendations` unchanged. Bumping the version instead would make
+   * every shipped client reject the whole manifest and fall back to its bundled
+   * baseline — the opposite of a config change that ships without a release.
+   *
+   * Unknown tier keys are dropped on parse: the tier vocabulary is a
+   * release-time contract (see `HardwareTier`), the contents are not. A tier
+   * the manifest omits falls back to {@link BASELINE_TIER_RECOMMENDATIONS}, so
+   * a partial `tiers` object is valid and useful.
+   */
+  tiers?: Partial<Record<HardwareTier, Recommendation[]>>
 }
 
 export type RegistrySource = 'remote' | 'cache' | 'baseline'
 
 export type RegistryFetchResult = {
   recommendations: Recommendation[]
+  /** Per-tier lists the manifest carried. Missing tiers fall back to the
+   *  bundled ladder at selection time, so this may be partial or empty. */
+  tiers: Partial<Record<HardwareTier, Recommendation[]>>
   source: RegistrySource
   fetchedAt: number | null
   manifestUpdatedAt: string | null
@@ -70,11 +113,26 @@ export type RegistryFetchResult = {
  * values. Keeps the in-memory shape small and protects against malformed
  * upstream entries.
  */
+/**
+ * Quant pins are used to *select a file to download*, so a malformed or hostile
+ * manifest must not be able to smuggle a token that matches an unintended file.
+ * Restrict hard to the shape real quant labels take (`Q8_0`, `Q4_K_M`, `BF16`).
+ */
+const QUANT_TOKEN = /^[A-Za-z0-9_]{2,16}$/
+
+const sanitizeQuantToken = (value: unknown): string | undefined =>
+  typeof value === 'string' && QUANT_TOKEN.test(value)
+    ? value.toUpperCase()
+    : undefined
+
 const sanitizeRecommendation = (raw: unknown): Recommendation | null => {
   if (typeof raw !== 'object' || raw === null) return null
   const r = raw as Record<string, unknown>
   if (typeof r.model_name !== 'string' || r.model_name.length === 0) return null
-  if (typeof r.description_key !== 'string' || !r.description_key.startsWith('hub:')) {
+  if (
+    typeof r.description_key !== 'string' ||
+    !r.description_key.startsWith('hub:')
+  ) {
     return null
   }
   const platforms = Array.isArray(r.platforms)
@@ -85,12 +143,37 @@ const sanitizeRecommendation = (raw: unknown): Recommendation | null => {
       ) as RecommendationPlatform[])
     : undefined
   const active = typeof r.active === 'boolean' ? r.active : undefined
+  const quant = sanitizeQuantToken(r.quant)
+  const mmprojQuant = sanitizeQuantToken(r.mmproj_quant)
   return {
     model_name: r.model_name,
     description_key: r.description_key,
     ...(platforms && platforms.length > 0 ? { platforms } : {}),
     ...(active === false ? { active: false } : {}),
+    ...(quant ? { quant } : {}),
+    ...(mmprojQuant ? { mmproj_quant: mmprojQuant } : {}),
   }
+}
+
+/**
+ * Keep only keys that name a tier this build knows about, and only entries that
+ * survive {@link sanitizeRecommendation}. An unrecognised key means the manifest
+ * was written for a newer tier vocabulary; dropping it leaves that machine on
+ * the bundled ladder, which is a working recommendation rather than none.
+ */
+const sanitizeTiers = (
+  raw: unknown
+): Partial<Record<HardwareTier, Recommendation[]>> => {
+  if (typeof raw !== 'object' || raw === null) return {}
+  const out: Partial<Record<HardwareTier, Recommendation[]>> = {}
+  for (const [key, value] of Object.entries(raw as Record<string, unknown>)) {
+    if (!isHardwareTier(key) || !Array.isArray(value)) continue
+    const entries = value
+      .map(sanitizeRecommendation)
+      .filter((r): r is Recommendation => r !== null)
+    if (entries.length > 0) out[key] = entries
+  }
+  return out
 }
 
 const isManifestShape = (value: unknown): value is RegistryManifest => {
@@ -218,10 +301,15 @@ const fetchManifest = async (
     .map(sanitizeRecommendation)
     .filter((r): r is Recommendation => r !== null)
 
+  const tiers = sanitizeTiers(data.tiers)
+
+  // Only carried when non-empty so `writeCache` never persists an empty object
+  // that would be indistinguishable from "this manifest has no tier lists".
   return {
     schema_version: data.schema_version,
     updated_at: data.updated_at,
     recommendations,
+    ...(Object.keys(tiers).length > 0 ? { tiers } : {}),
   }
 }
 
@@ -269,13 +357,17 @@ export type FetchOptions = {
 export const getRecommendationsOrFallback = async (
   options: FetchOptions = {}
 ): Promise<RegistryFetchResult> => {
-  const { force = false, url = REGISTRY_URL, timeoutMs = FETCH_TIMEOUT_MS } =
-    options
+  const {
+    force = false,
+    url = REGISTRY_URL,
+    timeoutMs = FETCH_TIMEOUT_MS,
+  } = options
 
   const cached = getCachedManifest()
   if (!force && isCacheFresh(cached) && cached) {
     return {
       recommendations: cached.manifest.recommendations.slice(),
+      tiers: { ...(cached.manifest.tiers ?? {}) },
       source: 'cache',
       fetchedAt: cached.fetchedAt,
       manifestUpdatedAt: cached.manifest.updated_at,
@@ -303,6 +395,7 @@ export const getRecommendationsOrFallback = async (
     )
     return {
       recommendations: manifest.recommendations.slice(),
+      tiers: { ...(manifest.tiers ?? {}) },
       source: 'remote',
       fetchedAt,
       manifestUpdatedAt: manifest.updated_at,
@@ -321,6 +414,7 @@ export const getRecommendationsOrFallback = async (
     if (cached) {
       return {
         recommendations: cached.manifest.recommendations.slice(),
+        tiers: { ...(cached.manifest.tiers ?? {}) },
         source: 'cache',
         fetchedAt: cached.fetchedAt,
         manifestUpdatedAt: cached.manifest.updated_at,
@@ -329,6 +423,7 @@ export const getRecommendationsOrFallback = async (
     }
     return {
       recommendations: BASELINE_RECOMMENDED_MODELS.slice(),
+      tiers: {},
       source: 'baseline',
       fetchedAt: null,
       manifestUpdatedAt: null,
@@ -351,3 +446,24 @@ export const filterRecommendationsForPlatform = (
   recommendations.filter(
     (r) => r.active !== false && (!r.platforms || r.platforms.includes(os))
   )
+
+/**
+ * The recommendations for one tier, primary first.
+ *
+ * The manifest wins when it names this tier, so the offer can be changed
+ * without a release; otherwise the bundled ladder does, which is a real
+ * recommendation rather than an empty picker. A manifest that carries `tiers`
+ * but omits *this* tier falls back per-tier, not wholesale — a partial `tiers`
+ * object is a legitimate way to override one rung.
+ */
+export const selectTierRecommendations = (
+  tiers: Partial<Record<HardwareTier, Recommendation[]>> | undefined,
+  tier: HardwareTier
+): Recommendation[] => {
+  const fromManifest = tiers?.[tier]
+  return (
+    fromManifest && fromManifest.length > 0
+      ? fromManifest
+      : BASELINE_TIER_RECOMMENDATIONS[tier]
+  ).slice()
+}

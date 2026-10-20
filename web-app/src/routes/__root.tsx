@@ -3,38 +3,49 @@ import { createRootRoute, Outlet } from '@tanstack/react-router'
 
 import DialogAppUpdater from '@/containers/dialogs/AppUpdater'
 import BackendUpdater from '@/containers/dialogs/BackendUpdater'
-import TurboquantOptimalBackendDialog from '@/containers/dialogs/TurboquantOptimalBackendDialog'
+import EngineUpdateBanner from '@/containers/dialogs/EngineUpdateBanner'
+import ModelLoadSnackbar from '@/containers/ModelLoadSnackbar'
+import SuboptimalBackendDialog from '@/containers/dialogs/SuboptimalBackendDialog'
 import { Fragment } from 'react/jsx-runtime'
 import { ThemeProvider } from '@/providers/ThemeProvider'
 import { InterfaceProvider } from '@/providers/InterfaceProvider'
 import { KeyboardShortcutsProvider } from '@/providers/KeyboardShortcuts'
 import { DataProvider } from '@/providers/DataProvider'
+import { DeferredFirstSendProvider } from '@/providers/DeferredFirstSendProvider'
 import { route } from '@/constants/routes'
 import { ExtensionProvider } from '@/providers/ExtensionProvider'
 import { ToasterProvider } from '@/providers/ToasterProvider'
 // import { useAnalytic } from '@/hooks/useAnalytic'
 // import { PromptAnalytic } from '@/containers/analytics/PromptAnalytic'
-import { useJanModelPrompt } from '@/hooks/useJanModelPrompt'
-import { PromptJanModel } from '@/containers/PromptJanModel'
+import { useOnboardingModelReminder } from '@/hooks/useOnboardingModelReminder'
+import { PromptOnboardingModel } from '@/containers/PromptOnboardingModel'
+import { DownloadManagement } from '@/containers/DownloadManegement'
 import { AnalyticProvider } from '@/providers/AnalyticProvider'
 import { useLeftPanel } from '@/hooks/useLeftPanel'
 import { useTrayStatusSync } from '@/hooks/useTrayStatusSync'
+import { useRemoteAccessSync } from '@/hooks/useRemoteAccessSync'
+import { useManagedEnvironmentSync } from '@/hooks/useManagedEnvironmentSync'
+import { useEngineVersionsSync } from '@/hooks/useEngineVersionsSync'
 import ToolApproval from '@/containers/dialogs/ToolApproval'
 import AgentApprovalDialog from '@/containers/dialogs/AgentApprovalDialog'
 import AgentFolderAccessDialog from '@/containers/dialogs/AgentFolderAccessDialog'
+import VoiceSetupDialog from '@/containers/dialogs/VoiceSetupDialog'
+import ImageSetupDialog from '@/containers/dialogs/ImageSetupDialog'
+import { ImageGenerationProvider } from '@/providers/ImageGenerationProvider'
+import { VideoGenerationProvider } from '@/providers/VideoGenerationProvider'
 import { TranslationProvider } from '@/i18n/TranslationContext'
-import OutOfContextPromiseModal from '@/containers/dialogs/OutOfContextDialog'
 import AttachmentIngestionDialog from '@/containers/dialogs/AttachmentIngestionDialog'
 import WhatsNewDialog from '@/containers/dialogs/WhatsNewDialog'
-import { useEffect, useState } from 'react'
-import { localStorageKey } from '@/constants/localStorage'
+import { useEffect } from 'react'
+import { useSetupCompleted } from '@/hooks/useSetupCompleted'
 import GlobalError from '@/containers/GlobalError'
 import * as Sentry from '@sentry/react'
 import { GlobalEventHandler } from '@/providers/GlobalEventHandler'
+import { StartupBackendCoordinator } from '@/providers/StartupBackendCoordinator'
 import { ServiceHubProvider } from '@/providers/ServiceHubProvider'
 import { SidebarInset, SidebarProvider } from '@/components/ui/sidebar'
 import { LeftSidebar } from '@/components/left-sidebar'
-import { WindowControls } from '@/components/WindowControls'
+import { ManagedEngineOperationBar } from '@/containers/managed-engine/ManagedEngineOperationBar'
 
 export const Route = createRootRoute({
   component: RootLayout,
@@ -47,49 +58,25 @@ export const Route = createRootRoute({
   },
 })
 
-const SETUP_COMPLETED_EVENT = 'app:setup-completed'
-
-/// Tracks the `setup-completed` localStorage flag so we can defer mounting
-/// `<BackendUpdater />` until after the dedicated onboarding flow finishes.
-/// During onboarding the SetupBackendStep handles backend recommendations
-/// inline; mounting the global dialog before then would surface a duplicate
-/// modal on top of the setup screen.
-function useSetupCompleted(): boolean {
-  const [completed, setCompleted] = useState(() => {
-    if (typeof window === 'undefined') return false
-    return localStorage.getItem(localStorageKey.setupCompleted) === 'true'
-  })
-
-  useEffect(() => {
-    const sync = () => {
-      setCompleted(
-        localStorage.getItem(localStorageKey.setupCompleted) === 'true'
-      )
-    }
-    // Same-tab signal dispatched explicitly by SetupScreen when it persists
-    // the flag (the native 'storage' event only fires across tabs).
-    window.addEventListener(SETUP_COMPLETED_EVENT, sync)
-    window.addEventListener('storage', sync)
-    return () => {
-      window.removeEventListener(SETUP_COMPLETED_EVENT, sync)
-      window.removeEventListener('storage', sync)
-    }
-  }, [])
-
-  return completed
-}
-
 const AppLayout = () => {
-  const { showJanModelPrompt } = useJanModelPrompt()
-  const {
-    open: isLeftPanelOpen,
-    setLeftPanel,
-    width: sidebarWidth,
-    setLeftPanelWidth,
-  } = useLeftPanel()
+  const { showOnboardingModelReminder } = useOnboardingModelReminder()
+  const isLeftPanelOpen = useLeftPanel((state) => state.open)
+  const setLeftPanel = useLeftPanel((state) => state.setLeftPanel)
+  const sidebarWidth = useLeftPanel((state) => state.width)
+  const setLeftPanelWidth = useLeftPanel((state) => state.setLeftPanelWidth)
   // Feeds live server / model / RAM state into the desktop system tray.
   // No-op outside macOS and Windows Tauri builds (see hook implementation).
   useTrayStatusSync()
+  // Mirrors the Cloudflare tunnel's status for Settings → Remote & LAN and
+  // starts the tunnel with the Local API Server when asked to. No-op wherever
+  // there is no Local API Server (mobile, web).
+  useRemoteAccessSync()
+  // Follows the core's TensorRT-LLM environment and its setup for the whole session, so the
+  // provider page finds a running setup as it is. No-op off Linux.
+  useManagedEnvironmentSync()
+  // Asks the core about every engine's versions for the update banner and the
+  // installed builds lists, again whenever an engine changes. Desktop only.
+  useEngineVersionsSync()
   const isSetupCompleted = useSetupCompleted()
 
   return (
@@ -102,23 +89,19 @@ const AppLayout = () => {
       >
         <AnalyticProvider />
         <KeyboardShortcutsProvider />
-        {/* Fake absolute panel top to enable window drag */}
-        {IS_WINDOWS && <WindowControls />}
-        {/* On Windows we use a fixed overlay for the drag region.
-            On macOS we attach data-tauri-drag-region directly to the
-            SidebarHeader and HeaderPage elements so that the drag area is
-            always the topmost element in those regions (the fixed overlay at
-            z-20 is covered by header content at the same z-level and
-            therefore never receives mousedown events on macOS). */}
-        {IS_WINDOWS && (
-          <div
-            className="fixed w-full h-12 z-20 top-0"
-            data-tauri-drag-region
-          />
-        )}
         <DialogAppUpdater />
         {isSetupCompleted && <BackendUpdater />}
-        {isSetupCompleted && <TurboquantOptimalBackendDialog />}
+        {/* ATO-528/531: offers a new inference-engine build. Gated on
+            the same flag as <BackendUpdater /> — an engine update is
+            noise while onboarding is still picking the first one. */}
+        {isSetupCompleted && <EngineUpdateBanner />}
+        {/* ATO-530: a load the user is waiting on, top-right — the opposite
+            corner from the update banners above, so the two never meet. */}
+        {isSetupCompleted && <ModelLoadSnackbar />}
+        {/* Unlike the recommendation dialogs above, this dialog only opens
+            after ChatInput dispatches a mismatch prompt. Keep it mounted for
+            upgraded/legacy users whose setup-completed flag is absent. */}
+        <SuboptimalBackendDialog />
         <WhatsNewDialog />
         <LeftSidebar />
         <SidebarInset>
@@ -127,9 +110,23 @@ const AppLayout = () => {
           </div>
         </SidebarInset>
 
-        {/* Попап согласия на аналитику отключён; настройки → Privacy по-прежнему доступны */}
+        {/* Analytics consent popup is disabled; Settings → Privacy is still available */}
         {/* {productAnalyticPrompt && <PromptAnalytic />} */}
-        {showJanModelPrompt && <PromptJanModel />}
+        {showOnboardingModelReminder && <PromptOnboardingModel />}
+        {/* ATO-462: mounted once at the root, not inside the sidebar or the
+            header. It used to render in one of two places depending on whether
+            the left panel was open, so a download's progress moved around the
+            screen — or vanished — as the user toggled the sidebar. This is also
+            the component that registers the download event listeners, so a
+            single mount keeps them registered exactly once. */}
+        <DownloadManagement />
+        {/* Binds the image-generation store to the native plugin for the life
+            of the app: a job lives in the plugin, so the run loop and the
+            event subscription must outlive the Images page. */}
+        <ImageGenerationProvider />
+        {/* The video job store, bound once for the same reason; it reads the
+            engine and the resident model through the image store. */}
+        <VideoGenerationProvider />
       </SidebarProvider>
     </div>
   )
@@ -196,15 +193,19 @@ function RootLayout() {
         <TranslationProvider>
           <ExtensionProvider>
             <DataProvider />
+            <DeferredFirstSendProvider />
             <GlobalEventHandler />
+            <ManagedEngineOperationBar />
+            <StartupBackendCoordinator />
             {IS_LOGS_ROUTE ? <LogsLayout /> : <AppLayout />}
           </ExtensionProvider>
           {/* <TanStackRouterDevtools position="bottom-right" /> */}
           <ToolApproval />
           <AgentApprovalDialog />
           <AgentFolderAccessDialog />
+          <VoiceSetupDialog />
+          <ImageSetupDialog />
           <AttachmentIngestionDialog />
-          <OutOfContextPromiseModal />
         </TranslationProvider>
       </ServiceHubProvider>
     </Fragment>

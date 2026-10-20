@@ -1,5 +1,6 @@
-import { act, fireEvent, render, screen } from '@testing-library/react'
+import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
+import { EngineManager, type ThreadMessage } from '@janhq/core'
 
 import { ContextSizeControl } from '@/containers/ContextSizeControl'
 import { useModelProvider } from '@/hooks/useModelProvider'
@@ -10,6 +11,7 @@ const stopModel = vi.fn()
 const startModel = vi.fn()
 const getActiveModels = vi.fn()
 const syncActiveModelsFromEngines = vi.fn()
+const tokenCountState = vi.hoisted(() => ({ value: 164 }))
 
 class MockResizeObserver {
   observe() {}
@@ -23,7 +25,7 @@ beforeAll(() => {
 
 vi.mock('@/hooks/useTokensCount', () => ({
   useTokensCount: () => ({
-    tokenCount: 164,
+    tokenCount: tokenCountState.value,
     maxTokens: 16384,
     isNearLimit: false,
     loading: false,
@@ -36,7 +38,15 @@ vi.mock('@/utils/activeModelsSync', () => ({
     syncActiveModelsFromEngines(...args),
 }))
 
-function setSelectedModel(providerName: string) {
+const fitSetting = (value: boolean) => ({
+  key: 'fit',
+  title: 'Fit context to device memory',
+  description: '',
+  controller_type: 'checkbox',
+  controller_props: { value },
+})
+
+function setSelectedModel(providerName: string, fit?: boolean) {
   const model = {
     id: 'test-model',
     name: 'Test model',
@@ -59,6 +69,7 @@ function setSelectedModel(providerName: string) {
   const provider = {
     provider: providerName,
     models: [model],
+    settings: fit === undefined ? [] : [fitSetting(fit)],
   } as ModelProvider
 
   useModelProvider.setState({
@@ -71,6 +82,7 @@ function setSelectedModel(providerName: string) {
 describe('ContextSizeControl', () => {
   beforeEach(() => {
     vi.clearAllMocks()
+    tokenCountState.value = 164
     getActiveModels.mockResolvedValue([])
     seedServiceHub({
       models: {
@@ -102,18 +114,79 @@ describe('ContextSizeControl', () => {
     ).not.toBeInTheDocument()
   })
 
-  it('keeps the previous token usage details inside the context editor', () => {
+  it('shows the current input and latest output token usage', () => {
     setSelectedModel('llamacpp')
-    render(<ContextSizeControl />)
+    const messages = [
+      {
+        role: 'assistant',
+        metadata: {
+          usage: {
+            outputTokens: 24,
+          },
+        },
+      } as ThreadMessage,
+    ]
+    render(<ContextSizeControl messages={messages} />)
 
     fireEvent.click(screen.getByRole('button', { name: 'Context usage: 1.0%' }))
 
-    expect(screen.getByText('Text')).toBeInTheDocument()
-    expect(screen.getByText('Remaining')).toBeInTheDocument()
-    expect(screen.getByText('164')).toBeInTheDocument()
+    expect(screen.getByText('Input')).toBeInTheDocument()
+    expect(screen.getByText('Output')).toBeInTheDocument()
+    expect(screen.queryByText('Remaining')).not.toBeInTheDocument()
+    expect(screen.getByText('140')).toBeInTheDocument()
+    expect(screen.getByText('24')).toBeInTheDocument()
     expect(screen.getByText('164 / 16.4K')).toBeInTheDocument()
-    expect(screen.getByRole('slider')).toHaveAttribute('aria-valuemax', '65536')
+    expect(screen.getByRole('progressbar').firstElementChild).toHaveClass(
+      'bg-emerald-500'
+    )
+    expect(screen.getByRole('slider')).toHaveAttribute(
+      'aria-valuemax',
+      '524288'
+    )
   })
+
+  it('falls back to response usage when a new chat has not been tokenized', () => {
+    tokenCountState.value = 0
+    setSelectedModel('llamacpp')
+    const messages = [
+      {
+        role: 'assistant',
+        metadata: {
+          usage: {
+            inputTokens: 37,
+            outputTokens: 11,
+            totalTokens: 48,
+          },
+        },
+      } as ThreadMessage,
+    ]
+    render(<ContextSizeControl messages={messages} />)
+
+    fireEvent.click(screen.getByRole('button', { name: 'Context usage: 0.3%' }))
+
+    expect(screen.getByText('37')).toBeInTheDocument()
+    expect(screen.getByText('11')).toBeInTheDocument()
+    expect(screen.getByText('48 / 16.4K')).toBeInTheDocument()
+  })
+
+  it.each([
+    [12000, 'bg-orange-500'],
+    [14700, 'bg-destructive'],
+  ])(
+    'changes the context progress tone at usage thresholds',
+    (additionalTokens, expectedClass) => {
+      setSelectedModel('llamacpp')
+      render(<ContextSizeControl additionalTokens={additionalTokens} />)
+
+      fireEvent.click(
+        screen.getByRole('button', { name: /Context usage:/ })
+      )
+
+      expect(screen.getByRole('progressbar').firstElementChild).toHaveClass(
+        expectedClass
+      )
+    }
+  )
 
   it('persists the edited context size through the model provider store', () => {
     setSelectedModel('llamacpp')
@@ -127,7 +200,29 @@ describe('ContextSizeControl', () => {
     expect(
       useModelProvider.getState().selectedModel?.settings?.ctx_len
         ?.controller_props.value
-    ).toBe(65536)
+    ).toBe(524288)
+  })
+
+  it('uses the model training limit when the engine provides one', async () => {
+    const getMaxCtxTrain = vi.fn().mockResolvedValue(131072)
+    const engineManager = vi
+      .spyOn(EngineManager, 'instance')
+      .mockReturnValue({
+        get: () => ({ getMaxCtxTrain }),
+      } as unknown as EngineManager)
+    setSelectedModel('llamacpp')
+    render(<ContextSizeControl />)
+
+    fireEvent.click(screen.getByRole('button', { name: /Context usage:/ }))
+
+    await waitFor(() =>
+      expect(screen.getByRole('slider')).toHaveAttribute(
+        'aria-valuemax',
+        '131072'
+      )
+    )
+    expect(getMaxCtxTrain).toHaveBeenCalledWith('test-model')
+    engineManager.mockRestore()
   })
 
   it('restarts a running model after the context size changes', async () => {
@@ -158,5 +253,69 @@ describe('ContextSizeControl', () => {
     )
     expect(syncActiveModelsFromEngines).toHaveBeenCalled()
     vi.useRealTimers()
+  })
+
+  describe('fit to device memory', () => {
+    it('shows the fit switch for a llama.cpp engine and disables the slider while it is on', () => {
+      // Under fit the slider used to be ignored silently (`--ctx-size` is
+      // not emitted); now it says so by being disabled.
+      setSelectedModel('llamacpp-upstream', true)
+      render(<ContextSizeControl />)
+      fireEvent.click(
+        screen.getByRole('button', { name: 'Context usage: 1.0%' })
+      )
+
+      expect(
+        screen.getByRole('switch', { name: 'assistants:contextSizeFit' })
+      ).toBeChecked()
+      expect(screen.getByRole('slider')).toHaveAttribute('data-disabled')
+    })
+
+    it('hands the slider back when fit is switched off', async () => {
+      const updateSettings = vi.fn().mockResolvedValue(undefined)
+      seedServiceHub({
+        models: {
+          stopModel,
+          startModel,
+          getActiveModels,
+        } as unknown as ModelsService,
+        providers: {
+          updateSettings,
+        } as unknown as Parameters<typeof seedServiceHub>[0]['providers'],
+      })
+      setSelectedModel('llamacpp-upstream', true)
+      render(<ContextSizeControl />)
+      fireEvent.click(
+        screen.getByRole('button', { name: 'Context usage: 1.0%' })
+      )
+
+      fireEvent.click(
+        screen.getByRole('switch', { name: 'assistants:contextSizeFit' })
+      )
+
+      await waitFor(() =>
+        expect(screen.getByRole('slider')).not.toHaveAttribute('data-disabled')
+      )
+      expect(updateSettings).toHaveBeenCalledWith(
+        'llamacpp-upstream',
+        expect.arrayContaining([
+          expect.objectContaining({
+            key: 'fit',
+            controller_props: expect.objectContaining({ value: false }),
+          }),
+        ])
+      )
+    })
+
+    it('offers no fit switch for an engine without the flag', () => {
+      setSelectedModel('mlx')
+      render(<ContextSizeControl />)
+      fireEvent.click(
+        screen.getByRole('button', { name: 'Context usage: 1.0%' })
+      )
+
+      expect(screen.queryByRole('switch')).toBeNull()
+      expect(screen.getByRole('slider')).not.toHaveAttribute('data-disabled')
+    })
   })
 })

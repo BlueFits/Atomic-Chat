@@ -199,4 +199,116 @@ describe('BaseExtension', () => {
     setItemSpy.mockRestore()
     localStorage.clear()
   })
+
+  it('uses the registered default when a stale backend value is absent from the options', async () => {
+    localStorage.clear()
+    localStorage.setItem(
+      'TestExtension',
+      JSON.stringify([{ key: 'version_backend', controllerProps: { value: 'none' } }])
+    )
+
+    await baseExtension.registerSettings([
+      {
+        key: 'version_backend',
+        controllerProps: {
+          value: 'b99999/macos-arm64',
+          options: [
+            { value: 'latest/macos-arm64', name: 'Latest' },
+            { value: 'b99999/macos-arm64', name: 'Installed' },
+          ],
+        },
+      } as any,
+    ])
+
+    const stored = JSON.parse(localStorage.getItem('TestExtension') ?? '[]')
+    expect(stored[0].controllerProps.value).toBe('b99999/macos-arm64')
+    localStorage.clear()
+  })
+
+  it('takes the freshly registered recommendation over the stored one', async () => {
+    localStorage.clear()
+    localStorage.setItem(
+      'TestExtension',
+      JSON.stringify([
+        {
+          key: 'version_backend',
+          controllerProps: {
+            value: 'b1/macos-arm64',
+            options: [{ value: 'b1/macos-arm64', name: 'b1' }],
+            recommended: 'b0/macos-arm64',
+          },
+        },
+      ])
+    )
+
+    const setItemSpy = vi.spyOn(localStorage, 'setItem')
+
+    await baseExtension.registerSettings([
+      {
+        key: 'version_backend',
+        controllerProps: {
+          value: 'b1/macos-arm64',
+          options: [
+            { value: 'b1/macos-arm64', name: 'b1' },
+            { value: 'b2/macos-arm64', name: 'b2' },
+          ],
+          recommended: 'b2/macos-arm64',
+        },
+      } as any,
+    ])
+
+    const [, latestPayload] = setItemSpy.mock.calls[setItemSpy.mock.calls.length - 1]
+    const persisted = JSON.parse(latestPayload).find(
+      (setting: any) => setting.key === 'version_backend'
+    )
+
+    // A stale recommendation is a dead end: it names a build the dropdown no
+    // longer offers, so the UI points at something the user cannot pick.
+    expect(persisted.controllerProps.recommended).toBe('b2/macos-arm64')
+
+    setItemSpy.mockRestore()
+    localStorage.clear()
+  })
+
+  it('keeps the stored recommendation when the registration carries none', async () => {
+    localStorage.clear()
+    localStorage.setItem(
+      'TestExtension',
+      JSON.stringify([
+        {
+          key: 'version_backend',
+          controllerProps: {
+            value: 'b1/macos-arm64',
+            options: [{ value: 'b1/macos-arm64', name: 'b1' }],
+            recommended: 'b1/macos-arm64',
+          },
+        },
+      ])
+    )
+
+    const setItemSpy = vi.spyOn(localStorage, 'setItem')
+
+    // The settings schema ships an empty recommendation, and every cold start
+    // registers it before the catalog resolves.
+    await baseExtension.registerSettings([
+      {
+        key: 'version_backend',
+        controllerProps: {
+          value: 'b1/macos-arm64',
+          options: [{ value: 'b1/macos-arm64', name: 'b1' }],
+          recommended: '',
+        },
+      } as any,
+    ])
+
+    const [, latestPayload] = setItemSpy.mock.calls[setItemSpy.mock.calls.length - 1]
+    const persisted = JSON.parse(latestPayload).find(
+      (setting: any) => setting.key === 'version_backend'
+    )
+
+    expect(persisted.controllerProps.recommended).toBe('b1/macos-arm64')
+
+    setItemSpy.mockRestore()
+    localStorage.clear()
+  })
 })

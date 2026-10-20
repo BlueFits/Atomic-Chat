@@ -4,10 +4,14 @@ import { useGeneralSetting } from '@/hooks/useGeneralSetting'
 import { useModelProvider } from '@/hooks/useModelProvider'
 import { useServiceHub } from '@/hooks/useServiceHub'
 import { useTranslation } from '@/i18n'
-import { markDownloadCancellationRequested } from '@/lib/downloadCancellation'
+import {
+  isDownloadCancellationError,
+  markDownloadCancellationRequested,
+  wasDownloadCancellationRequested,
+} from '@/lib/downloadCancellation'
 import { extractModelName } from '@/lib/models'
 import { cn, sanitizeModelId } from '@/lib/utils'
-import { CatalogModel } from '@/services/models/types'
+import { CatalogModel, ModelQuant } from '@/services/models/types'
 import { IconX } from '@tabler/icons-react'
 import { DownloadEvent, DownloadState, events } from '@janhq/core'
 import { useCallback, useEffect, useMemo, useState } from 'react'
@@ -17,11 +21,13 @@ import { DEFAULT_MODEL_QUANTIZATIONS } from '@/constants/models'
 
 type ModelProps = {
   model: CatalogModel
+  variant?: ModelQuant
   handleUseModel: (modelId: string) => void
 }
 
 export function DownloadButtonPlaceholder({
   model,
+  variant,
   handleUseModel,
 }: ModelProps) {
   const {
@@ -70,11 +76,13 @@ export function DownloadButtonPlaceholder({
   const [isDownloaded, setDownloaded] = useState<boolean>(false)
 
   const quant =
+    variant ??
     model.quants?.find((e) =>
       DEFAULT_MODEL_QUANTIZATIONS.some((m) =>
         e.model_id.toLowerCase().includes(m)
       )
-    ) ?? model.quants?.[0]
+    ) ??
+    model.quants?.[0]
 
   const modelId = quant?.model_id || model.model_name
 
@@ -179,6 +187,12 @@ export function DownloadButtonPlaceholder({
       removeLocalDownloadingModel(modelId)
       clearDownloadOrigin(modelId)
       markResumableDownload(modelId)
+      if (
+        wasDownloadCancellationRequested(modelId) ||
+        isDownloadCancellationError(error)
+      ) {
+        return
+      }
       toast.error(t('hub:downloadFailed'), {
         description: error instanceof Error ? error.message : String(error),
       })

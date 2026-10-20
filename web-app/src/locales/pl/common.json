@@ -1,7 +1,11 @@
 {
+  "api": "API",
+  "cloud": "Cloud",
   "assistants": "Asystenci",
   "hardware": "Sprzęt",
   "mcp-servers": "Serwery MCP",
+  "connectors": "Konektory",
+  "plugins": "Wtyczki",
   "local_api_server": "Lokalny Serwer API",
   "https_proxy": "Pośrednik HTTPS",
   "extensions": "Rozszerzenia",
@@ -22,12 +26,17 @@
   "recents": "Ostatnie",
   "hub": "Centrum Modeli",
   "models": "Modele",
+  "images": "Images",
+  "video": "Video",
+  "media": "Media",
   "helpSupport": "Pomoc i Obsługa",
   "helpUsImproveJan": "Pomóż nam ulepszyć Atomic Bot",
   "unstarAll": "Usuń Wszystkim Gwiazdkę",
   "unstar": "Usuń Gwiazdkę",
   "deleteAll": "Usuń Wszystko",
   "star": "Dodaj Gwiazdkę",
+  "openInNewWindow": "Otwórz w nowym oknie",
+  "openInNewWindowFailed": "Nie udało się otworzyć tego czatu w nowym oknie",
   "rename": "Zmień Nazwę",
   "delete": "Usuń",
   "copied": "Skopiowano!",
@@ -233,16 +242,13 @@
     "deleteThread": {
       "description": "Na pewno chcesz usunąć ten wątek? Tej operacji nie można cofnąć."
     },
-    "editMessage": {
-      "title": "Edytuj Wiadomość"
-    },
     "messageMetadata": {
       "title": "Metadane Wiadomości"
     }
   },
   "projects": {
     "title": "Projekty",
-    "new": "Nowe Projekty",
+    "new": "Nowy Projekt",
     "addProject": "Dodaj Projekt",
     "addToProject": "Dodaj do projektu",
     "removeFromProject": "Usuń z projektu",
@@ -382,5 +388,18 @@
   "conversationNotAvailable": "Rozmowa niedostępna",
   "conversationNotAvailableDescription": "Rozmowa, do której próbujesz uzyskać dostęp, nie jest dostępna lub została usunięta.",
   "temporaryChat": "Tymczasowy Czat",
-  "temporaryChatTooltip": "Tymczasowy czat nie pojawi się w Twojej historii"
+  "temporaryChatTooltip": "Tymczasowy czat nie pojawi się w Twojej historii",
+  "skills": "Umiejętności",
+  "pluginsMenu": {
+    "title": "Wtyczki",
+    "emptySkills": "Brak umiejętności",
+    "manageSkills": "Zarządzaj umiejętnościami"
+  },
+  "desktopNotification": {
+    "modelReadyTitle": "Model pobrany",
+    "modelReadyBody": "{{name}} jest gotowy do użycia.",
+    "engineReadyTitle": "Silnik zainstalowany",
+    "chatEngineReadyBody": "llama.cpp jest gotowy do uruchamiania modeli.",
+    "mediaEngineReadyBody": "Silnik obrazów i wideo jest gotowy."
+  }
 }

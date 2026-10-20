@@ -254,7 +254,7 @@ async fn join_output(
 }
 
 #[cfg(unix)]
-fn configure_process_tree(command: &mut Command) {
+pub(crate) fn configure_process_tree(command: &mut Command) {
     use std::os::unix::process::CommandExt;
 
     unsafe {
@@ -266,7 +266,7 @@ fn configure_process_tree(command: &mut Command) {
 }
 
 #[cfg(windows)]
-fn configure_process_tree(command: &mut Command) {
+pub(crate) fn configure_process_tree(command: &mut Command) {
     use std::os::windows::process::CommandExt;
 
     const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
@@ -277,9 +277,9 @@ fn configure_process_tree(command: &mut Command) {
 }
 
 #[cfg(not(any(unix, windows)))]
-fn configure_process_tree(_command: &mut Command) {}
+pub(crate) fn configure_process_tree(_command: &mut Command) {}
 
-async fn terminate_process_tree(child: &mut Child, pid: Option<u32>) {
+pub(crate) async fn terminate_process_tree(child: &mut Child, pid: Option<u32>) {
     #[cfg(unix)]
     if let Some(pid) = pid.and_then(|value| i32::try_from(value).ok()) {
         let _ = nix::sys::signal::killpg(
@@ -317,7 +317,7 @@ fn optional_string_array(args: &Value, key: &str) -> Result<Vec<String>, ToolOut
     }
 }
 
-fn interpreter_invocation(
+pub(crate) fn interpreter_invocation(
     script_path: &Path,
     user_args: Vec<String>,
     bundled_script_runtime: Option<&Path>,
@@ -336,10 +336,22 @@ fn interpreter_invocation(
             } else {
                 "pwsh".into()
             },
-            ["-NoProfile".into(), "-File".into(), path]
-                .into_iter()
-                .chain(user_args)
-                .collect(),
+            // Windows clients default to the `Restricted` execution policy,
+            // under which `-File` refuses every script; scope the bypass to
+            // this one process.
+            if cfg!(windows) {
+                vec![
+                    "-NoProfile".into(),
+                    "-ExecutionPolicy".into(),
+                    "Bypass".into(),
+                ]
+            } else {
+                vec!["-NoProfile".into()]
+            }
+            .into_iter()
+            .chain(["-File".into(), path])
+            .chain(user_args)
+            .collect(),
         ),
         "js" | "mjs" | "cjs" | "ts" => (
             bundled_script_runtime
@@ -506,13 +518,23 @@ mod tests {
     #[tokio::test]
     async fn reports_script_timeout() {
         let temp = TempDir::new().unwrap();
+        // On Windows `bash` resolves to the System32 WSL stub, which exits
+        // immediately when no distribution is installed — use cmd.exe there.
+        let (program, arguments) = if cfg!(windows) {
+            (
+                "cmd.exe".to_string(),
+                vec!["/C".into(), "ping -n 30 127.0.0.1 >nul".into()],
+            )
+        } else {
+            ("bash".to_string(), vec!["-c".into(), "sleep 2".into()])
+        };
         let invocation = SkillScriptInvocation {
             skill_name: "test-skill".into(),
             script_name: "slow.sh".into(),
             skill_root: temp.path().to_path_buf(),
             script_path: temp.path().join("slow.sh"),
-            program: "bash".into(),
-            arguments: vec!["-c".into(), "sleep 2".into()],
+            program,
+            arguments,
             timeout_ms: 1_000,
         };
         let error = run_invocation(&invocation, &CancellationToken::new())
@@ -548,16 +570,32 @@ mod tests {
     #[tokio::test]
     async fn terminates_scripts_that_exceed_the_output_limit() {
         let temp = TempDir::new().unwrap();
+        // Same WSL-stub problem as `reports_script_timeout`: spell the
+        // infinite-output loop in cmd.exe on Windows.
+        let (program, arguments) = if cfg!(windows) {
+            (
+                "cmd.exe".to_string(),
+                vec![
+                    "/C".into(),
+                    "for /L %i in (0,0,1) do @echo xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx".into(),
+                ],
+            )
+        } else {
+            (
+                "bash".to_string(),
+                vec![
+                    "-c".into(),
+                    "while true; do printf xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx; done".into(),
+                ],
+            )
+        };
         let invocation = SkillScriptInvocation {
             skill_name: "test-skill".into(),
             script_name: "noisy.sh".into(),
             skill_root: temp.path().to_path_buf(),
             script_path: temp.path().join("noisy.sh"),
-            program: "bash".into(),
-            arguments: vec![
-                "-c".into(),
-                "while true; do printf xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx; done".into(),
-            ],
+            program,
+            arguments,
             timeout_ms: 5_000,
         };
 

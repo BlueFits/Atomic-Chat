@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { renderHook, act } from '@testing-library/react'
+import { renderHook, act, waitFor } from '@testing-library/react'
 import { useAppUpdater } from '../useAppUpdater'
 import type { EventsService } from '@/services/events/types'
 import type { ModelsService } from '@/services/models/types'
@@ -23,6 +23,11 @@ vi.mock('@janhq/core', () => ({
     onAppUpdateDownloadSuccess: 'onAppUpdateDownloadSuccess',
     onAppUpdateDownloadError: 'onAppUpdateDownloadError',
   },
+}))
+
+const mockToastError = vi.hoisted(() => vi.fn())
+vi.mock('sonner', () => ({
+  toast: { error: mockToastError, info: vi.fn() },
 }))
 
 vi.mock('@/types/events', () => ({
@@ -92,11 +97,23 @@ describe('useAppUpdater', () => {
       isUpdateAvailable: false,
       updateInfo: null,
       isDownloading: false,
+      isInstalling: false,
       downloadProgress: 0,
       downloadedBytes: 0,
       totalBytes: 0,
       remindMeLater: false,
+      // Resolved asynchronously from the Tauri app API, which is absent in
+      // this environment — the build-time `VERSION` define fills in.
+      currentVersion: '',
     })
+  })
+
+  it('reports the running app version once it resolves', async () => {
+    const { result } = renderHook(() => useAppUpdater())
+
+    await waitFor(() =>
+      expect(result.current.updateState.currentVersion).toBe('test')
+    )
   })
 
   it('should set up event listeners for update state sync', () => {
@@ -307,6 +324,13 @@ describe('useAppUpdater', () => {
       expect(mockEventsEmit).toHaveBeenCalledWith('KILL_SIDECAR')
       expect(mockUpdaterDownloadAndInstallWithProgress).toHaveBeenCalled()
       expect(mockRelaunch).toHaveBeenCalled()
+      // Between the last byte and the relaunch the banner says "Installing…"
+      // rather than offering "Update" again.
+      expect(result.current.updateState).toMatchObject({
+        isDownloading: false,
+        isInstalling: true,
+        downloadProgress: 1,
+      })
     })
 
     it('should handle download errors', async () => {
@@ -342,11 +366,77 @@ describe('useAppUpdater', () => {
         expect.any(Error)
       )
       expect(result.current.updateState.isDownloading).toBe(false)
+      expect(result.current.updateState.isInstalling).toBe(false)
+      expect(mockToastError).toHaveBeenCalledTimes(1)
       expect(mockEvents.emit).toHaveBeenCalledWith('onAppUpdateDownloadError', {
         message: 'Download failed',
       })
 
       consoleErrorSpy.mockRestore()
+    })
+
+    it('downloads the update even when stopping local models fails', async () => {
+      const consoleWarnSpy = vi
+        .spyOn(console, 'warn')
+        .mockImplementation(() => {})
+      mockUpdaterCheck.mockResolvedValue({ version: '1.2.0' })
+      // What a release app says when the core behind the engines is missing.
+      mockStopAllModels.mockRejectedValue(
+        new Error('Command atomic_core_call not found')
+      )
+      mockUpdaterDownloadAndInstallWithProgress.mockResolvedValue(undefined)
+
+      const { result } = renderHook(() => useAppUpdater())
+      await act(async () => {
+        await result.current.checkForUpdate()
+      })
+      await act(async () => {
+        await result.current.downloadAndInstallUpdate()
+      })
+
+      expect(mockUpdaterDownloadAndInstallWithProgress).toHaveBeenCalled()
+      expect(mockRelaunch).toHaveBeenCalled()
+      expect(mockEvents.emit).not.toHaveBeenCalledWith(
+        'onAppUpdateDownloadError',
+        expect.anything()
+      )
+      expect(consoleWarnSpy).toHaveBeenCalledWith(
+        'Could not stop local models before the update; updating anyway:',
+        expect.any(Error)
+      )
+
+      consoleWarnSpy.mockRestore()
+    })
+
+    it('downloads the update when stopping local models never finishes', async () => {
+      vi.useFakeTimers()
+      const consoleWarnSpy = vi
+        .spyOn(console, 'warn')
+        .mockImplementation(() => {})
+      try {
+        mockUpdaterCheck.mockResolvedValue({ version: '1.2.0' })
+        mockStopAllModels.mockReturnValue(new Promise<void>(() => {}))
+        mockUpdaterDownloadAndInstallWithProgress.mockResolvedValue(undefined)
+
+        const { result } = renderHook(() => useAppUpdater())
+        await act(async () => {
+          await result.current.checkForUpdate()
+        })
+        await act(async () => {
+          const pending = result.current.downloadAndInstallUpdate()
+          // 15 s for the models, then the 1 s grace for sidecars to exit.
+          await vi.advanceTimersByTimeAsync(16_000)
+          await pending
+        })
+
+        expect(mockUpdaterDownloadAndInstallWithProgress).toHaveBeenCalled()
+        expect(consoleWarnSpy).toHaveBeenCalledWith(
+          'Local models did not stop within 15000 ms; updating anyway'
+        )
+      } finally {
+        consoleWarnSpy.mockRestore()
+        vi.useRealTimers()
+      }
     })
 
     it('should not download if no update info is available', async () => {

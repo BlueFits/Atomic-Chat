@@ -123,17 +123,164 @@ export function isMtpCompanionFile(rfilename: string): boolean {
   const lower = rfilename.toLowerCase()
   if (/(^|\/)mtp\//.test(lower)) return true
   const base = (lower.split('/').pop() ?? lower).replace(/\.gguf$/, '')
-  return /^mtp[-_.]/.test(base) || /[-_]mtp$/.test(base)
+  if (/^mtp[-_.]/.test(base)) return true
+  // A trailing `MTP` right after a quant token names a full set of weights with
+  // the MTP layers baked in (`Qwen3.6-27B-UDT-Q6_K_MTP.gguf`, 21.6 GB), not a
+  // head — reading it as a companion hid those repos from the Hub entirely.
+  if (/[-_]mtp$/.test(base)) return !QUANT_BEFORE_MTP.test(base)
+  return false
 }
 
-// Drop MTP companion quants from a catalog entry, keying off the file path
-// (the real HF filename) and falling back to the quant id when absent.
-export function stripMtpCompanionQuants<
+const QUANT_BEFORE_MTP =
+  /[-_](?:i?q\d[0-9a-z_]*|bf16|f16|f32|mxfp\d[0-9a-z_]*)[-_]mtp$/
+
+/**
+ * GGUF files a repository ships next to its weights that llama.cpp cannot run
+ * on its own: importance matrices, vocab-only dumps, speculative-decoding heads
+ * and drafts (MTP, DFlash, EAGLE3, Gemma 4's "assistant"), and the
+ * tokenizer/vocoder halves of an audio stack. Offering them as download options
+ * is how a user ends up with a 1.4 GB `imatrix_unsloth.gguf` and a model that
+ * never loads; listing one found in a local cache is how they end up picking a
+ * 97 MB `mtp-gemma-4-E2B-it` that dies on "requires ctx_other to be set".
+ *
+ * This is the one rule both import paths use — the Hub listing and the local
+ * cache scan — so they cannot drift apart on what counts as a model (ATO-523).
+ *
+ * Matching is anchored to the start or the end of the file name, never taken as
+ * a substring: `…-NEO-IMATRIX-MAX-MTP.Q4_K_M.gguf` is an ordinary quant of a
+ * model whose *name* mentions imatrix, and a loose test would hide the repo.
+ * The exceptions are names that only ever mark a draft, below.
+ */
+const NON_WEIGHT_GGUF_PREFIX =
+  /^(?:imatrix|ggml-vocab|vocab|eagle3|tokenizer|vocoder|audio(?:de|en)coder)(?:[-_.]|$)/
+
+// DFlash drafts carry the target's name with `DFlash` inside it
+// (`Qwen3.6-27B-DFlash.Q8_0`, `qwen3.5-9b-dflash-Q4_K_M`); no full model is
+// named that way, so the token counts wherever it stands.
+const DFLASH_DRAFT_TOKEN = /(?:^|[-_.])dflash(?:[-_.]|$)/
+
+// Gemma 4's MTP drafter ships as `<target>-assistant`
+// (`gemma-4-26B-A4B-it-assistant.Q8_0`) and loads as the `gemma4-assistant`
+// architecture, which cannot create a context without a target beside it.
+const GEMMA4_ASSISTANT_HEAD = /gemma[-_.]?4.*[-_.]assistant(?:[-_.]|$)/
+
+export function isNonWeightGgufFile(rfilename: string): boolean {
+  if (isMtpCompanionFile(rfilename)) return true
+  const lower = rfilename.toLowerCase()
+  const base = (lower.split('/').pop() ?? lower).replace(/\.gguf$/, '')
+  return (
+    NON_WEIGHT_GGUF_PREFIX.test(base) ||
+    // `<model>.imatrix.gguf` / `<model>-imatrix.gguf` (mradermacher, bartowski).
+    /[-_.]imatrix$/.test(base) ||
+    DFLASH_DRAFT_TOKEN.test(base) ||
+    GEMMA4_ASSISTANT_HEAD.test(base)
+  )
+}
+
+// A quant too large for one file is published as `-00001-of-000NN` shards, and
+// the repo listing carries each shard as a file of its own. Taken at face value
+// they enter the Hub as separate quants: the first shard is a few-megabyte
+// header, so a 156 GB variant advertises itself as a 5 MB "Good fit" and its
+// badge degrades to "00001". Everything a shard set shares -- id, size, quant
+// label -- comes from the name with this suffix removed.
+// The marker also has to be recognised mid-path, because a shard downloaded by
+// this app lands in a directory named after it (`.../M-00002-of-00003/model.gguf`).
+const GGUF_SHARD_SUFFIX = /-\d{5}-of-\d{5}(?=\.gguf$|\/|$)/i
+
+/** Name a shard set is known by: the filename without its `-NNNNN-of-NNNNN`. */
+export function ggufShardGroupKey(rfilename: string): string {
+  return rfilename.replace(GGUF_SHARD_SUFFIX, '')
+}
+
+/** Whether this path is one part of a multi-part GGUF. */
+export function isGgufShard(rfilename: string): boolean {
+  return GGUF_SHARD_SUFFIX.test(rfilename)
+}
+
+/**
+ * The shard llama.cpp has to be handed for this set — the first one. Any other
+ * shard is refused outright ("model must be loaded with the first split"), so
+ * this is what a model entry must point at. Unsharded paths pass through.
+ */
+export function firstGgufShardPath(rfilename: string): string {
+  return rfilename.replace(GGUF_SHARD_SUFFIX, (marker) =>
+    marker.replace(/^-\d{5}/, '-00001')
+  )
+}
+
+/** Group files by the quant they belong to, preserving repository order. */
+export function groupGgufShards<T extends { rfilename: string }>(
+  files: readonly T[]
+): T[][] {
+  const groups = new Map<string, T[]>()
+  for (const file of files) {
+    const key = ggufShardGroupKey(file.rfilename)
+    const group = groups.get(key)
+    if (group) group.push(file)
+    else groups.set(key, [file])
+  }
+  // Repositories list shards in order, but nothing guarantees it, and the first
+  // shard is the one a download has to start from.
+  return [...groups.values()].map((group) =>
+    [...group].sort((left, right) =>
+      left.rfilename.localeCompare(right.rfilename)
+    )
+  )
+}
+
+/**
+ * Fold the shards of a quant back into the single variant they form.
+ *
+ * The curated catalog mirrors the repository file list, so a sharded quant
+ * arrives as one entry per shard — the Hub would otherwise offer `unsloth`
+ * MoE repos as dozens of `00001`-badged variants, most of them 5 MB headers.
+ * The download keeps pointing at the first shard; only the quoted size changes,
+ * to that of the whole set.
+ */
+export function mergeShardedQuants<
+  T extends Pick<CatalogModel, 'quants' | 'num_quants'>,
+>(model: T): T {
+  if (!model.quants?.length) return model
+
+  const groups = groupGgufShards(
+    model.quants.map((quant) => ({
+      rfilename: quant.path || quant.model_id,
+      quant,
+    }))
+  )
+  if (groups.length === model.quants.length) return model
+
+  const quants = groups.map(([first, ...rest]) => {
+    const totalBytes = [first, ...rest].reduce(
+      (sum, entry) => sum + (parseCatalogFileSize(entry.quant.file_size) ?? 0),
+      0
+    )
+    return {
+      ...first.quant,
+      model_id: ggufShardGroupKey(first.quant.model_id),
+      file_size: formatCatalogFileSize(totalBytes) ?? first.quant.file_size,
+    }
+  })
+
+  return { ...model, quants, num_quants: quants.length }
+}
+
+/**
+ * Drop the quants of a catalog entry that are not runnable weights — everything
+ * {@link isNonWeightGgufFile} covers, MTP heads included. Keys off the file path
+ * (the real HF filename), falling back to the quant id when absent.
+ *
+ * The curated catalog mirrors each repository's file list verbatim, so without
+ * this an `imatrix` sits in the download list next to the real quants, sorted
+ * to the top by size and preselected as the one that fits — which is how a user
+ * downloads 1.4 GB of importance matrix and reports the model as broken.
+ */
+export function stripNonWeightQuants<
   T extends Pick<CatalogModel, 'quants' | 'num_quants'>,
 >(model: T): T {
   if (!model.quants?.length) return model
   const quants = model.quants.filter(
-    (q) => !isMtpCompanionFile(q.path || q.model_id)
+    (q) => !isNonWeightGgufFile(q.path || q.model_id)
   )
   if (quants.length === model.quants.length) return model
   return { ...model, quants, num_quants: quants.length }
@@ -149,13 +296,21 @@ export function getPreferredMmprojModel(
   )
 }
 
+/**
+ * Quoted download size: the weights plus whichever projector will be fetched.
+ *
+ * `mmproj` overrides the default projector choice — pass the same one the
+ * download will use, or the row quotes one file's size while fetching another
+ * (the LFM VL projectors range from 98 MB to 359 MB).
+ */
 export function getTotalDownloadFileSize(
   model: Pick<CatalogModel, 'mmproj_models'>,
-  variant?: Pick<ModelQuant, 'file_size'> | null
+  variant?: Pick<ModelQuant, 'file_size'> | null,
+  mmproj?: Pick<MMProjModel, 'file_size'> | null
 ): string | undefined {
   const modelBytes = parseCatalogFileSize(variant?.file_size)
   const mmprojBytes = parseCatalogFileSize(
-    getPreferredMmprojModel(model)?.file_size
+    (mmproj !== undefined ? mmproj : getPreferredMmprojModel(model))?.file_size
   )
 
   if (modelBytes === undefined) {
@@ -165,7 +320,7 @@ export function getTotalDownloadFileSize(
   return formatCatalogFileSize(modelBytes + (mmprojBytes ?? 0))
 }
 
-//* MLX: суммируем размер всех safetensors-шардов (HF часто режет на 00001-of-0000N)
+//* MLX: sum the size of all safetensors shards (HF often splits into 00001-of-0000N)
 export function getMlxTotalFileSize(
   model: Pick<CatalogModel, 'safetensors_files'>
 ): string | undefined {
@@ -189,10 +344,10 @@ export function getMlxTotalFileSize(
   return formatCatalogFileSize(totalBytes)
 }
 
-//* Hub / setup: рекомендованный repo id ↔ запись каталога.
-//* Совпадение строго по полному `org/repo` (case-insensitive). Без fallback
-//* по «хвосту» — иначе при коллизии (`unsloth/X` vs `lmstudio-community/X`)
-//* recommended из одной орги молча резолвится в чужую модель.
+//* Hub / setup: recommended repo id ↔ catalog entry.
+//* Match strictly on the full `org/repo` (case-insensitive). No fallback
+//* on the "tail" — otherwise on a collision (`unsloth/X` vs `lmstudio-community/X`)
+//* a recommended model from one org silently resolves to another org's model.
 export function findCatalogModelForRecommendedRepo(
   sources: readonly CatalogModel[],
   recommendedRepoId: string

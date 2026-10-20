@@ -11,6 +11,15 @@
     }
   },
   {
+    "key": "allow_candidate_builds",
+    "title": "Allow unverified llama.cpp builds",
+    "description": "Offer llama.cpp releases Atomic Chat has not verified yet. Off by default: only verified builds are recommended and offered as updates.",
+    "controllerType": "checkbox",
+    "controllerProps": {
+      "value": false
+    }
+  },
+  {
     "key": "mtp",
     "title": "Enable MTP (Multi-Token Prediction)",
     "description": "Speed up generation with a compatible MTP head. Atomic Chat uses a built-in or matching downloaded head when available. Requires an MTP-capable llama.cpp backend and is mutually exclusive with DFlash.",
@@ -107,24 +116,45 @@
     }
   },
   {
-    "key": "timeout",
-    "title": "Timeout for llamacpp",
-    "description": "Llamacpp connection and load timeout in seconds",
+    "key": "reasoning_preserve",
+    "title": "Preserve Reasoning",
+    "description": "Preserve supported reasoning traces across conversation turns. Requires a compatible chat template and llama.cpp b9837 or newer.",
+    "controllerType": "checkbox",
+    "controllerProps": {
+      "value": false
+    }
+  },
+  {
+    "key": "extra_args",
+    "title": "Additional llama-server Arguments",
+    "description": "Advanced: append arbitrary llama-server arguments. Separate arguments with spaces and quote values containing spaces. Arguments are passed directly without shell expansion.",
     "controllerType": "input",
     "controllerProps": {
-      "value": "600",
-      "placeholder": "e.g 600",
+      "value": "",
+      "placeholder": "--reasoning-format deepseek --reasoning-budget 4096",
+      "type": "text",
+      "textAlign": "right"
+    }
+  },
+  {
+    "key": "timeout",
+    "title": "Timeout for llamacpp",
+    "description": "Llamacpp connection and load timeout in seconds. Model loading and chat streaming both use at least 1800s regardless of a lower value here.",
+    "controllerType": "input",
+    "controllerProps": {
+      "value": "1800",
+      "placeholder": "e.g 1800",
       "type": "number",
       "textAlign": "right"
     }
   },
   {
     "key": "fit",
-    "title": "Fit (auto-adjust to device memory)",
-    "description": "Whether to adjust unset arguments to fit in device memory ('on' or 'off'). (env: LLAMA_ARG_FIT)",
+    "title": "Fit context to device memory",
+    "description": "Let llama.cpp pick the largest context window that fits this device's memory (--fit). While on, the context-size slider is set by the engine; turn off to set it by hand. (env: LLAMA_ARG_FIT)",
     "controllerType": "checkbox",
     "controllerProps": {
-      "value": false
+      "value": true
     }
   },
   {
@@ -227,9 +257,18 @@
     "controllerProps": {
       "value": "layer",
       "options": [
-        { "value": "none", "name": "None" },
-        { "value": "layer", "name": "Layer" },
-        { "value": "row", "name": "Row" }
+        {
+          "value": "none",
+          "name": "None"
+        },
+        {
+          "value": "layer",
+          "name": "Layer"
+        },
+        {
+          "value": "row",
+          "name": "Row"
+        }
       ]
     }
   },
@@ -253,9 +292,18 @@
     "controllerProps": {
       "value": "auto",
       "options": [
-        { "value": "auto", "name": "Auto" },
-        { "value": "on", "name": "On" },
-        { "value": "off", "name": "Off" }
+        {
+          "value": "auto",
+          "name": "Auto"
+        },
+        {
+          "value": "on",
+          "name": "On"
+        },
+        {
+          "value": "off",
+          "name": "Off"
+        }
       ]
     }
   },
@@ -285,15 +333,42 @@
     "controllerProps": {
       "value": "f16",
       "options": [
-        { "value": "f32", "name": "f32" },
-        { "value": "f16", "name": "f16" },
-        { "value": "bf16", "name": "bf16" },
-        { "value": "q8_0", "name": "q8_0" },
-        { "value": "q4_0", "name": "q4_0" },
-        { "value": "q4_1", "name": "q4_1" },
-        { "value": "iq4_nl", "name": "iq4_nl" },
-        { "value": "q5_0", "name": "q5_0" },
-        { "value": "q5_1", "name": "q5_1" }
+        {
+          "value": "f32",
+          "name": "f32"
+        },
+        {
+          "value": "f16",
+          "name": "f16"
+        },
+        {
+          "value": "bf16",
+          "name": "bf16"
+        },
+        {
+          "value": "q8_0",
+          "name": "q8_0"
+        },
+        {
+          "value": "q4_0",
+          "name": "q4_0"
+        },
+        {
+          "value": "q4_1",
+          "name": "q4_1"
+        },
+        {
+          "value": "iq4_nl",
+          "name": "iq4_nl"
+        },
+        {
+          "value": "q5_0",
+          "name": "q5_0"
+        },
+        {
+          "value": "q5_1",
+          "name": "q5_1"
+        }
       ]
     }
   },
@@ -305,15 +380,42 @@
     "controllerProps": {
       "value": "f16",
       "options": [
-        { "value": "f32", "name": "f32" },
-        { "value": "f16", "name": "f16" },
-        { "value": "bf16", "name": "bf16" },
-        { "value": "q8_0", "name": "q8_0" },
-        { "value": "q4_0", "name": "q4_0" },
-        { "value": "q4_1", "name": "q4_1" },
-        { "value": "iq4_nl", "name": "iq4_nl" },
-        { "value": "q5_0", "name": "q5_0" },
-        { "value": "q5_1", "name": "q5_1" }
+        {
+          "value": "f32",
+          "name": "f32"
+        },
+        {
+          "value": "f16",
+          "name": "f16"
+        },
+        {
+          "value": "bf16",
+          "name": "bf16"
+        },
+        {
+          "value": "q8_0",
+          "name": "q8_0"
+        },
+        {
+          "value": "q4_0",
+          "name": "q4_0"
+        },
+        {
+          "value": "q4_1",
+          "name": "q4_1"
+        },
+        {
+          "value": "iq4_nl",
+          "name": "iq4_nl"
+        },
+        {
+          "value": "q5_0",
+          "name": "q5_0"
+        },
+        {
+          "value": "q5_1",
+          "name": "q5_1"
+        }
       ]
     }
   },
@@ -338,9 +440,18 @@
     "controllerProps": {
       "value": "none",
       "options": [
-        { "value": "none", "name": "None" },
-        { "value": "linear", "name": "Linear" },
-        { "value": "yarn", "name": "YaRN" }
+        {
+          "value": "none",
+          "name": "None"
+        },
+        {
+          "value": "linear",
+          "name": "Linear"
+        },
+        {
+          "value": "yarn",
+          "name": "YaRN"
+        }
       ]
     }
   },
@@ -382,70 +493,6 @@
       "textAlign": "right",
       "min": 0,
       "step": 0.01
-    }
-  },
-  {
-    "key": "mirostat",
-    "title": "Mirostat Mode",
-    "description": "Use Mirostat sampling (0: disabled, 1: Mirostat V1, 2: Mirostat V2).",
-    "controllerType": "dropdown",
-    "controllerProps": {
-      "value": 0,
-      "options": [
-        { "value": 0, "name": "Disabled" },
-        { "value": 1, "name": "Mirostat V1" },
-        { "value": 2, "name": "Mirostat V2" }
-      ]
-    }
-  },
-  {
-    "key": "mirostat_lr",
-    "title": "Mirostat Learning Rate",
-    "description": "Mirostat learning rate (eta).",
-    "controllerType": "input",
-    "controllerProps": {
-      "value": 0.1,
-      "placeholder": "0.1",
-      "type": "number",
-      "textAlign": "right",
-      "min": 0,
-      "step": 0.01
-    }
-  },
-  {
-    "key": "mirostat_ent",
-    "title": "Mirostat Target Entropy",
-    "description": "Mirostat target entropy (tau).",
-    "controllerType": "input",
-    "controllerProps": {
-      "value": 5.0,
-      "placeholder": "5.0",
-      "type": "number",
-      "textAlign": "right",
-      "min": 0,
-      "step": 0.01
-    }
-  },
-  {
-    "key": "grammar_file",
-    "title": "Grammar File",
-    "description": "Path to a BNF-like grammar file to constrain generations.",
-    "controllerType": "input",
-    "controllerProps": {
-      "value": "",
-      "placeholder": "path/to/grammar.gbnf",
-      "type": "text"
-    }
-  },
-  {
-    "key": "json_schema_file",
-    "title": "JSON Schema File",
-    "description": "Path to a JSON schema file to constrain generations.",
-    "controllerType": "input",
-    "controllerProps": {
-      "value": "",
-      "placeholder": "path/to/schema.json",
-      "type": "text"
     }
   }
 ]
