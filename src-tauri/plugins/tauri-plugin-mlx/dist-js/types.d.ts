@@ -1,0 +1,20 @@
+export interface SessionInfo {
+    pid: number;
+    port: number;
+    model_id: string;
+    model_path: string;
+    is_embedding: boolean;
+    api_key: string;
+}
+export interface UnloadResult {
+    success: boolean;
+    error?: string;
+}
+export type MlxConfig = {
+    ctx_size: number;
+    draft_model_path: string;
+    block_size: number;
+    draft_kind: string;
+    kv_bits: number;
+    kv_quant_scheme: string;
+};
