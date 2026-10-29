@@ -12,6 +12,7 @@ import { useAgentProvider } from '@/hooks/useAgentProvider'
 import { agentProviderBlockReason } from '@/lib/agent-provider'
 import {
   agentModelBlockReason,
+  imageAttachmentsAllowed,
 } from '@/lib/managed-engine/chat'
 import AgentApprovalInline from '@/containers/AgentApprovalInline'
 import { addExternalAgentFolder } from '@/lib/agent-workspace-actions'
@@ -791,6 +792,10 @@ const ChatInput = memo(function ChatInput({
     let cancelled = false
     let unlistenFallback: (() => void) | undefined
 
+    // Catalog vision is known immediately, which is what paste and drop see
+    // on the first frame. A live llama session can still turn it off.
+    setHasMmproj(imageAttachmentsAllowed(selectedProvider, selectedModel ?? undefined))
+
     const checkMmprojSupport = async () => {
       if (!selectedModel?.id) {
         setHasMmproj(false)
@@ -803,7 +808,15 @@ const ChatInput = memo(function ChatInput({
           modelId: selectedModel.id,
           capabilities: selectedModel.capabilities,
         })
-        if (!cancelled) setHasMmproj(supported && selectedProvider !== 'tensorrt-llm')
+        if (!cancelled) {
+          setHasMmproj(
+            supported &&
+              imageAttachmentsAllowed(
+                selectedProvider,
+                selectedModel ?? undefined
+              )
+          )
+        }
       } catch (error) {
         console.error('Error checking mmproj:', error)
         if (!cancelled) setHasMmproj(false)

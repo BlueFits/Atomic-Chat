@@ -1122,6 +1122,7 @@ describe('ChatInput', () => {
     const addImages = screen.getByText('Add Images').closest('button')!
     const items = within(addImages.parentElement!).getAllByRole('button')
     expect(items.map((item) => item.textContent)).toEqual([
+      'Create Image',
       'Add Images',
       'Add documents or files',
       'chat:agentMode.menuItem',
